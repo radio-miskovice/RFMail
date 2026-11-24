@@ -167,3 +167,6 @@ test/                node:test suites
 
 The backend runs TypeScript directly (Node's type stripping); there is no build
 step for it. `REQUIREMENTS.md` is the contract and `DEVELOPMENT.md` the plan.
+
+Where the work stands, how to run it, and what is next: see
+[PICKUP.md](PICKUP.md).
