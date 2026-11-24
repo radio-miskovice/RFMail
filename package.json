@@ -1,0 +1,27 @@
+{
+  "name": "rfmail",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Winlink radio mail server: mail store, web GUI, mail access",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "start": "node apps/backend/src/main.ts",
+    "cli": "node apps/backend/src/cli.ts",
+    "build:web": "npm --workspace apps/web run build",
+    "dev": "npm run build:web && node apps/backend/src/main.ts",
+    "check": "tsc -p tsconfig.json && npm --workspace apps/web run check",
+    "test": "node --test \"test/*.test.ts\""
+  },
+  "dependencies": {
+    "smol-toml": "^1.4.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "@types/sanitize-html": "^2.16.2",
+    "typescript": "^6.0.3"
+  }
+}

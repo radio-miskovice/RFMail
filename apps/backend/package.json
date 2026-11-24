@@ -1,0 +1,16 @@
+{
+  "name": "@rfmail/backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "rfmail": "./src/main.ts"
+  },
+  "dependencies": {
+    "@rfmail/core-b2f": "*",
+    "@rfmail/mailservers": "*",
+    "@rfmail/server": "*",
+    "@rfmail/shared": "*",
+    "@rfmail/store": "*"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "@rfmail/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@rfmail/core-b2f": "*",
+    "@rfmail/mailservers": "*",
+    "@rfmail/shared": "*",
+    "@rfmail/store": "*",
+    "sanitize-html": "^2.18.2",
+    "smol-toml": "^1.4.2"
+  }
+}
