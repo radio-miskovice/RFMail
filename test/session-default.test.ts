@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { chooseSessionMode, type ModemLike } from '../apps/web/src/lib/session-default.ts';
-import { modemForChannel } from '@rfmail/shared';
+import { modemForChannel, parseClientIdentity } from '@rfmail/shared';
 import type { ModemKind } from '@rfmail/shared';
 
 const kinds: ModemKind[] = ['ardop', 'vara', 'vara-fm', 'xara', 'data2g', 'mercury'];
@@ -66,4 +66,17 @@ test('a channel tagged for one modem belongs to that modem, whatever its mode st
   assert.equal(modemForChannel('vara', 'EMCOMM'), 'vara');
   assert.equal(modemForChannel('vara-fm', null), 'vara-fm');
   assert.equal(modemForChannel('ardop', 'PUBLIC'), 'ardop');
+});
+
+test('a SID identity is accepted only in the shape the handshake can carry', () => {
+  assert.deepEqual(parseClientIdentity('RMS Express-1.8.6.0'), { application: 'RMS Express', version: '1.8.6.0' });
+  assert.deepEqual(parseClientIdentity('  Pat-0.19.1  '), { application: 'Pat', version: '0.19.1' });
+  assert.deepEqual(parseClientIdentity('Aether HF-1'), { application: 'Aether HF', version: '1' });
+
+  // Anything that would corrupt the SID line is refused, not repaired.
+  for (const bad of ['', '   ', 'rfmail', 'RMS Express', '-1.0', '[X]-1.0', 'X-1.0]', 'X-', 'X-1.0.0.0.0', '1X-1.0', 'X\r-1.0', 'X-'.padEnd(70, '9')]) {
+    assert.equal(parseClientIdentity(bad), null, JSON.stringify(bad));
+  }
+  // Surrounding whitespace is trimmed as the value is read, so a pasted string is usable.
+  assert.deepEqual(parseClientIdentity('X-1.0\r\n'), { application: 'X', version: '1.0' });
 });

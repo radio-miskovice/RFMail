@@ -511,11 +511,33 @@ user's login. rfmail refuses to enable gateway mode without a gateway callsign,
 its password, and an explicitly recorded acknowledgement that the station is
 registered.
 
-**R4.4.3 Post office.** An inbound RF B2F session is terminated locally: inbound
-messages are stored for the addressed local callsign, outbound messages for the
-connecting callsign are offered from the database. Proposals for a MID already
-stored for that user are rejected (that is what makes reconnects harmless).
-Mail for a callsign that no user owns is refused or held per configured policy.
+**R4.4.3 Post office.** An inbound RF B2F session is terminated locally (decision
+26): the station answers as one account's callsign — its *owner* — on one modem,
+armed and disarmed by the operator, and it asks who is calling before it offers
+anything (decision 27).
+
+* **Inbound.** Every local callsign a received message names gets it in its own
+  INBOX; that mailbox *is* the delivery, so no second queue exists. Proposals are
+  answered `-` only for a MID this station already received anywhere (decision 28);
+  a MID in somebody's OUTBOX is a message this station is sending, not one it has.
+* **Unknown recipient.** Where the peer names the recipient before the transfer
+  (`;PM:`), a callsign no account holds is answered `=` — deferred, so nothing is
+  lost and the peer may ask again. Where it does not, the message is accepted and
+  then held in the owner's mailbox with the peer recorded and a warning naming the
+  address, because `-` means "I already have it" and would lose the message. It is
+  never silently dropped.
+* **Outbound.** The calling station is offered what its own mailbox holds and has
+  not collected over the air yet; a message the peer accepts, or says it already
+  has, is marked collected and stays in the mailbox (collecting is not deleting).
+  The addresses offered for are the ones its `;FW:` list asked for; the station
+  never broadcasts its account list.
+* **The radio.** Arming tunes the transceiver to the chosen dial first and refuses
+  when that link is down, for the same reason a client dial does: an inbound call
+  cannot be tuned for, so the station must be on the channel already. One modem
+  carries the post office; an outbound session on that modem is refused while it is
+  armed, and listening is re-armed after every call.
+* A station with a gateway role may run the post office at the same time on a
+  different modem; nothing in the post office needs WDT registration.
 
 **R4.4.4 Forwarding.** For a user account configured to fetch automatically, the
 backend opens sessions on the user's behalf (typically to a CMS over telnet, or
@@ -572,9 +594,10 @@ PostgreSQL use pure-JS drivers (R1.2).
 a lock, with per-dialect DDL. A database from a newer schema version is refused
 rather than half-used.
 
-**R5.3** Users: unique login name, password hash (scrypt with per-user salt),
-role (admin or user), enabled flag, quota, created/updated timestamps, and a
-list of owned callsigns. Administration is by role, not by configuration file.
+**R5.3** Users: one callsign, which is the account's login and its mailbox (decision
+25) — unique without regard to case — a password hash (scrypt with per-user salt),
+role (admin or user), enabled flag, quota and created/updated timestamps.
+Administration is by role, not by configuration file.
 An account may exist without a password at all — the first-run account does —
 which is stored as a null hash: an empty password authenticates then, and the
 moment a password is set, an empty one stops working everywhere (web client and
@@ -705,8 +728,8 @@ surface.
 SameSite=Strict, Secure under TLS), CSRF nonce on every state-changing request.
 The first account is created by the CLI, or by the first-run form, which exists
 only while no account exists at all and answers 409 afterwards. The browser
-remembers the account name in `localStorage` so a restart prefills the sign-in;
-the name is a convenience, never a credential. Every account may configure and
+remembers the callsign in `localStorage` so a restart prefills the sign-in; the
+callsign is a convenience there, never a credential (decision 25). Every account may configure and
 operate the station's radios, modems and sessions; the admin role is needed only
 to administer other accounts (decision 14).
 
@@ -937,10 +960,10 @@ Settled 2026-11-24. Kept numbered so later work can cite them ("per decision 7")
    Platform-independent (JavaScript or WebAssembly) implementations are
    preferred where realistic. SQLite therefore stays on Node's built-in driver,
    with a `better-sqlite3` adapter only as an optional alternative. (R1.2)
-10. **First-run account**: created in the web client at the first start, with no
-    password; the account name is remembered in the browser's `localStorage`.
-    Until a password is set, the sign-in and POP3 both accept an empty password;
-    once one is set, both require it. (R5.3, R6.2, R7.2)
+10. **First-run account**: created in the web client at the first start, from its
+    callsign and with no password; the callsign is remembered in the browser's
+    `localStorage`. Until a password is set, the sign-in and POP3 both accept an
+    empty password; once one is set, both require it. (R5.3, R6.2, R7.2)
 11. **Delivery order**: the mail store, the web client and POP3 come first;
     SMTP, IMAP, the MariaDB and PostgreSQL adapters, rig control, the modem
     drivers, the B2F engine and the gateway roles follow in later steps.
@@ -983,3 +1006,43 @@ Settled 2026-11-24. Kept numbered so later work can cite them ("per decision 7")
     `XARA`, `MERCURY` or `DATA2G` to advertise it for one of the newer modems; such a
     channel's mode string is ordinary VARA, so it belongs to that modem alone and
     must be marked as tagged in the list. (R4.4.0, R3.0)
+25. **The callsign is the account** (settled 25 Nov 2026): a Winlink station has one
+    callsign, so the account is that callsign and has no second name. The sign-in
+    form, POP3, IMAP and SMTP all ask for the callsign, matched without regard to
+    case; `OK4RM`, `ok4rm` and `OK4RM@winlink.org` are one mailbox, resolved by one
+    function. The store keeps `login` as the callsign (upper-case) so the unique
+    index is the sign-in key, and renaming the station renames the login with it.
+    An account is created with a callsign — there is no account that cannot send or
+    receive — and the accounts screen shows one identity column. Rows written before
+    this decision had their callsign copied into the login by migration 007; a row
+    that never had a callsign keeps its old login until one is set on it, because a
+    callsign is never invented for an account. (R7.2, R7.3, R6.1, decision 13)
+26. **The post office is the station answering calls** (settled 25 Nov 2026): an
+    inbound B2F session is terminated locally rather than relayed, under the callsign
+    of one *owner* account (`users.is_post_office`, at most one, enforced by a partial
+    unique index). The station's mailboxes are the store: an inbound message is filed
+    for every local callsign it names, and what the caller's own mailbox holds and has
+    not collected over the air is what it is offered. Collection is a flag
+    (`FLAG_COLLECTED`), so the message stays readable locally — collecting is not
+    deleting — and the same mail is not offered twice. An address no account holds is
+    deferred when the peer names it in `;PM:`, and otherwise held in the owner's
+    mailbox and logged, never dropped and never answered `-`. One modem carries the
+    role, arming tunes the radio first, and listening is re-armed after every call.
+    No gateway registration is involved. (R4.4.3, R4.5.1, R4.4.05)
+27. **The station challenges every caller, and either credential authenticates**
+    (settled 25 Nov 2026): the answering half sends `;PQ:` with a fresh nonce per call
+    and judges the `;PR:` answer before a single proposal. The password may be the
+    Winlink secure-login password registered for that callsign or the account's
+    *post-office password* — an account-level secret for stations that have no Winlink
+    registration yet, which in the beginning is the only one that exists. Both are
+    stored sealed (AES-256-GCM under `store_key`), never hashed, because `;PR` can only
+    be checked by recomputing it; both are dropped when the callsign changes; the API
+    answers only `hasPostOfficePassword`. A callsign with no account, or an account
+    with neither credential, is refused — there is no guest access, and a challenge is
+    sent to unknown callsigns too, so the refusal does not reveal which callsigns
+    exist. (R4.4.3, R7.2, R9.1)
+28. **The post office's duplicate check is the station's, not a mailbox's** (settled
+    25 Nov 2026): a proposal arrives before the recipient is known, so the MID is
+    matched across every mailbox — but only against mail that has *arrived*. A MID
+    held in somebody's OUTBOX is a message this station is sending; answering `-` for
+    it would tell the peer its message is already here and lose it. (R4.4.3)

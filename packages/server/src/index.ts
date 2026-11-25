@@ -7,3 +7,4 @@ export * from './static.ts';
 export * from './logging.ts';
 export * from './secrets.ts';
 export * from './platform.ts';
+export * from './postoffice.ts';

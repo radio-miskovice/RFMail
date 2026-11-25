@@ -10,6 +10,7 @@ import {
   FLAG_ANSWERED,
   FLAG_FLAGGED,
   FLAG_UNREAD,
+  type ArmPostOfficeRequest,
   type ComposeRequest,
   type CreateUserRequest,
   type FolderWithCounts,
@@ -27,6 +28,7 @@ import {
   type ModemKind,
   type PatchMessageRequest,
   type PasswordRequest,
+  type PostOfficeStatus,
   type ModemListenRequest,
   type SessionMode,
   type SessionRunRequest,
@@ -63,6 +65,7 @@ import {
   type UserRecord,
 } from '@rfmail/store';
 import type { CreateModemInput, ModemRecord } from '@rfmail/store';
+import type { PostOffice } from './postoffice.ts';
 import { findUserByCredential, type MailEvents, type PeerPolicy } from '@rfmail/mailservers';
 import type { TransceiverConfig, TransceiverLinks } from '@rfmail/rig';
 import { sanitiseHtml } from './html.ts';
@@ -105,6 +108,8 @@ export interface ApiServices {
   storeKey: string;
   /** Live rig links; configuration lives in the store, connection state here. */
   links: TransceiverLinks;
+  /** The answering half of the B2F exchange: a running post office, if any. */
+  postOffice: PostOffice;
   /** Directory holding the cached Winlink gateway catalogue; null disables the cache. */
   cacheDir?: string | null;
 }
@@ -123,7 +128,6 @@ function isAuthed(ctx: Ctx): ctx is AuthedContext {
 function toUser(user: UserRecord): User {
   return {
     id: user.id,
-    login: user.login,
     role: user.role,
     enabled: user.enabled,
     quotaBytes: user.quotaBytes,
@@ -131,6 +135,8 @@ function toUser(user: UserRecord): User {
     locator: user.locator,
     hasPassword: user.pwHash !== null,
     hasWinlinkPassword: user.winlinkSecret !== null,
+    hasPostOfficePassword: user.postOfficeSecret !== null,
+    isPostOffice: user.isPostOffice,
     createdAt: new Date(user.createdAt).toISOString(),
   };
 }
@@ -194,14 +200,15 @@ function requireAdmin(ctx: Ctx): AuthedContext {
   return authed;
 }
 
-function loginName(value: unknown): string {
-  const name = typeof value === 'string' ? value.trim() : '';
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{1,31}$/.test(name)) {
-    throw new HttpError(400, 'login name must be 2-32 characters: letters, digits, dot, dash, underscore', {
-      login: 'invalid login name',
-    });
+function requireCallsign(value: unknown): string {
+  // The account's identity is the callsign (decision 25), so the field is both the
+  // login and the station: one validator, and a missing value is a refusal, never a
+  // guessed name.
+  const callsign = normaliseCallsign(value);
+  if (!callsign) {
+    throw new HttpError(400, 'a callsign is required', { callsign: 'required' });
   }
-  return name;
+  return callsign;
 }
 
 // ---------------------------------------------------------------------------
@@ -211,7 +218,7 @@ export function createApi(services: ApiServices): {
   handle: (req: IncomingMessage, res: ServerResponse) => Promise<void>;
   loginAttempts: Map<string, { count: number; resetAt: number }>;
 } {
-  const { store, sessions, policy, logger, storeKey, links } = services;
+  const { store, sessions, policy, logger, storeKey, links, postOffice } = services;
   const router = new Router();
   const loginAttempts = new Map<string, { count: number; resetAt: number }>();
 
@@ -252,24 +259,19 @@ export function createApi(services: ApiServices): {
       throw new HttpError(409, 'the first account has already been created');
     }
     const body = await readJson<SetupRequest>(ctx.req);
-    const login = loginName(body.login);
-    const callsign = normaliseCallsign(body.callsign);
-    const user = await store.createUser({
-      login,
-      pwHash: null,
-      role: 'admin',
-      ...(callsign ? { callsign } : {}),
-    });
+    const callsign = requireCallsign(body.callsign);
+    const user = await store.createUser({ callsign, pwHash: null, role: 'admin' });
     const { token, payload } = sessions.issue(user.id);
     ctx.res.setHeader('Set-Cookie', sessions.cookieHeader(token, services.secureCookies));
-    logger.info('first account created', { login, remote: ctx.remote });
+    logger.info('first account created', { callsign, remote: ctx.remote });
     sendJson(ctx.res, 201, await meResponse(user.id, payload.csrf));
   });
 
   router.add('POST', '/api/login', async (ctx) => {
     const body = await readJson<LoginRequest>(ctx.req);
-    const name = typeof body.login === 'string' ? body.login.trim() : '';
-    if (!name) throw new HttpError(400, 'login name required', { login: 'required' });
+    // The sign-in name is the callsign; any case is accepted (decision 25).
+    const name = typeof body.callsign === 'string' ? body.callsign.trim() : '';
+    if (!name) throw new HttpError(400, 'callsign required', { callsign: 'required' });
 
     const now = Date.now();
     const attempt = loginAttempts.get(ctx.remote);
@@ -308,7 +310,7 @@ export function createApi(services: ApiServices): {
     loginAttempts.delete(ctx.remote);
     const { token, payload } = sessions.issue(user.id);
     ctx.res.setHeader('Set-Cookie', sessions.cookieHeader(token, services.secureCookies));
-    logger.info('login', { login: user.login, remote: ctx.remote });
+    logger.info('login', { callsign: user.callsign ?? user.login, remote: ctx.remote });
     sendJson(ctx.res, 200, await meResponse(user.id, payload.csrf));
   });
 
@@ -745,7 +747,7 @@ export function createApi(services: ApiServices): {
       throw new HttpError(502, `${record.name} did not answer: ${result.error}`, { modemId: 'offline' });
     }
     listenStates.set(record.id, on);
-    logger.info('modem listening', { modem: record.name, listening: on, answer: result.answer, by: authed.user.login });
+    logger.info('modem listening', { modem: record.name, listening: on, answer: result.answer, by: authed.user.callsign });
     sendJson(ctx.res, 200, { modemId: record.id, listening: on, answer: result.answer });
   });
 
@@ -759,7 +761,7 @@ export function createApi(services: ApiServices): {
       host: string;
     };
     const created = await store.createModem({ ...input, name: input.name, kind: input.kind, host: input.host });
-    logger.info('modem created', { name: created.name, kind: created.kind, by: authed.user.login });
+    logger.info('modem created', { name: created.name, kind: created.kind, by: authed.user.callsign });
     sendJson(ctx.res, 201, toModem(created));
   });
 
@@ -805,7 +807,7 @@ export function createApi(services: ApiServices): {
       name: created.name,
       host: created.host,
       port: created.port,
-      by: authed.user.login,
+      by: authed.user.callsign,
     });
     sendJson(ctx.res, 201, toTransceiver(created));
   });
@@ -885,28 +887,23 @@ export function createApi(services: ApiServices): {
     const authed = requireAdmin(ctx);
     requireCsrf(ctx);
     const body = await readJson<CreateUserRequest>(ctx.req);
-    const login = loginName(body.login);
-    if (await store.findUserByLogin(login)) {
-      throw new HttpError(409, 'that account already exists', { login: 'duplicate' });
-    }
+    // The callsign is the account: it is the login, the mailbox and the originator
+    // of everything the account transmits (decision 25).
+    const callsign = requireCallsign(body.callsign);
+    await assertCallsignFree(store, callsign, 0);
     const password = typeof body.password === 'string' ? body.password : '';
     if (password !== '' && password.length < 6) {
       throw new HttpError(400, 'password must be at least 6 characters', { password: 'too short' });
     }
     const role = body.role === 'admin' ? 'admin' : 'user';
     const created = await store.createUser({
-      login,
+      callsign,
       pwHash: password ? hashPassword(password) : null,
       role,
     });
-    const callsign = normaliseCallsign(body.callsign);
-    if (callsign) {
-      await assertCallsignFree(store, callsign, created.id);
-      await store.setCallsign(created.id, callsign);
-    }
     const locator = normaliseLocator(body.locator);
     if (locator) await store.setLocator(created.id, locator);
-    logger.info('account created', { login, role, by: authed.user.login });
+    logger.info('account created', { callsign, role, by: authed.user.callsign });
     const stored = await store.getUser(created.id);
     sendJson(ctx.res, 201, toUser(stored ?? created));
   });
@@ -941,6 +938,49 @@ export function createApi(services: ApiServices): {
     if (body.locator !== undefined) {
       await store.setLocator(target.id, normaliseLocator(body.locator));
     }
+    if (body.postOfficePassword !== undefined) {
+      const password = body.postOfficePassword === null ? '' : body.postOfficePassword;
+      if (typeof password !== 'string') {
+        throw new HttpError(400, 'the post-office password must be a string', {
+          postOfficePassword: 'invalid',
+        });
+      }
+      if (password.length > 128) {
+        throw new HttpError(400, 'the post-office password is too long', {
+          postOfficePassword: 'too long',
+        });
+      }
+      const stored = await store.setPostOfficeSecret(
+        target.id,
+        password.trim() === '' ? null : sealSecret(password, storeKey),
+      );
+      if (!stored) {
+        throw new HttpError(400, 'that account has no callsign, so it cannot hold the password', {
+          callsign: 'required',
+        });
+      }
+      logger.info('post office password reset by administrator', {
+        callsign: (await store.getUser(target.id))?.callsign ?? null,
+        by: authed.user.callsign,
+      });
+    }
+    if (body.isPostOffice !== undefined) {
+      if (body.isPostOffice) {
+        const made = await store.setPostOfficeOwner(target.id);
+        if (!made) {
+          throw new HttpError(400, 'that account has no callsign, so it cannot own the post office', {
+            callsign: 'required',
+          });
+        }
+        logger.info('post office owner set', {
+          callsign: (await store.getUser(target.id))?.callsign ?? null,
+          by: authed.user.callsign,
+        });
+      } else if (target.isPostOffice) {
+        await store.setPostOfficeOwner(null);
+        logger.info('post office owner cleared', { by: authed.user.callsign });
+      }
+    }
     const updated = await store.getUser(target.id);
     sendJson(ctx.res, 200, toUser(updated ?? target));
   });
@@ -955,7 +995,7 @@ export function createApi(services: ApiServices): {
     }
     await ensureAnotherAdmin(target);
     await store.deleteUser(target.id);
-    logger.info('account deleted', { login: target.login, by: authed.user.login });
+    logger.info('account deleted', { callsign: target.callsign ?? target.login, by: authed.user.callsign });
     sendJson(ctx.res, 200, { ok: true });
   });
 
@@ -970,7 +1010,7 @@ export function createApi(services: ApiServices): {
       throw new HttpError(400, 'password must be at least 6 characters', { password: 'too short' });
     }
     await store.setUserPassword(target.id, password === '' ? null : hashPassword(password));
-    logger.info('password reset by administrator', { login: target.login, by: authed.user.login });
+    logger.info('password reset by administrator', { callsign: target.callsign ?? target.login, by: authed.user.callsign });
     sendJson(ctx.res, 200, { ok: true, hasPassword: password !== '' });
   });
 
@@ -991,6 +1031,12 @@ export function createApi(services: ApiServices): {
     if (!modem) throw new HttpError(404, 'modem not found');
     if (!modem.commandPort) {
       throw new HttpError(400, 'this modem has no command port configured', { modemId: 'noport' });
+    }
+    if (postOffice.modemId === modem.id) {
+      // One modem carries one session (R4.5.1), and an armed post office is using it.
+      throw new HttpError(409, `${modem.name} is answering calls for the post office; disarm it first`, {
+        modemId: 'postoffice',
+      });
     }
     const target = String(body.target ?? '').trim().toUpperCase();
     if (!/^[A-Z0-9]{3,10}([-/][A-Z0-9]{1,3})?$/.test(target)) {
@@ -1051,7 +1097,7 @@ export function createApi(services: ApiServices): {
     const prepared = await prepareDial(authed, body);
     const { modem, target, frequencyHz, bandwidthHz, rig, transceiverName } = prepared;
 
-    logger.info('connect test', { modem: modem.name, target, frequencyHz, by: authed.user.login });
+    logger.info('connect test', { modem: modem.name, target, frequencyHz, by: authed.user.callsign });
     const outcome = await dialModem({
       host: modem.host,
       port: modem.commandPort ?? 0,
@@ -1102,9 +1148,19 @@ export function createApi(services: ApiServices): {
     const prepared = await prepareDial(authed, body);
     const { modem, target, frequencyHz, bandwidthHz, rig, transceiverName } = prepared;
 
-    const secret = authed.user.winlinkSecret ? openSecret(authed.user.winlinkSecret, services.storeKey) : null;
+    // What the far end will be answered with. A post office of this station may
+    // challenge for either credential (decision 27); a CMS only for the Winlink one,
+    // so that is preferred when both exist.
+    const winlinkPassword = authed.user.winlinkSecret
+      ? openSecret(authed.user.winlinkSecret, services.storeKey)
+      : null;
+    const postOfficePassword =
+      mode === 'postoffice' && authed.user.postOfficeSecret
+        ? openSecret(authed.user.postOfficeSecret, services.storeKey)
+        : null;
+    const secret = winlinkPassword ?? postOfficePassword;
     const startedAt = Date.now();
-    logger.info('session start', { modem: modem.name, target, mode, frequencyHz, by: authed.user.login });
+    logger.info('session start', { modem: modem.name, target, mode, frequencyHz, by: authed.user.callsign });
 
     const report = await runSession({
       store,
@@ -1120,6 +1176,7 @@ export function createApi(services: ApiServices): {
       mode,
       bandwidthHz,
       password: secret,
+      fakeClient: typeof body.fakeClient === 'string' && body.fakeClient.trim() !== '' ? body.fakeClient : null,
       logger,
     });
 
@@ -1127,6 +1184,7 @@ export function createApi(services: ApiServices): {
       modem: modem.name,
       target,
       mode,
+      fakeClient: body.fakeClient ?? null,
       result: report.result,
       sent: report.sent.length,
       received: report.received.length,
@@ -1172,6 +1230,127 @@ export function createApi(services: ApiServices): {
    * attempt: by estimated quality, or by distance when the operator knows the
    * neighbourhood better than the estimate (VHF/UHF especially).
    */
+  // -- post office ------------------------------------------------------------
+
+  /**
+   * The role's state. While it is armed the callsign in force is the one it was
+   * armed with; while it is not, the owner flag in the store is the answer.
+   */
+  async function postOfficeStatus(): Promise<PostOfficeStatus> {
+    const snapshot = postOffice.snapshot();
+    if (snapshot.armed) return snapshot;
+    const owner = await store.findPostOfficeOwner();
+    return { ...snapshot, owner: owner?.callsign ?? null };
+  }
+
+  router.add('GET', '/api/postoffice/status', async (ctx) => {
+    requireLogin(ctx);
+    sendJson(ctx.res, 200, await postOfficeStatus());
+  });
+
+  /**
+   * Arms the station's post office: the radio is tuned first, then the modem is
+   * told to listen. An inbound call cannot be tuned for, so a station that keys a
+   * carrier without a dial set is not acceptable here for the same reason a dial
+   * refuses it (R4.4.05).
+   */
+  router.add('POST', '/api/postoffice/arm', async (ctx) => {
+    const authed = requireLogin(ctx);
+    requireCsrf(ctx);
+    const body = await readJson<ArmPostOfficeRequest>(ctx.req);
+
+    const owner = await store.findPostOfficeOwner();
+    if (!owner || !owner.callsign) {
+      throw new HttpError(400, 'no account owns the post office: mark one on the accounts page', {
+        owner: 'missing',
+      });
+    }
+    if (postOffice.isArmed) {
+      throw new HttpError(409, 'the post office is already armed; disarm it first', {
+        armed: 'already',
+      });
+    }
+
+    const modem = await store.getModem(Number(body.modemId));
+    if (!modem) throw new HttpError(404, 'modem not found');
+    if (!modem.commandPort) {
+      throw new HttpError(400, 'this modem has no command port configured', { modemId: 'noport' });
+    }
+    if (postOffice.modemId === modem.id) {
+      // One modem carries one session (R4.5.1), and an armed post office is using it.
+      throw new HttpError(409, `${modem.name} is answering calls for the post office; disarm it first`, {
+        modemId: 'postoffice',
+      });
+    }
+    if (!modem.dataPort) {
+      throw new HttpError(400, 'this modem has no data port, so a session has nowhere to run', {
+        modemId: 'nodata',
+      });
+    }
+    if (modem.kind === 'ardop') {
+      throw new HttpError(400, 'ARDOP carries session data on its command port, which this build cannot yet carry', {
+        modemId: 'ardop',
+      });
+    }
+    const frequencyHz = Number(body.frequencyHz);
+    if (!Number.isFinite(frequencyHz) || frequencyHz < 1_800_000 || frequencyHz > 450_000_000) {
+      throw new HttpError(400, 'the dial frequency is outside every amateur band', {
+        frequencyHz: 'invalid',
+      });
+    }
+    if (modem.transceiverId === null) {
+      throw new HttpError(409, 'the modem has no transceiver assigned, so the dial cannot be set', {
+        transceiverId: 'missing',
+      });
+    }
+    const radio = await store.getTransceiver(modem.transceiverId);
+    if (!radio) {
+      throw new HttpError(400, 'the modem names a transceiver that no longer exists', {
+        modemId: 'stale',
+      });
+    }
+    try {
+      await links.tune(radio.id, frequencyHz, modem.rigMode);
+    } catch (error) {
+      throw new HttpError(
+        409,
+        `the transceiver ${radio.name} is not connected: ${error instanceof Error ? error.message : String(error)}`,
+        { transceiverId: 'offline' },
+      );
+    }
+
+    try {
+      const status = await postOffice.arm({
+        owner,
+        modem: {
+          id: modem.id,
+          name: modem.name,
+          host: modem.host,
+          commandPort: modem.commandPort,
+          dataPort: modem.dataPort,
+        },
+        frequencyHz,
+      });
+      logger.info('post office arm', {
+        callsign: owner.callsign,
+        modem: modem.name,
+        frequencyHz,
+        by: authed.user.callsign,
+      });
+      sendJson(ctx.res, 200, { ...status, owner: status.owner ?? owner.callsign });
+    } catch (error) {
+      throw new HttpError(502, error instanceof Error ? error.message : String(error));
+    }
+  });
+
+  router.add('POST', '/api/postoffice/disarm', async (ctx) => {
+    const authed = requireLogin(ctx);
+    requireCsrf(ctx);
+    await postOffice.disarm();
+    logger.info('post office disarm', { by: authed.user.callsign });
+    sendJson(ctx.res, 200, await postOfficeStatus());
+  });
+
   router.add('GET', '/api/gateways', async (ctx) => {
     const authed = requireLogin(ctx);
     const modemParam = ctx.url.searchParams.get('modem');
@@ -1238,6 +1417,33 @@ export function createApi(services: ApiServices): {
       await store.setLocator(authed.user.id, locator);
     }
 
+    if (body.postOfficePassword !== undefined) {
+      const password = body.postOfficePassword === null ? '' : body.postOfficePassword;
+      if (typeof password !== 'string') {
+        throw new HttpError(400, 'the post-office password must be a string', {
+          postOfficePassword: 'invalid',
+        });
+      }
+      if (password.length > 128) {
+        throw new HttpError(400, 'the post-office password is too long', {
+          postOfficePassword: 'too long',
+        });
+      }
+      const stored = await store.setPostOfficeSecret(
+        authed.user.id,
+        password.trim() === '' ? null : sealSecret(password, storeKey),
+      );
+      if (!stored) {
+        throw new HttpError(400, 'set a callsign before a post-office password', {
+          callsign: 'required',
+        });
+      }
+      logger.info(
+        password.trim() === '' ? 'post office password cleared' : 'post office password stored',
+        { callsign: authed.user.callsign },
+      );
+    }
+
     if (body.winlinkPassword !== undefined) {
       const password = body.winlinkPassword === null ? '' : body.winlinkPassword;
       if (typeof password !== 'string') {
@@ -1267,7 +1473,7 @@ export function createApi(services: ApiServices): {
             callsign: 'required',
           });
         }
-        logger.info('winlink password stored', { login: authed.user.login });
+        logger.info('winlink password stored', { callsign: authed.user.callsign ?? authed.user.login });
       }
     }
 
@@ -1289,7 +1495,7 @@ export function createApi(services: ApiServices): {
       throw new HttpError(400, 'password must be at least 6 characters', { password: 'too short' });
     }
     await store.setUserPassword(authed.user.id, password === '' ? null : hashPassword(password));
-    logger.info('password changed', { login: authed.user.login });
+    logger.info('password changed', { callsign: authed.user.callsign ?? authed.user.login });
     sendJson(ctx.res, 200, { ok: true, hasPassword: password !== '' });
   });
 
@@ -1422,7 +1628,7 @@ async function assertCallsignFree(
   if (!callsign) return;
   const owner = await store.findUserByCallsign(callsign);
   if (owner && owner.id !== exceptUserId) {
-    throw new HttpError(409, `${callsign} already belongs to account ${owner.login}`, {
+    throw new HttpError(409, `${callsign} already belongs to account ${owner.callsign ?? owner.login}`, {
       callsign: 'duplicate',
     });
   }

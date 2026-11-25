@@ -21,10 +21,10 @@ const USAGE = `rfmail - Winlink radio mail server
 
 usage:
   rfmail info
-  rfmail user list
-  rfmail user add <login> [--callsign CALL] [--admin] [--password PW]
-  rfmail user passwd <login> [--password PW]      (omit --password to clear)
-  rfmail import <file.eml> --user <login> [--folder INBOX]
+  rfmail user list [CALLSIGN]
+  rfmail user add <callsign> [--admin] [--password PW]
+  rfmail user passwd <callsign> [--password PW]   (omit --password to clear)
+  rfmail import <file.eml> --user <callsign> [--folder INBOX]
 
 global options:
   --config PATH   configuration file (default: ${defaultConfigPath()})
@@ -37,7 +37,6 @@ async function main(): Promise<void> {
       user: { type: 'string' },
       folder: { type: 'string', default: 'INBOX' },
       password: { type: 'string' },
-      callsign: { type: 'string' },
       admin: { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
     },
@@ -88,23 +87,23 @@ async function main(): Promise<void> {
     }
 
     if (group === 'user' && action === 'add') {
-      const login = rest[0];
-      if (!login) throw new Error('user add needs a login name');
-      if (await store.findUserByLogin(login)) throw new Error(`account already exists: ${login}`);
+      // The callsign is the account and the login (decision 25).
+      const callsign = (rest[0] ?? '').trim().toUpperCase();
+      if (!callsign) throw new Error('user add needs a callsign');
+      if (await store.findUserByCallsign(callsign)) throw new Error(`account already exists: ${callsign}`);
       const password = values.password ?? (await promptPassword());
       const user = await store.createUser({
-        login,
+        callsign,
         pwHash: password ? hashPassword(password) : null,
         role: values.admin ? 'admin' : 'user',
       });
-      if (values.callsign) await store.setCallsign(user.id, values.callsign);
       process.stdout.write(`created ${user.login} (${user.role})${password ? '' : ' with no password'}\n`);
       return;
     }
 
     if (group === 'user' && action === 'passwd') {
       const login = rest[0];
-      if (!login) throw new Error('user passwd needs a login name');
+      if (!login) throw new Error('user passwd needs a callsign');
       const user = await store.findUserByLogin(login);
       if (!user) throw new Error(`no such account: ${login}`);
       const password = values.password ?? '';
@@ -149,12 +148,12 @@ function formatUser(user: {
   callsign: string | null;
   pwHash: string | null;
 }): string {
+  // The login is the callsign, so it is named once.
   return [
     `id:        ${user.id}`,
-    `login:     ${user.login}`,
+    `callsign:  ${user.callsign ?? user.login}`,
     `role:      ${user.role}`,
     `enabled:   ${user.enabled}`,
-    `callsign: ${user.callsign ?? '-'}`,
     `password:  ${user.pwHash ? 'set' : 'none'}`,
   ].join('\n');
 }

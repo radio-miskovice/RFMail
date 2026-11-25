@@ -31,8 +31,7 @@ async function harness(options: { password?: string; maxMessageBytes?: number } 
 }> {
 	const store = new SqliteStore({ path: ':memory:' });
 	await store.migrate();
-	const user = await store.createUser({ login: 'tester', pwHash: null, role: 'admin' });
-	await store.setCallsign(user.id, 'OK4RM');
+	const user = await store.createUser({ callsign: 'OK4RM', pwHash: null, role: 'admin' });
 	const events = new MailEvents();
 	const server = new SmtpServer({
 		store,
@@ -67,7 +66,7 @@ test('accepts an authenticated submission into OUTBOX and notifies', async () =>
 		const client = new SmtpTestClient(port);
 		await client.greeting();
 		assert.match(await client.cmd('EHLO test'), /^250/);
-		const auth = await client.cmd(`AUTH PLAIN ${Buffer.from('\u0000tester\u0000').toString('base64')}`);
+		const auth = await client.cmd(`AUTH PLAIN ${Buffer.from('\u0000ok4rm\u0000').toString('base64')}`);
 		assert.match(auth, /^235/);
 		assert.match(await client.cmd('MAIL FROM:<OK4RM@winlink.org>'), /^250/);
 		assert.match(await client.cmd('RCPT TO:<LA5NTA@winlink.org>'), /^250/);
@@ -106,7 +105,7 @@ test('refuses submission before authentication and from a foreign sender', async
 		assert.match(await client.cmd('MAIL FROM:<someone@example.org>'), /^530/);
 
 		assert.match(await client.cmd('AUTH LOGIN'), /^334 /);
-		client.write(`${Buffer.from('tester').toString('base64')}\r\n`);
+		client.write(`${Buffer.from('ok4rm').toString('base64')}\r\n`);
 		assert.match(await client.line(), /^334 /);
 		client.write(`${Buffer.from('').toString('base64')}\r\n`);
 		assert.match(await client.line(), /^235/);
@@ -128,11 +127,11 @@ test('rejects a wrong password and an oversized message', async () => {
 		await client.greeting();
 		await client.cmd('EHLO test');
 		assert.match(
-			await client.cmd(`AUTH PLAIN ${Buffer.from('\u0000tester\u0000wrong').toString('base64')}`),
+			await client.cmd(`AUTH PLAIN ${Buffer.from('\u0000ok4rm\u0000wrong').toString('base64')}`),
 			/^535/,
 		);
 		assert.match(
-			await client.cmd(`AUTH PLAIN ${Buffer.from('\u0000tester\u0000secret').toString('base64')}`),
+			await client.cmd(`AUTH PLAIN ${Buffer.from('\u0000ok4rm\u0000secret').toString('base64')}`),
 			/^235/,
 		);
 		assert.match(await client.cmd('MAIL FROM:<OK4RM>'), /^250/);

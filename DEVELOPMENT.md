@@ -477,9 +477,26 @@ moves, attachments, raw download, notifications.
 ### M12 — Post office and gateway relay (L)
 Local termination of inbound sessions, unknown-recipient policy, gateway relay
 with access policy and redaction, forwarding/store-and-forward.
-**Exit:** a scripted user session relayed to a scripted CMS, byte-identical both
-ways; a post office message picked up by a second session; queued mail flushed
-when the CMS comes back.
+
+**Split (25 Nov 2026):** the post office is built first and does not wait for the
+relay — it needs no Winlink Development Team registration, so it can be run and
+tested today.
+
+* *M12a — post office* (built): `packages/server/src/postoffice.ts` arms one modem,
+  answers `CONNECTED` with a challenge, files inbound mail by recipient, offers what
+  the caller's mailbox has not collected, holds mail for an unknown address, and
+  re-arms after every call. Owner flag and post-office password on the account; API
+  arm/disarm/status. **Exit:** a calling station's session collects its mail and
+  leaves its own over a scripted modem; a wrong password is refused before anything
+  is offered (`test/postoffice.test.ts`).
+* *M12b — forwarding and store-and-forward* (R4.4.4, R4.4.5): open sessions on a
+  user's behalf, attempt counts and next-attempt time, flush when the far end
+  returns.
+* *M12c — gateway relay* (R4.4.2): byte pipe to a CMS, access policy, verbatim
+  logging both ways, registration acknowledgement before it can be enabled.
+**Exit (whole milestone):** a scripted user session relayed to a scripted CMS,
+byte-identical both ways; a post office message picked up by a second session;
+queued mail flushed when the CMS comes back.
 
 ### M13 — Hardening and packaging (M)
 Limits, log rotation, redaction audit, backup documentation, Dockerfile sketch,
@@ -632,7 +649,7 @@ packages/store/src/password.ts        scrypt hash/verify
 packages/mailservers/src/access.ts    "very strict" / "strict" peer policy
 packages/mailservers/src/lines.ts     CRLF line reader (utf8 or latin1)
 packages/mailservers/src/events.ts    in-process "something arrived" bus
-packages/mailservers/src/identity.ts  login by account name, callsign or address
+packages/mailservers/src/identity.ts  login by callsign (any case, or the address)
 packages/mailservers/src/pop3.ts      POP3 server, one maildrop per account
 packages/mailservers/src/smtp.ts      SMTP submission (AUTH PLAIN/LOGIN)
 packages/mailservers/src/imap.ts      IMAP4rev1 (LOGIN, LIST, SELECT, SEARCH,
@@ -683,11 +700,12 @@ Deviations from the plan above, and why:
   destroy credentials. The store only ever sees an opaque
   `v1.<iv>.<tag>.<ct>` blob; the API exposes a `hasWinlinkPassword` boolean and
   never the value.
-* **One identity, three spellings** (`mailservers/src/identity.ts`): the web API,
-  POP3, IMAP and SMTP all resolve a username through the same function — exact
-  account name first, then the bare callsign, then a login that equals the
-  callsign — because a mail program fills the username field from the address and
-  the operator should not have to know which spelling the server prefers.
+* **One identity, one name** (`mailservers/src/identity.ts`, decision 25): the
+  account IS its callsign, so the web API, POP3, IMAP and SMTP all resolve a
+  username the same way — strip a `@winlink.org` domain, then one case-insensitive
+  callsign lookup. A mail program that fills the username field from the address
+  and an operator who types the callsign reach the same mailbox, and there is no
+  second account name to drift from it.
 * **One address form per surface** (`core-b2f/src/address.ts`): `toWinlinkAddress`
   on every ingress (SMTP `MAIL FROM`/`RCPT TO`, IMAP `APPEND`, the API composer,
   the importer — the first two through `parseRfc822`), `toFullAddress` only where

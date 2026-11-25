@@ -2,7 +2,7 @@
 // stored procedures, no native ENUM, timestamps as epoch milliseconds in
 // INTEGER columns. Later dialect adapters reproduce this shape exactly.
 
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 8;
 
 export const MIGRATION_001 = `
 CREATE TABLE users (
@@ -160,4 +160,33 @@ CREATE TABLE modems (
   updated_at     INTEGER NOT NULL
 );
 CREATE UNIQUE INDEX modems_name ON modems (name COLLATE NOCASE);
+`;
+
+// One identity per account (decision 25): a Winlink station has one callsign, so
+// the account IS that callsign and there is no second name for the same person.
+// `login` becomes the callsign, upper-case, and stays in step with it: the sign-in
+// form, POP3, IMAP and SMTP all ask for the callsign, and an address resolves to
+// the same row. Accounts made before this migration copy their callsign into the
+// login; a row that never had a callsign keeps its old login until one is set on
+// it (a callsign is never invented for an account). The callsign index becomes
+// case-insensitive, so `ok4rm` and `OK4RM` cannot become two accounts.
+export const MIGRATION_007 = `
+UPDATE users SET callsign = UPPER(TRIM(callsign))
+WHERE callsign IS NOT NULL AND callsign <> UPPER(TRIM(callsign));
+UPDATE users SET login = callsign WHERE callsign IS NOT NULL;
+DROP INDEX IF EXISTS users_callsign;
+CREATE UNIQUE INDEX users_callsign ON users (callsign COLLATE NOCASE);
+`;
+
+// The post office (decisions 27, 28). Two columns on the account and nothing else:
+//   post_office_secret  the sealed credential a station without a Winlink password
+//                       answers this station's `;PQ` challenge with. Sealed, not
+//                       hashed, because `;PR` is checked by recomputation.
+//   is_post_office      the account whose callsign the station answers as. A
+//                       partial unique index makes "at most one owner" a database
+//                       fact rather than a rule somebody remembers to enforce.
+export const MIGRATION_008 = `
+ALTER TABLE users ADD COLUMN post_office_secret TEXT;
+ALTER TABLE users ADD COLUMN is_post_office INTEGER NOT NULL DEFAULT 0;
+CREATE UNIQUE INDEX users_post_office_owner ON users (is_post_office) WHERE is_post_office = 1;
 `;

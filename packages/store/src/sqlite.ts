@@ -14,6 +14,8 @@ import {
   MIGRATION_004,
   MIGRATION_005,
   MIGRATION_006,
+  MIGRATION_007,
+  MIGRATION_008,
   SCHEMA_VERSION,
 } from './schema.ts';
 import type {
@@ -41,6 +43,8 @@ interface UserRow {
   callsign: string | null;
   locator: string | null;
   winlink_secret: string | null;
+  post_office_secret: string | null;
+  is_post_office: number;
   pw_hash: string | null;
   role: string;
   enabled: number;
@@ -88,6 +92,7 @@ interface FolderRow {
 
 interface MessageRow {
   id: number;
+  user_id: number;
   folder_id: number;
   uid: number;
   mid: string;
@@ -199,6 +204,8 @@ export class SqliteStore implements Store {
       [4, MIGRATION_004],
       [5, MIGRATION_005],
       [6, MIGRATION_006],
+      [7, MIGRATION_007],
+      [8, MIGRATION_008],
     ];
     for (const [version, sql] of migrations) {
       if (seen.has(version)) continue;
@@ -237,18 +244,24 @@ export class SqliteStore implements Store {
       callsign: row.callsign,
       locator: row.locator,
       winlinkSecret: row.winlink_secret,
+      postOfficeSecret: row.post_office_secret,
+      isPostOffice: row.is_post_office === 1,
       createdAt: row.created_at,
     };
   }
 
   async createUser(input: CreateUserInput): Promise<UserRecord> {
     const now = Date.now();
+    // One identity: the login is the callsign (decision 25). Both columns are
+    // written here so a caller cannot create an account whose two names differ.
+    const callsign = input.callsign.trim().toUpperCase();
+    if (callsign === '') throw new Error('an account needs a callsign');
     const id = this.transaction(() => {
       const result = this.run(
         `INSERT INTO users (login, callsign, pw_hash, role, enabled, quota_bytes, created_at, updated_at)
          VALUES (?, ?, ?, ?, 1, 0, ?, ?)`,
-        input.login,
-        input.callsign ? input.callsign.toUpperCase() : null,
+        callsign,
+        callsign,
         input.pwHash,
         input.role,
         now,
@@ -272,7 +285,14 @@ export class SqliteStore implements Store {
   }
 
   async findUserByLogin(login: string): Promise<UserRecord | null> {
-    const row = this.get<UserRow>('SELECT * FROM users WHERE login = ? COLLATE NOCASE', login);
+    // The login is the callsign; matching is case-insensitive because a station is
+    // told its callsign in whatever case the operator typed (decision 25).
+    const name = login.trim();
+    const row = this.get<UserRow>(
+      'SELECT * FROM users WHERE login = ? COLLATE NOCASE OR callsign = ? COLLATE NOCASE',
+      name,
+      name,
+    );
     return row ? this.userFrom(row) : null;
   }
 
@@ -322,7 +342,7 @@ export class SqliteStore implements Store {
   }
 
   async setCallsign(userId: number, callsign: string | null): Promise<void> {
-    const next = callsign ? callsign.toUpperCase() : null;
+    const next = callsign ? callsign.trim().toUpperCase() : null;
     const current = this.get<{ callsign: string | null }>(
       'SELECT callsign FROM users WHERE id = ?',
       userId,
@@ -330,9 +350,16 @@ export class SqliteStore implements Store {
     const changed = (current?.callsign ?? null) !== next;
     this.run(
       // The sealed credential belongs to the callsign, so a different callsign
-      // must not inherit it.
-      'UPDATE users SET callsign = ?, winlink_secret = CASE WHEN ? THEN NULL ELSE winlink_secret END, updated_at = ? WHERE id = ?',
+      // must not inherit it. `login` follows the callsign: one identity per
+      // account, so renaming the station renames the sign-in (decision 25).
+      `UPDATE users SET callsign = ?, login = COALESCE(?, login),
+         winlink_secret = CASE WHEN ? THEN NULL ELSE winlink_secret END,
+         post_office_secret = CASE WHEN ? THEN NULL ELSE post_office_secret END,
+         updated_at = ?
+       WHERE id = ?`,
       next,
+      next,
+      changed ? 1 : 0,
       changed ? 1 : 0,
       Date.now(),
       userId,
@@ -344,7 +371,10 @@ export class SqliteStore implements Store {
   }
 
   async findUserByCallsign(callsign: string): Promise<UserRecord | null> {
-    const row = this.get<UserRow>('SELECT * FROM users WHERE callsign = ?', callsign.toUpperCase());
+    const row = this.get<UserRow>(
+      'SELECT * FROM users WHERE callsign = ? COLLATE NOCASE',
+      callsign.trim(),
+    );
     return row ? this.userFrom(row) : null;
   }
 
@@ -360,6 +390,49 @@ export class SqliteStore implements Store {
     const row = this.get<{ callsign: string | null }>('SELECT callsign FROM users WHERE id = ?', userId);
     if (!row?.callsign) return false;
     this.run('UPDATE users SET winlink_secret = ?, updated_at = ? WHERE id = ?', secret, Date.now(), userId);
+    return true;
+  }
+
+  async getPostOfficeSecret(userId: number): Promise<string | null> {
+    const row = this.get<{ post_office_secret: string | null }>(
+      'SELECT post_office_secret FROM users WHERE id = ?',
+      userId,
+    );
+    return row?.post_office_secret ?? null;
+  }
+
+  async setPostOfficeSecret(userId: number, secret: string | null): Promise<boolean> {
+    // Like the Winlink credential, it belongs to a callsign: without one there is
+    // nobody for a station to authenticate as.
+    const row = this.get<{ callsign: string | null }>('SELECT callsign FROM users WHERE id = ?', userId);
+    if (!row?.callsign) return false;
+    this.run(
+      'UPDATE users SET post_office_secret = ?, updated_at = ? WHERE id = ?',
+      secret,
+      Date.now(),
+      userId,
+    );
+    return true;
+  }
+
+  async findPostOfficeOwner(): Promise<UserRecord | null> {
+    const row = this.get<UserRow>('SELECT * FROM users WHERE is_post_office = 1');
+    return row ? this.userFrom(row) : null;
+  }
+
+  async setPostOfficeOwner(userId: number | null): Promise<boolean> {
+    if (userId === null) {
+      this.run('UPDATE users SET is_post_office = 0 WHERE is_post_office = 1');
+      return true;
+    }
+    const row = this.get<{ callsign: string | null }>('SELECT callsign FROM users WHERE id = ?', userId);
+    if (!row?.callsign) return false;
+    // The station answers as one callsign, so one account owns the role. Clearing
+    // the previous owner first also satisfies the partial unique index.
+    this.transaction(() => {
+      this.run('UPDATE users SET is_post_office = 0 WHERE is_post_office = 1 AND id <> ?', userId);
+      this.run('UPDATE users SET is_post_office = 1, updated_at = ? WHERE id = ?', Date.now(), userId);
+    });
     return true;
   }
 
@@ -693,6 +766,23 @@ export class SqliteStore implements Store {
     const { to, cc } = this.recipients(row.id);
     const count = this.get<{ n: number }>('SELECT COUNT(*) AS n FROM attachments WHERE message_id = ?', row.id);
     return this.envelopeFrom(row, count?.n ?? 0, to, cc);
+  }
+
+  async findReceivedByMid(
+    mid: string,
+  ): Promise<{ userId: number; envelope: MessageEnvelope } | null> {
+    // The station's duplicate check: a post office answers a proposal before it
+    // knows who the message is for, so the MID is matched across every mailbox —
+    // but only against mail that arrived. A copy in somebody's OUTBOX is a message
+    // this station is sending, and answering `-` for it would drop the peer's.
+    const row = this.get<MessageRow>(
+      "SELECT * FROM messages WHERE mid = ? AND direction = 'in' LIMIT 1",
+      mid.toUpperCase(),
+    );
+    if (!row) return null;
+    const { to, cc } = this.recipients(row.id);
+    const count = this.get<{ n: number }>('SELECT COUNT(*) AS n FROM attachments WHERE message_id = ?', row.id);
+    return { userId: row.user_id, envelope: this.envelopeFrom(row, count?.n ?? 0, to, cc) };
   }
 
   async listMessages(

@@ -38,7 +38,7 @@ async function silentModem(): Promise<{ port: number; close: () => Promise<void>
 test('a call that never comes up is logged with the reason it did not', async () => {
   const store = new SqliteStore({ path: ':memory:' });
   await store.migrate();
-  const user = await store.createUser({ login: 'ok4rm', pwHash: null, role: 'admin', callsign: 'OK4RM' });
+  const user = await store.createUser({ callsign: 'OK4RM', pwHash: null, role: 'admin' });
   const modem = await silentModem();
   const { logger, lines } = capturing();
 

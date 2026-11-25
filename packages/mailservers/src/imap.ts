@@ -803,7 +803,7 @@ export class ImapServer {
 			write(`${tag} NO [AUTHENTICATIONFAILED] invalid credentials\r\n`);
 			return false;
 		}
-		this.opts.logger.info('imap login', { login: user.login, callsign: user.callsign });
+		this.opts.logger.info('imap login', { callsign: user.callsign ?? user.login });
 		session.user = user;
 		write(`${tag} OK [CAPABILITY IMAP4rev1 LITERAL+ IDLE] logged in\r\n`);
 		return false;
@@ -909,7 +909,7 @@ export class ImapServer {
 				await this.opts.store.insertMessage(
 					user.id,
 					target.id,
-					{ ...full, mid: generateMid(user.login) },
+					{ ...full, mid: generateMid(user.callsign ?? user.login) },
 					{ direction: 'in' },
 				);
 			}
@@ -1194,7 +1194,7 @@ export class ImapServer {
 			write(`${tag} BAD APPEND needs a message literal\r\n`);
 			return false;
 		}
-		const message = parseRfc822(new Uint8Array(literal), { mid: generateMid(text(args[0]) || user.login) });
+		const message = parseRfc822(new Uint8Array(literal), { mid: generateMid(text(args[0]) || user.callsign || user.login) });
 		let flags = flagBits(flagNames);
 		if (!flagNames.some((flag) => flag.toLowerCase() === '\\seen')) flags |= FLAG_UNREAD;
 		await this.opts.store.insertMessage(user.id, folder.id, message, {

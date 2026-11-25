@@ -110,13 +110,14 @@ Empty `smtp`/`imap` strings keep that service off.
 | POP3 | `1110` — INBOX only |
 | IMAP | `1143` — every folder |
 | SMTP submission | `1025` — `AUTH` required once the account has a password |
-| User | the account name — `ok4rm`; the callsign `OK4RM` and the address `OK4RM@winlink.org` work too |
+| User | your callsign — `OK4RM`; `ok4rm` and `OK4RM@winlink.org` are the same name |
 | Password | the *mail* password from the Account page, not the Winlink one |
 | Security | none on loopback; TLS is not implemented yet |
 
-All three doors accept the account name, the callsign or the Winlink address as
-the username, so a mail program that fills in `OK4RM@winlink.org` from the address
-authenticates without being corrected. The password is the mail password set on
+The username is the callsign: it is the account, the mailbox and the login at
+every door, and it is matched without regard to case. A mail program that fills in
+`OK4RM@winlink.org` from the address therefore authenticates without being
+corrected. There is no separate account name. The password is the mail password set on
 the Account page's Password section — the Winlink password beside the callsign is
 a different secret and will not be accepted here.
 
@@ -130,15 +131,34 @@ radio session and a gateway use; an ordinary internet address such as
 POP3 serves INBOX only, and deleting there removes the message when the session
 ends, as POP3 specifies; deleting in the web client moves it to TRASH. IMAP sees
 all five folders. Submission through SMTP lands in OUTBOX, where the radio side
-will pick it up; the sender address must match one of the account's callsigns.
+will pick it up; the sender address must be the account's callsign.
+
+## Post office
+
+The station can answer calls as well as make them: it terminates the B2F session
+itself and holds mail for its own accounts, with no Winlink gateway registration.
+
+1. Accounts → mark one account as the **post office owner**. Its callsign is what the
+   station answers as.
+2. On that account (or on the Accounts page), set a **post-office password** — this is
+   what a station with no Winlink registration answers the challenge with. A Winlink
+   password works too, and either one authenticates.
+3. Post office → pick a modem, type the dial frequency (kHz below 10 MHz, MHz above)
+   and **Start answering**. The radio is tuned first; if its `rigctld` link is down the
+   station refuses rather than listening on a frequency nobody chose.
+
+Mail a caller leaves is filed in the INBOX of every local callsign it names. Mail
+waiting for the caller is offered once: collected mail stays in the mailbox but is
+marked as collected. Mail for a callsign no account holds is deferred when the caller
+names the recipient, and otherwise held in the owner's mailbox and logged.
 
 ## Command line
 
 ```sh
 npm run cli -- info
-npm run cli -- user add ok1abc --callsign OK1ABC --admin
-npm run cli -- user passwd ok1abc
-npm run cli -- import message.eml --user ok1abc
+npm run cli -- user add OK1ABC --admin
+npm run cli -- user passwd OK1ABC
+npm run cli -- import message.eml --user OK1ABC
 ```
 
 `import` parses RFC 822 (multipart, charsets, encoded words) and stores the
@@ -148,8 +168,8 @@ message in INBOX — useful for trying the UI or POP3 without a radio.
 
 ```sh
 npm run check   # tsc for the backend + svelte-check for the client (0 warnings)
-npm test        # 37 tests: message codec, store, HTTP API, POP3, SMTP, IMAP,
-                # HTML sanitiser, access policy
+npm test        # 171 tests: message codec, LZHUF, B2F exchange, sessions, the
+                # post office, store, HTTP API, POP3, SMTP, IMAP, HTML sanitiser
 ```
 
 ## Layout

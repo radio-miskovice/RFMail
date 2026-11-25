@@ -6,6 +6,7 @@
 	import RadioControl from './RadioControl.svelte';
 	import RadioView from './RadioView.svelte';
 	import SessionView from './SessionView.svelte';
+	import PostOfficeView from './PostOfficeView.svelte';
 	import ModemView from './ModemView.svelte';
 	import Composer from './Composer.svelte';
 	import MessageList from './MessageList.svelte';
@@ -25,7 +26,7 @@
 		onmechange: (me: Me) => void;
 	} = $props();
 
-	type View = 'mail' | 'users' | 'account' | 'radio' | 'modems' | 'session';
+	type View = 'mail' | 'users' | 'account' | 'radio' | 'modems' | 'session' | 'postoffice';
 	let view = $state<View>('mail');
 
 	let folders = $state<FolderWithCounts[]>([]);
@@ -185,6 +186,14 @@
 			<button class="btn ghost" class:active={view === 'session'} type="button" onclick={() => (view = 'session')}>
 				Session
 			</button>
+			<button
+				class="btn ghost"
+				class:active={view === 'postoffice'}
+				type="button"
+				onclick={() => (view = 'postoffice')}
+			>
+				Post office
+			</button>
 			<button class="btn ghost" class:active={view === 'account'} type="button" onclick={() => (view = 'account')}>
 				Account
 			</button>
@@ -213,6 +222,8 @@
 		<ModemView />
 	{:else if view === 'session'}
 		<SessionView onSent={() => void loadFolders()} />
+	{:else if view === 'postoffice'}
+		<PostOfficeView />
 	{:else if view === 'users'}
 		<UsersView {me} onmechanged={onmechange} />
 	{:else if view === 'account'}
@@ -220,14 +231,11 @@
 	{:else}
 	<div class="body">
 		<aside class="folders" aria-label="Folders">
-			<!-- Whose mailbox this is: the callsign is the Winlink identity, the
-			     login is the account name the mail program asks for. -->
-			<div class="mailbox-owner" title="Callsign and account of this mailbox">
-				{#if me.user.callsign}
-					<span class="owner-call">{me.user.callsign}</span>
-				{/if}
+			<!-- Whose mailbox this is: the callsign is the account, the login at every
+			     door, and the address a mail program signs in with (decision 25). -->
+			<div class="mailbox-owner" title="Callsign of this mailbox">
+				<span class="owner-call">{me.user.callsign ?? 'no callsign'}</span>
 				<span class="owner-row">
-					<span class="owner-login">{me.user.login}</span>
 					<button class="change-user" type="button" onclick={signOut}>Change user</button>
 				</span>
 			</div>
@@ -257,7 +265,7 @@
 
 		<section class="pane-list" aria-label="Messages">
 			<div class="toolbar">
-				<span class="owner-mobile">{me.user.callsign ?? me.user.login}</span>
+				<span class="owner-mobile">{me.user.callsign ?? ''}</span>
 				<select
 					class="folder-select"
 					aria-label="Folder"
@@ -432,14 +440,6 @@
 		font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
 		font-size: 0.8rem;
 		font-weight: 600;
-		white-space: nowrap;
-	}
-
-	.owner-login {
-		font-size: 0.76rem;
-		color: var(--muted);
-		overflow: hidden;
-		text-overflow: ellipsis;
 		white-space: nowrap;
 	}
 

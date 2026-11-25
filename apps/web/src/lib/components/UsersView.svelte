@@ -11,7 +11,6 @@
 	let error = $state('');
 	let notice = $state('');
 
-	let newLogin = $state('');
 	let newCallsign = $state('');
 	let newLocator = $state('');
 	let newRole = $state<Role>('user');
@@ -40,13 +39,11 @@
 		notice = '';
 		try {
 			await api.createUser({
-				login: newLogin.trim(),
+				callsign: newCallsign.trim(),
 				role: newRole,
 				...(newPassword ? { password: newPassword } : {}),
-				...(newCallsign.trim() ? { callsign: newCallsign.trim() } : {}),
 				...(newLocator.trim() ? { locator: newLocator.trim() } : {})
 			});
-			newLogin = '';
 			newCallsign = '';
 			newLocator = '';
 			newPassword = '';
@@ -88,15 +85,48 @@
 	}
 
 	async function resetPassword(user: User): Promise<void> {
-		const value = window.prompt(`New password for ${user.login} (leave empty to remove the password):`, '');
+		const value = window.prompt(`New password for ${user.callsign ?? 'this account'} (leave empty to remove the password):`, '');
 		if (value === null) return;
 		notice = '';
 		error = '';
 		try {
 			const result = await api.resetPassword(user.id, value);
 			notice = result.hasPassword
-				? `Password set for ${user.login}.`
-				: `Password removed for ${user.login}.`;
+				? `Password set for ${user.callsign}.`
+				: `Password removed for ${user.callsign}.`;
+			await load();
+		} catch (err) {
+			error = err instanceof ApiRequestError ? (Object.values(err.fields ?? {})[0] ?? err.message) : 'Failed.';
+		}
+	}
+
+	async function toggleOwner(user: User): Promise<void> {
+		notice = '';
+		error = '';
+		try {
+			await api.updateUser(user.id, { isPostOffice: !user.isPostOffice });
+			notice = user.isPostOffice
+				? `The post office no longer answers as ${user.callsign}.`
+				: `The post office now answers as ${user.callsign}.`;
+			await load();
+		} catch (err) {
+			error = err instanceof ApiRequestError ? err.message : 'Could not change the post office owner.';
+		}
+	}
+
+	async function resetPostOfficePassword(user: User): Promise<void> {
+		const value = window.prompt(
+			`Post-office password for ${user.callsign ?? 'this account'} — what it answers another station's challenge with (leave empty to remove):`,
+			''
+		);
+		if (value === null) return;
+		notice = '';
+		error = '';
+		try {
+			const updated = await api.updateUser(user.id, { postOfficePassword: value });
+			notice = updated.hasPostOfficePassword
+				? `Post-office password set for ${user.callsign}.`
+				: `Post-office password removed for ${user.callsign}.`;
 			await load();
 		} catch (err) {
 			error = err instanceof ApiRequestError ? (Object.values(err.fields ?? {})[0] ?? err.message) : 'Failed.';
@@ -104,12 +134,12 @@
 	}
 
 	async function remove(user: User): Promise<void> {
-		if (!window.confirm(`Delete the account ${user.login} and its mailbox? This cannot be undone.`)) return;
+		if (!window.confirm(`Delete the account ${user.callsign ?? 'this account'} and its mailbox? This cannot be undone.`)) return;
 		notice = '';
 		error = '';
 		try {
 			await api.deleteUser(user.id);
-			notice = `Account ${user.login} deleted.`;
+			notice = `Account ${user.callsign} deleted.`;
 			await load();
 		} catch (err) {
 			error = err instanceof ApiRequestError ? err.message : 'Could not delete the account.';
@@ -132,7 +162,6 @@
 
 	<div class="table" aria-busy={loading}>
 		<div class="head row">
-			<span>Account</span>
 			<span>Callsign</span>
 			<span>WW-Locator</span>
 			<span>Role</span>
@@ -143,11 +172,11 @@
 		{#each users as user (user.id)}
 			<div class="row" class:disabled={!user.enabled}>
 				<span class="login">
-					{user.login}
+					{user.callsign ?? '—'}
 					{#if user.id === me.user.id}<span class="you">you</span>{/if}
 					{#if !user.enabled}<span class="off">disabled</span>{/if}
+					{#if user.isPostOffice}<span class="owner" title="This account's callsign is what the post office answers as">post office</span>{/if}
 				</span>
-				<span class="mono">{user.callsign ?? '—'}</span>
 				<span class="mono">{user.locator ?? '—'}</span>
 				<button class="btn ghost small-btn" type="button" onclick={() => changeRole(user)} title="Toggle role">
 					{user.role}
@@ -156,6 +185,25 @@
 				<span class="muted">{formatDateTime(user.createdAt)}</span>
 				<span class="actions">
 					<button class="btn ghost small-btn" type="button" onclick={() => resetPassword(user)}>Password</button>
+					<button
+						class="btn ghost small-btn"
+						type="button"
+						title="The password this account answers a post office's challenge with"
+						onclick={() => resetPostOfficePassword(user)}
+					>
+						Post-office pw
+					</button>
+					<button
+						class="btn ghost small-btn"
+						type="button"
+						title={user.isPostOffice
+							? 'Stop answering calls as this account'
+							: 'Make this account the station the post office answers as'}
+						disabled={!user.callsign}
+						onclick={() => toggleOwner(user)}
+					>
+						{user.isPostOffice ? 'Unown' : 'Make owner'}
+					</button>
 					<button class="btn ghost small-btn" type="button" onclick={() => toggleEnabled(user)}>
 						{user.enabled ? 'Disable' : 'Enable'}
 					</button>
@@ -180,12 +228,8 @@
 		<form onsubmit={create}>
 			<div class="fields">
 				<label class="field">
-					<span>Account name</span>
-					<input type="text" name="login" bind:value={newLogin} required />
-				</label>
-				<label class="field">
-					<span>Callsign (optional)</span>
-					<input type="text" name="callsign" bind:value={newCallsign} placeholder="OK1ABC" />
+					<span>Callsign</span>
+					<input type="text" name="callsign" bind:value={newCallsign} placeholder="OK1ABC" required />
 				</label>
 				<label class="field">
 					<span>WW-Locator (optional)</span>
@@ -210,7 +254,7 @@
 				</label>
 			</div>
 			{#if createError}<p class="error" role="alert">{createError}</p>{/if}
-			<button class="btn primary" type="submit" disabled={creating || !newLogin.trim()}>
+			<button class="btn primary" type="submit" disabled={creating || !newCallsign.trim()}>
 				{creating ? 'Creating…' : 'Create account'}
 			</button>
 		</form>
@@ -274,6 +318,17 @@
 	.row.disabled .login {
 		text-decoration: line-through;
 		color: var(--muted);
+	}
+
+	.owner {
+		margin-left: 0.4rem;
+		padding: 0.05rem 0.35rem;
+		border-radius: 0.25rem;
+		border: 1px solid var(--accent);
+		color: var(--accent);
+		font-size: 0.65rem;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
 	}
 
 	.login {

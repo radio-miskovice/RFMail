@@ -419,6 +419,8 @@ function emptyUser(): UserRecord {
     callsign: null,
     locator: null,
     winlinkSecret: null,
+    postOfficeSecret: null,
+    isPostOffice: false,
     createdAt: 0,
   };
 }

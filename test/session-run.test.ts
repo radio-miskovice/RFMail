@@ -15,7 +15,7 @@ import { ScriptedModem, outboundMessage } from './helpers/scripted-gateway.ts';
 async function setup(): Promise<{ store: SqliteStore; userId: number; outboxId: number }> {
   const store = new SqliteStore({ path: ':memory:' });
   await store.migrate();
-  const user = await store.createUser({ login: 'jvavruska', pwHash: null, role: 'admin', callsign: 'OK4RM' });
+  const user = await store.createUser({ callsign: 'OK4RM', pwHash: null, role: 'admin' });
   await store.setLocator(user.id, 'JO70AA');
   const outbox = await store.findFolder(user.id, 'OUTBOX');
   assert.ok(outbox);
@@ -176,7 +176,7 @@ test('a peer-to-peer session offers only what is addressed to that station', asy
   await modem.listen();
   const store = new SqliteStore({ path: ':memory:' });
   await store.migrate();
-  const user = await store.createUser({ login: 'ok4rm', pwHash: null, role: 'admin', callsign: 'OK4RM' });
+  const user = await store.createUser({ callsign: 'OK4RM', pwHash: null, role: 'admin' });
   await store.setLocator(user.id, 'JO70AA');
   const outbox = await store.findFolder(user.id, 'OUTBOX');
   assert.ok(outbox);

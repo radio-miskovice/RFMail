@@ -20,6 +20,8 @@ import {
   ensureSecret,
   loadConfig,
   parseAddress,
+  openSecret,
+  PostOffice,
 } from '@rfmail/server';
 import { ImapServer, MailEvents, PeerPolicy, Pop3Server, SmtpServer } from '@rfmail/mailservers';
 import { TransceiverLinks } from '@rfmail/rig';
@@ -114,6 +116,14 @@ async function main(): Promise<void> {
       boundImap = imap.address;
     }
 
+    // The answering half of the B2F exchange: armed and disarmed from the API,
+    // never started by itself (decision 26).
+    const postOffice = new PostOffice({
+      store,
+      logger,
+      openSecret: (blob) => openSecret(blob, config.server.storeKey),
+    });
+
     const api = createApi({
       store,
       sessions,
@@ -124,6 +134,7 @@ async function main(): Promise<void> {
       accessMode: policy.describe(),
       storeKey: config.server.storeKey,
       links,
+      postOffice,
       // The catalogue cache sits beside the database, so a restart does not have to
       // ask Winlink again before the session screen can be filled.
       cacheDir: dirname(resolve(config.database.path)),

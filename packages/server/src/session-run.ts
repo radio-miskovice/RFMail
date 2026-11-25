@@ -26,7 +26,7 @@ import {
   type SessionHandler,
   type SessionMode,
 } from '@rfmail/core-b2f';
-import type { Logger, ModemKind } from '@rfmail/shared';
+import { parseClientIdentity, type Logger, type ModemKind } from '@rfmail/shared';
 import type { Store, UserRecord } from '@rfmail/store';
 import { bandwidthOfMode, dialModem, hangUpModem, type DialOutcome } from './modem-dial.ts';
 import { tcpDuplex } from './tcp-duplex.ts';
@@ -52,6 +52,12 @@ export interface SessionRunOptions {
    * and which of the account's outbox messages may be offered at all.
    */
   mode?: SessionMode;
+  /**
+   * A client identity to present in the SID instead of this station's own, e.g.
+   * `RMS Express-1.8.6.0`. Checked against the SID's format: if it does not pass, it is
+   * ignored and `rfmail-<version>` goes out as usual.
+   */
+  fakeClient?: string | null;
   bandwidthHz?: number;
   /** The Winlink secure-login password, opened from the sealed secret by the caller. */
   password?: string | null;
@@ -204,10 +210,22 @@ export async function runSession(options: SessionRunOptions): Promise<SessionRep
       },
     };
 
+    // A client identity the operator asked for, presented only when it survives the SID's
+    // own rules; otherwise the station presents itself and the log says why.
+    const claimed = options.fakeClient ? parseClientIdentity(options.fakeClient) : null;
+    if (options.fakeClient && !claimed) {
+      logger.warn('fake client ignored', {
+        target: options.target,
+        value: options.fakeClient,
+        reason: 'not NAME-VERSION: a letter-led name without brackets, then digits and dots',
+      });
+    }
+
     const session = new Session({
       myCallsign: callsign,
       target: options.target,
       mode,
+      ...(claimed ? { application: claimed.application, version: claimed.version } : {}),
       locator: account.locator ?? '',
       password: options.password ?? null,
       handler,

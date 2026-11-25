@@ -3,6 +3,12 @@ import type { MailAttachment, MailMessage } from '@rfmail/core-b2f';
 
 export interface UserRecord {
   id: number;
+  /**
+   * The account's identity, which is its callsign: `login` mirrors `callsign`
+   * (upper-case) and exists as the sign-in key, so the two can never name two
+   * different people. A row written before decision 25 may still hold a login
+   * of its own until a callsign is set on it.
+   */
   login: string;
   role: Role;
   enabled: boolean;
@@ -11,8 +17,8 @@ export interface UserRecord {
   pwHash: string | null;
   /**
    * The station callsign, which is the originator of every message this account
-   * sends. One callsign is one mailbox, so it is unique across accounts and may
-   * be null only for an account that has not been given one yet.
+   * sends. One callsign is one mailbox, so it is unique across accounts; it is
+   * also the login, so there is no second name for the same person.
    */
   callsign: string | null;
   /** Maidenhead grid square of the operator's station, e.g. `JO70AA`. */
@@ -22,6 +28,14 @@ export interface UserRecord {
    * Never serialised to a client: `toUser` exposes only a boolean.
    */
   winlinkSecret: string | null;
+  /**
+   * Sealed post-office password: the credential a station without a Winlink
+   * password answers this station's challenge with (decision 27). Sealed rather
+   * than hashed because `;PR` is verified by recomputation.
+   */
+  postOfficeSecret: string | null;
+  /** Whether this account is the station's post-office identity (at most one). */
+  isPostOffice: boolean;
   createdAt: number;
 }
 
@@ -160,11 +174,15 @@ export interface InsertResult {
 }
 
 export interface CreateUserInput {
-  login: string;
+  /**
+   * The account's identity: a Winlink station has one callsign, and the account
+   * is that callsign, so it is also the login (stored upper-case, matched
+   * without regard to case). Required — an account without a callsign can
+   * neither send nor receive mail.
+   */
+  callsign: string;
   pwHash: string | null;
   role: Role;
-  /** Optional at creation; an account cannot run a session without one. */
-  callsign?: string;
 }
 
 /**
@@ -200,6 +218,17 @@ export interface Store {
   getWinlinkSecret(userId: number): Promise<string | null>;
   /** Stores or clears the sealed credential; false if the account has no callsign. */
   setWinlinkSecret(userId: number, secret: string | null): Promise<boolean>;
+  /** Sealed post-office credential of the account, or null. */
+  getPostOfficeSecret(userId: number): Promise<string | null>;
+  /** Stores or clears it; false if the account has no callsign. */
+  setPostOfficeSecret(userId: number, secret: string | null): Promise<boolean>;
+  /**
+   * The account whose callsign the post office answers as, or null. At most one
+   * account is the owner; making one the owner unseats the previous one.
+   */
+  findPostOfficeOwner(): Promise<UserRecord | null>;
+  /** Makes the account the owner (null clears it); false if it has no callsign. */
+  setPostOfficeOwner(userId: number | null): Promise<boolean>;
 
   listTransceivers(): Promise<TransceiverRecord[]>;
   getTransceiver(id: number): Promise<TransceiverRecord | null>;
@@ -239,6 +268,15 @@ export interface Store {
    * already stored is offering something this station has.
    */
   findMessageByMid(userId: number, mid: string): Promise<MessageEnvelope | null>;
+  /**
+   * The *received* message holding this MID in any mailbox, with its owner. A post
+   * office decides a proposal before it knows who the message is for, so its
+   * duplicate check is the station's, not one mailbox's (decision 28) — and it
+   * matches only mail that has arrived: a message sitting in somebody's OUTBOX is
+   * one this station is sending, not one it already has, and rejecting a peer's
+   * proposal for it would lose the peer's message.
+   */
+  findReceivedByMid(mid: string): Promise<{ userId: number; envelope: MessageEnvelope } | null>;
   /** A message with its attachment bytes, ready for serialisation. */
   getMailMessage(userId: number, messageId: number): Promise<MailMessage | null>;
   getAttachment(

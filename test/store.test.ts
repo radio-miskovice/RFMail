@@ -12,8 +12,10 @@ async function freshStore(): Promise<SqliteStore> {
 
 test('creates a user with the default folders and no password', async () => {
 	const store = await freshStore();
-	const user = await store.createUser({ login: 'Tester', pwHash: null, role: 'admin' });
-	assert.equal(user.login, 'Tester');
+	// The callsign is the account and the login (decision 25), stored upper-case.
+	const user = await store.createUser({ callsign: 'ok1abc', pwHash: null, role: 'admin' });
+	assert.equal(user.login, 'OK1ABC');
+	assert.equal(user.callsign, 'OK1ABC');
 	assert.equal(user.pwHash, null);
 	assert.equal(user.role, 'admin');
 
@@ -32,17 +34,22 @@ test('creates a user with the default folders and no password', async () => {
 
 test('login lookup is case-insensitive and counts users', async () => {
 	const store = await freshStore();
-	await store.createUser({ login: 'tester', pwHash: null, role: 'user' });
+	await store.createUser({ callsign: 'OK1ABC', pwHash: null, role: 'user' });
 	assert.equal(await store.countUsers(), 1);
-	assert.ok(await store.findUserByLogin('TESTER'));
-	assert.equal(await store.findUserByLogin('other'), null);
-	await assert.rejects(() => store.createUser({ login: 'TESTER', pwHash: null, role: 'user' }));
+	// A callsign arrives in whatever case the operator typed it.
+	for (const spelling of ['OK1ABC', 'ok1abc', 'Ok1Abc', ' ok1abc ']) {
+		assert.equal((await store.findUserByLogin(spelling))?.login, 'OK1ABC', spelling);
+		assert.equal((await store.findUserByCallsign(spelling))?.id, (await store.findUserByLogin('OK1ABC'))?.id, spelling);
+	}
+	assert.equal(await store.findUserByLogin('ok2xyz'), null);
+	// The same callsign in another case is the same account, not a second one.
+	await assert.rejects(() => store.createUser({ callsign: 'ok1abc', pwHash: null, role: 'user' }));
 	await store.close();
 });
 
 test('stores a message, assigns uids per folder and lists it', async () => {
 	const store = await freshStore();
-	const user = await store.createUser({ login: 'tester', pwHash: null, role: 'user' });
+	const user = await store.createUser({ callsign: 'OK1ABC', pwHash: null, role: 'user' });
 	const inbox = await store.findFolder(user.id, 'INBOX');
 	assert.ok(inbox);
 
@@ -78,8 +85,8 @@ test('stores a message, assigns uids per folder and lists it', async () => {
 
 test('rejects a duplicate MID for the same user but not across users', async () => {
 	const store = await freshStore();
-	const alice = await store.createUser({ login: 'alice', pwHash: null, role: 'user' });
-	const bob = await store.createUser({ login: 'bob', pwHash: null, role: 'user' });
+	const alice = await store.createUser({ callsign: 'OK1ALC', pwHash: null, role: 'user' });
+	const bob = await store.createUser({ callsign: 'OK2BOB', pwHash: null, role: 'user' });
 	const aliceInbox = await store.findFolder(alice.id, 'INBOX');
 	const bobInbox = await store.findFolder(bob.id, 'INBOX');
 	assert.ok(aliceInbox && bobInbox);
@@ -93,8 +100,8 @@ test('rejects a duplicate MID for the same user but not across users', async () 
 
 test('flags, folders and deletion respect ownership', async () => {
 	const store = await freshStore();
-	const alice = await store.createUser({ login: 'alice', pwHash: null, role: 'user' });
-	const bob = await store.createUser({ login: 'bob', pwHash: null, role: 'user' });
+	const alice = await store.createUser({ callsign: 'OK1ALC', pwHash: null, role: 'user' });
+	const bob = await store.createUser({ callsign: 'OK2BOB', pwHash: null, role: 'user' });
 	const inbox = await store.findFolder(alice.id, 'INBOX');
 	const archive = await store.findFolder(alice.id, 'ARCHIVE');
 	assert.ok(inbox && archive);
@@ -120,7 +127,7 @@ test('flags, folders and deletion respect ownership', async () => {
 
 test('search filters on subject and sender', async () => {
 	const store = await freshStore();
-	const user = await store.createUser({ login: 'tester', pwHash: null, role: 'user' });
+	const user = await store.createUser({ callsign: 'OK1ABC', pwHash: null, role: 'user' });
 	const inbox = await store.findFolder(user.id, 'INBOX');
 	assert.ok(inbox);
 	const base = {
@@ -148,7 +155,7 @@ test('search filters on subject and sender', async () => {
 
 test('usage counts message bodies and attachments', async () => {
 	const store = await freshStore();
-	const user = await store.createUser({ login: 'tester', pwHash: null, role: 'user' });
+	const user = await store.createUser({ callsign: 'OK1ABC', pwHash: null, role: 'user' });
 	const inbox = await store.findFolder(user.id, 'INBOX');
 	assert.ok(inbox);
 	const message = composeMessage({
@@ -168,13 +175,18 @@ test('usage counts message bodies and attachments', async () => {
 test('one callsign per account, and the Winlink credential belongs to it', async () => {
 	const store = new SqliteStore({ path: ':memory:' });
 	await store.migrate();
-	const user = await store.createUser({ login: 'op', pwHash: null, role: 'user' });
+	// An account is created with its callsign, and the login is that callsign.
+	const user = await store.createUser({ callsign: 'OK1OP', pwHash: null, role: 'user' });
+	assert.equal(user.login, 'OK1OP');
 
-	assert.equal(await store.setWinlinkSecret(user.id, 'sealed-blob'), false, 'no callsign yet');
-	assert.equal(await store.getWinlinkSecret(user.id), null);
+	assert.equal(await store.setWinlinkSecret(user.id, 'sealed-blob'), true);
+	assert.equal(await store.getWinlinkSecret(user.id), 'sealed-blob');
 
 	await store.setCallsign(user.id, 'OK4RM');
 	assert.equal((await store.getUser(user.id))?.callsign, 'OK4RM', 'stored upper-cased');
+	assert.equal((await store.getUser(user.id))?.login, 'OK4RM', 'the login follows the callsign');
+	assert.equal((await store.findUserByLogin('ok4rm'))?.id, user.id);
+	assert.equal((await store.findUserByLogin('ok1op')), null, 'the old callsign is not a second name');
 	assert.equal(await store.setWinlinkSecret(user.id, 'sealed-blob'), true);
 	assert.equal(await store.getWinlinkSecret(user.id), 'sealed-blob');
 
@@ -187,14 +199,17 @@ test('one callsign per account, and the Winlink credential belongs to it', async
 	assert.equal(await store.getWinlinkSecret(user.id), null);
 
 	// A callsign belongs to one mailbox.
-	const other = await store.createUser({ login: 'other', pwHash: null, role: 'user' });
+	const other = await store.createUser({ callsign: 'OK2OTH', pwHash: null, role: 'user' });
 	await assert.rejects(() => store.setCallsign(other.id, 'OK4RM-10'), /UNIQUE|constraint/i);
+	assert.equal((await store.getUser(other.id))?.login, 'OK2OTH', 'a refused rename leaves the login alone');
 	assert.equal((await store.findUserByCallsign('OK4RM-10'))?.id, user.id, 'lookup is case-insensitive');
 
-	// Clearing the callsign clears the credential with it.
+	// Clearing the callsign clears the credential with it, and the old callsign
+	// stays the login so the account can still be signed in to.
 	await store.setWinlinkSecret(user.id, 'sealed-blob');
 	await store.setCallsign(user.id, null);
 	assert.equal((await store.getUser(user.id))?.callsign, null);
+	assert.equal((await store.getUser(user.id))?.login, 'OK4RM-10');
 	assert.equal(await store.getWinlinkSecret(user.id), null);
 
 	// Clearing the credential on its own.
@@ -249,5 +264,56 @@ test('the transceiver registry stores what a session needs and nothing about sta
 	assert.equal(await store.deleteTransceiver(created.id), true);
 	assert.equal(await store.deleteTransceiver(created.id), false, 'the second delete reports nothing removed');
 	assert.equal((await store.listTransceivers()).length, 1);
+	await store.close();
+});
+
+test('one post office owner, and its credential follows the callsign', async () => {
+	const store = await freshStore();
+	const first = await store.createUser({ callsign: 'OK1ABC', pwHash: null, role: 'admin' });
+	const second = await store.createUser({ callsign: 'OK2XYZ', pwHash: null, role: 'user' });
+
+	assert.equal(await store.findPostOfficeOwner(), null, 'nobody owns it until one is marked');
+	assert.equal(await store.setPostOfficeOwner(first.id), true);
+	assert.equal((await store.findPostOfficeOwner())?.callsign, 'OK1ABC');
+	// Marking another account takes the role from the first: the station answers as
+	// one callsign, so there is one owner.
+	assert.equal(await store.setPostOfficeOwner(second.id), true);
+	assert.equal((await store.findPostOfficeOwner())?.callsign, 'OK2XYZ');
+	assert.equal((await store.getUser(first.id))?.isPostOffice, false);
+	assert.equal(await store.setPostOfficeOwner(null), true);
+	assert.equal(await store.findPostOfficeOwner(), null);
+
+	// The post-office password belongs to a callsign like the Winlink one.
+	await store.setPostOfficeSecret(second.id, 'sealed-blob');
+	assert.equal(await store.getPostOfficeSecret(second.id), 'sealed-blob');
+	await store.setCallsign(second.id, 'OK2XYZ-5');
+	assert.equal(await store.getPostOfficeSecret(second.id), null, 'a different callsign keeps no credential');
+	await store.close();
+});
+
+test('the station duplicate check sees received mail, never its own outbox', async () => {
+	const store = await freshStore();
+	const alice = await store.createUser({ callsign: 'OK1ABC', pwHash: null, role: 'user' });
+	const bob = await store.createUser({ callsign: 'OK2XYZ', pwHash: null, role: 'user' });
+	const aliceOutbox = (await store.findFolder(alice.id, 'OUTBOX'))!.id;
+	const bobInbox = (await store.findFolder(bob.id, 'INBOX'))!.id;
+
+	// A message this station is sending is not one it already has.
+	await store.insertMessage(
+		alice.id,
+		aliceOutbox,
+		composeMessage({ from: 'OK1ABC', to: 'OK9ZZZ', subject: 's', body: 'b', mid: 'OUTBOX000001' }),
+		{ direction: 'out' },
+	);
+	assert.equal(await store.findReceivedByMid('OUTBOX000001'), null);
+
+	await store.insertMessage(
+		bob.id,
+		bobInbox,
+		composeMessage({ from: 'OK9ZZZ', to: 'OK2XYZ', subject: 's', body: 'b', mid: 'INBOX0000001' }),
+		{ direction: 'in' },
+	);
+	const found = await store.findReceivedByMid('inbox0000001');
+	assert.equal(found?.userId, bob.id, 'matched across mailboxes, without regard to case');
 	await store.close();
 });

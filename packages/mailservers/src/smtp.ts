@@ -357,7 +357,7 @@ export class SmtpServer {
     });
     this.opts.events.notify({ userId: user.id, folderId: outbox.id, folder: outbox.name });
     this.opts.logger.info('smtp message queued', {
-      user: user.login,
+      callsign: user.callsign ?? user.login,
       mid: message.mid,
       recipients: transaction.recipients.length,
     });

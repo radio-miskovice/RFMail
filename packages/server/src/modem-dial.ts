@@ -408,6 +408,12 @@ export interface HangUpOptions {
   quietMs?: number;
   /** A ceiling on the whole hang-up, however chatty the modem stays. */
   hardMs?: number;
+  /**
+   * Keep the socket open afterwards. A dial owns its socket and closes it; a post
+   * office holds one command socket for as long as it is armed, and hanging up one
+   * call must not deafen it to the next (decision 26).
+   */
+  keepSocket?: boolean;
   /** Every line the modem says while hanging up, for the session record. */
   onLine?: (line: string) => void;
 }
@@ -457,7 +463,8 @@ export async function hangUpModem(socket: Socket, options: HangUpOptions = {}): 
       clearTimeout(disconnectedTimer);
       clearInterval(poll);
       socket.removeListener('close', done);
-      socket.destroy();
+      socket.removeListener('data', onData);
+      if (options.keepSocket !== true) socket.destroy();
       resolve();
     };
 
@@ -480,7 +487,7 @@ export async function hangUpModem(socket: Socket, options: HangUpOptions = {}): 
     }, 200);
     poll.unref?.();
 
-    socket.on('data', (chunk: string | Buffer) => {
+    const onData = (chunk: string | Buffer): void => {
       partial += chunk.toString();
       let index = partial.search(/[\r\n]/);
       while (index >= 0) {
@@ -495,7 +502,8 @@ export async function hangUpModem(socket: Socket, options: HangUpOptions = {}): 
         }
         index = partial.search(/[\r\n]/);
       }
-    });
+    };
+    socket.on('data', onData);
     socket.once('close', done);
 
     try {

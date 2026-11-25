@@ -656,3 +656,25 @@ test('a challenge is refused by a server and merely reported by a peer', async (
 		assert.match(end.error ?? '', /no Winlink password/);
 	}
 });
+
+test('a claimed client identity replaces rfmail in the SID, and an invalid one does not', async () => {
+	for (const [claimed, expected] of [
+		[{ application: 'RMS Express', version: '1.8.6.0' }, '[RMS Express-1.8.6.0-B2FHM$]'],
+		[null, '[rfmail-0.1-B2FHM$]'],
+	] as const) {
+		const { station, gateway } = pair();
+		const state = handler();
+		const session = new Session(
+			options({ handler: state.handler, myCallsign: 'OK4RM', ...(claimed ?? {}) }),
+		);
+		const peer = new Peer(gateway);
+		const exchange = session.run(station);
+
+		await openGateway(peer);
+		const handshake = await readStationHandshake(peer);
+		assert.equal(handshake[1], expected, 'the SID names the client the station presents');
+		assert.equal((await readBlock(peer)).terminator, 'FF');
+		await peer.send('FQ');
+		assert.equal((await exchange).result, 'complete');
+	}
+});

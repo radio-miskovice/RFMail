@@ -24,7 +24,7 @@
 		type Transceiver
 	} from '@rfmail/shared';
 	import { api, ApiRequestError } from '../api/client';
-	import { bandContains } from '@rfmail/shared';
+	import { bandContains, parseClientIdentity } from '@rfmail/shared';
 	import { chooseSessionMode } from '../session-default';
 	import {
 		dialNumber,
@@ -62,6 +62,16 @@
 	 * a post office for its own users.
 	 */
 	let sessionMode = $state<'cms' | 'p2p' | 'postoffice'>('cms');
+
+	/**
+	 * Present another program's identity in the SID. The value must survive the SID's own
+	 * format — `NAME-VERSION` — or it is ignored and the station sends `rfmail-<version>`.
+	 */
+	let fakeClient = $state(false);
+	let fakeClientValue = $state('RMS Express-1.8.6.0');
+	const fakeClientValid = $derived(parseClientIdentity(fakeClientValue) !== null);
+	/** This station's own SID identity, for showing what the peer would see instead. */
+	const ownSid = 'rfmail-0.1';
 	/** The dial is held in hertz; the input shows it in kHz or MHz (dial.ts). */
 	let frequencyHz = $state<number | null>(null);
 	let frequencyText = $state('');
@@ -318,6 +328,8 @@
 			const response = await api.runSession({
 				modemId: chosenModem.id,
 				mode: sessionMode,
+				// Only a valid identity travels; an invalid one is ignored rather than sent.
+				...(fakeClient && fakeClientValid ? { fakeClient: fakeClientValue.trim() } : {}),
 				target: callsign.trim().toUpperCase(),
 				frequencyHz: frequencyHz!,
 				bandwidthHz: pickedMode ? bandwidthOfMode(pickedMode) : undefined
@@ -483,6 +495,35 @@
 					<option value="postoffice">Post office</option>
 				</select>
 			</label>
+		</div>
+
+		<div class="row">
+			<label class="field fake">
+				<span>
+					<input type="checkbox" bind:checked={fakeClient} />
+					Fake client in SID
+				</span>
+				<input
+					class="mono"
+					bind:value={fakeClientValue}
+					disabled={!fakeClient}
+					placeholder="RMS Express-1.8.6.0"
+					autocomplete="off"
+					spellcheck="false"
+					title="NAME-VERSION, as a SID carries it; anything else is ignored and {ownSid} is sent"
+				/>
+			</label>
+			{#if fakeClient}
+				<p class="hint">
+					{#if fakeClientValid}
+						The peer will see [{fakeClientValue.trim()}-B2FHM$] instead of
+						[{ownSid}-B2FHM$].
+					{:else}
+						Not NAME-VERSION (a letter-led name, no brackets, then digits and dots) — the
+						value is ignored and the station presents itself as rfmail.
+					{/if}
+				</p>
+			{/if}
 		</div>
 
 		<p class="hint">

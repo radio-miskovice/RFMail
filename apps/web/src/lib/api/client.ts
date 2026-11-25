@@ -5,6 +5,7 @@
 
 import type {
 	ApiError,
+	ArmPostOfficeRequest,
 	ComposeRequest,
 	CreateUserRequest,
 	FolderWithCounts,
@@ -21,6 +22,7 @@ import type {
 	ModemKind,
 	PatchMessageRequest,
 	PasswordRequest,
+	PostOfficeStatus,
 	CreateTransceiverRequest,
 	SessionOptions,
 	SessionRunRequest,
@@ -99,14 +101,14 @@ async function request<T>(
 export const api = {
 	status: (): Promise<StatusResponse> => request('GET', '/api/status'),
 
-	setup: async (login: string): Promise<Me> => {
-		const me = await request<Me>('POST', '/api/setup', { login } satisfies SetupRequest);
+	setup: async (callsign: string): Promise<Me> => {
+		const me = await request<Me>('POST', '/api/setup', { callsign } satisfies SetupRequest);
 		setCsrf(me.csrf);
 		return me;
 	},
 
-	login: async (login: string, password?: string): Promise<Me> => {
-		const payload: LoginRequest = password === undefined ? { login } : { login, password };
+	login: async (callsign: string, password?: string): Promise<Me> => {
+		const payload: LoginRequest = password === undefined ? { callsign } : { callsign, password };
 		const me = await request<Me>('POST', '/api/login', payload);
 		setCsrf(me.csrf);
 		return me;
@@ -116,6 +118,13 @@ export const api = {
 		await request('POST', '/api/logout');
 		csrfToken = '';
 	},
+
+	postOfficeStatus: (): Promise<PostOfficeStatus> => request('GET', '/api/postoffice/status'),
+
+	postOfficeArm: (body: ArmPostOfficeRequest): Promise<PostOfficeStatus> =>
+		request('POST', '/api/postoffice/arm', body),
+
+	postOfficeDisarm: (): Promise<PostOfficeStatus> => request('POST', '/api/postoffice/disarm'),
 
 	me: async (): Promise<Me> => {
 		const me = await request<Me>('GET', '/api/me');

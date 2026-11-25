@@ -98,7 +98,7 @@ async function setupAccount(options: { password?: string } = {}): Promise<{
 	const store = new SqliteStore({ path: ':memory:' });
 	await store.migrate();
 	const user = await store.createUser({
-		login: 'tester',
+		callsign: 'OK4RM',
 		pwHash: options.password ? hashPassword(options.password) : null,
 		role: 'admin',
 	});
@@ -147,7 +147,7 @@ test('POP3 retrieves a message with an empty password and dot-stuffs it', async 
 		await addMessage(store, userId, 'First', 'line one\n.hidden\nline three');
 		const client = await connectClient(port);
 		assert.match(client.greeting, /^\+OK /);
-		assert.match(await client.cmd('USER tester'), /^\+OK/);
+		assert.match(await client.cmd('USER ok4rm'), /^\+OK/);
 		assert.match(await client.cmd('PASS '), /^\+OK 1 message/);
 
 		const list = await client.multi('LIST');
@@ -191,7 +191,7 @@ test('DELE removes the message when the session quits', async () => {
 		assert.ok(inbox);
 
 		const client = await connectClient(port);
-		await client.cmd('USER tester');
+		await client.cmd('USER ok4rm');
 		await client.cmd('PASS ');
 		assert.match(await client.cmd('DELE 1'), /^\+OK/);
 		assert.match(await client.cmd('RETR 1'), /^-ERR/);
@@ -211,7 +211,7 @@ test('a password-protected account needs the right password', async () => {
 	const { port, close } = await setupAccount({ password: 'hunter2' });
 	try {
 		const client = await connectClient(port);
-		await client.cmd('USER tester');
+		await client.cmd('USER ok4rm');
 		assert.match(await client.cmd('PASS '), /^-ERR/);
 		assert.match(await client.cmd('PASS wrong'), /^-ERR/);
 		assert.match(await client.cmd('STAT'), /^-ERR/);
@@ -228,11 +228,11 @@ test('one maildrop per account: a second session is refused', async () => {
 	const { port, close } = await setupAccount();
 	try {
 		const first = await connectClient(port);
-		await first.cmd('USER tester');
+		await first.cmd('USER ok4rm');
 		assert.match(await first.cmd('PASS '), /^\+OK/);
 
 		const second = await connectClient(port);
-		await second.cmd('USER tester');
+		await second.cmd('USER ok4rm');
 		assert.match(await second.cmd('PASS '), /^-ERR \[IN-USE\]/);
 
 		await first.cmd('QUIT');
@@ -240,7 +240,7 @@ test('one maildrop per account: a second session is refused', async () => {
 		await new Promise((resolve) => setTimeout(resolve, 100));
 
 		const third = await connectClient(port);
-		await third.cmd('USER tester');
+		await third.cmd('USER ok4rm');
 		assert.match(await third.cmd('PASS '), /^\+OK/);
 		await third.cmd('QUIT');
 		third.close();

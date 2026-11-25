@@ -19,11 +19,10 @@ async function harness(options: { password?: string } = {}): Promise<{
 	const store = new SqliteStore({ path: ':memory:' });
 	await store.migrate();
 	const user = await store.createUser({
-		login: 'tester',
+		callsign: 'OK4RM',
 		pwHash: options.password ? hashPassword(options.password) : null,
 		role: 'admin',
 	});
-	await store.setCallsign(user.id, 'OK4RM');
 	const events = new MailEvents();
 	const server = new ImapServer({
 		store,
@@ -68,7 +67,7 @@ async function addToInbox(store: SqliteStore, userId: number, subject: string, b
 async function login(port: number): Promise<ImapTestClient> {
 	const client = new ImapTestClient(port);
 	assert.match(await client.greeting(), /^\* OK \[CAPABILITY/);
-	const loginReply = await client.command('LOGIN tester ""');
+	const loginReply = await client.command('LOGIN ok4rm ""');
 	assert.equal(loginReply.status, 'OK');
 	return client;
 }
@@ -211,11 +210,11 @@ test('a password-protected account needs the right password', async () => {
 	try {
 		const client = new ImapTestClient(port);
 		await client.greeting();
-		const denied = await client.command('LOGIN tester ""');
+		const denied = await client.command('LOGIN ok4rm ""');
 		assert.equal(denied.status, 'NO');
-		const wrong = await client.command('LOGIN tester wrong');
+		const wrong = await client.command('LOGIN ok4rm wrong');
 		assert.equal(wrong.status, 'NO');
-		const accepted = await client.command('LOGIN tester hunter2');
+		const accepted = await client.command('LOGIN ok4rm hunter2');
 		assert.equal(accepted.status, 'OK');
 		await client.command('LOGOUT');
 		client.close();

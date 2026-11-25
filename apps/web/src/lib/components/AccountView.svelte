@@ -11,6 +11,9 @@
 	let winlinkPassword = $state('');
 	let hasWinlinkPassword = $state(false);
 	let clearWinlink = $state(false);
+	let postOfficePassword = $state('');
+	let hasPostOfficePassword = $state(false);
+	let clearPostOffice = $state(false);
 	let currentPassword = $state('');
 	let newPassword = $state('');
 	let confirmPassword = $state('');
@@ -23,6 +26,7 @@
 		locator = me.user.locator ?? '';
 		hasPassword = me.user.hasPassword;
 		hasWinlinkPassword = me.user.hasWinlinkPassword;
+		hasPostOfficePassword = me.user.hasPostOfficePassword;
 	});
 	let busy = $state(false);
 	let notice = $state('');
@@ -38,18 +42,24 @@
 				callsign: string | null;
 				locator: string | null;
 				winlinkPassword?: string | null;
+				postOfficePassword?: string | null;
 			} = {
 				callsign: callsign.trim() || null,
 				locator: locator.trim().toUpperCase() || null
 			};
 			if (clearWinlink) patch.winlinkPassword = null;
 			else if (winlinkPassword.length > 0) patch.winlinkPassword = winlinkPassword;
+			if (clearPostOffice) patch.postOfficePassword = null;
+			else if (postOfficePassword.length > 0) patch.postOfficePassword = postOfficePassword;
 			const updated = await api.updateAccount(patch);
 			callsign = updated.user.callsign ?? '';
 			locator = updated.user.locator ?? '';
 			hasWinlinkPassword = updated.user.hasWinlinkPassword;
+			hasPostOfficePassword = updated.user.hasPostOfficePassword;
 			winlinkPassword = '';
 			clearWinlink = false;
+			postOfficePassword = '';
+			clearPostOffice = false;
 			onchanged(updated);
 			notice = 'Station settings saved.';
 		} catch (err) {
@@ -97,7 +107,7 @@
 	<header>
 		<h1>Account</h1>
 		<p class="muted">
-			Signed in as <strong>{me.user.login}</strong> · {me.user.role} · created {formatDateTime(me.user.createdAt)}
+			Signed in as <strong>{me.user.callsign ?? '—'}</strong> · {me.user.role} · created {formatDateTime(me.user.createdAt)}
 		</p>
 	</header>
 
@@ -108,13 +118,17 @@
 	<section>
 		<h2>Callsign and Winlink password</h2>
 		<p class="muted small">
-			The callsign is this account's Winlink identity: it is the originator of everything the account sends
-			and the mailbox that incoming mail is addressed to, so one callsign is one account. Changing it drops
-			the stored Winlink password, which belonged to the old callsign. The Winlink password is the one
+			The callsign is this account: it is the name you sign in with here and from a mail program, the
+			originator of everything the account sends, and the mailbox that incoming mail is addressed to, so
+			one callsign is one account. Changing it changes the login with it, and drops the stored Winlink
+			password, which belonged to the old callsign. The Winlink password is the one
 			registered with the Winlink Development Team for that callsign — the CMS asks for it during a radio
 			session. It is <strong>not</strong> the mail password below, and it is kept sealed, never shown again.
-			The WW-Locator is the station's Maidenhead grid square: gateway lists are ordered by distance from
-			it.
+			The post-office password is what this station answers another station's challenge with when it collects
+			mail from that station's post office — for a station that has no Winlink registration yet, it is the only
+			credential there is. It is sealed like the Winlink one, never shown again, and dropping the callsign
+			drops it too. The WW-Locator is the station's Maidenhead grid square: gateway lists are ordered by
+			distance from it.
 		</p>
 		<form class="station-form" onsubmit={saveStation}>
 			<div class="station">
@@ -148,7 +162,30 @@
 						placeholder={hasWinlinkPassword ? 'unchanged' : 'CMS secure-login password'}
 					/>
 				</label>
+				<label class="field">
+					<span>
+						Post-office password
+						{#if hasPostOfficePassword && !clearPostOffice}<span class="set" title="A post-office password is stored">stored</span>{/if}
+					</span>
+					<input
+						type="password"
+						name="postOfficePassword"
+						autocomplete="off"
+						bind:value={postOfficePassword}
+						disabled={clearPostOffice}
+						placeholder={hasPostOfficePassword ? 'unchanged' : 'what this station answers with'}
+					/>
+				</label>
 			</div>
+			{#if hasPostOfficePassword}
+				<label class="check">
+					<input type="checkbox" name="clearPostOffice" bind:checked={clearPostOffice} />
+					<span>Remove the stored post-office password</span>
+				</label>
+			{/if}
+			{#if errors['postOfficePassword']}
+				<p class="error">{errors['postOfficePassword']}</p>
+			{/if}
 			{#if hasWinlinkPassword}
 				<label class="check">
 					<input type="checkbox" name="clearWinlink" bind:checked={clearWinlink} />

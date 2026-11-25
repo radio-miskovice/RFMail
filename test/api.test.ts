@@ -3,7 +3,7 @@ import test from 'node:test';
 import { createServer } from 'node:http';
 import { createServer as createServer2 } from 'node:net';
 import type { AddressInfo } from 'node:net';
-import { createApi, createLogger, Sessions } from '@rfmail/server';
+import { createApi, createLogger, openSecret, PostOffice, Sessions } from '@rfmail/server';
 import { TransceiverLinks } from '@rfmail/rig';
 import { MailEvents, PeerPolicy } from '@rfmail/mailservers';
 import { SqliteStore } from '@rfmail/store';
@@ -28,6 +28,7 @@ async function harness(): Promise<{
 }> {
 	const store = new SqliteStore({ path: ':memory:' });
 	await store.migrate();
+	const storeKey = Buffer.alloc(32, 7).toString('base64');
 	const api = createApi({
 		store,
 		sessions: new Sessions('test-secret-value'),
@@ -40,8 +41,13 @@ async function harness(): Promise<{
 		smtpAddress: null,
 		imapAddress: null,
 		secureCookies: false,
-		storeKey: Buffer.alloc(32, 7).toString('base64'),
+		storeKey: storeKey,
 		links: new TransceiverLinks(),
+		postOffice: new PostOffice({
+			store,
+			logger: silent,
+			openSecret: (blob) => openSecret(blob, storeKey),
+		}),
 	});
 	const server = createServer((req, res) => void api.handle(req, res));
 	await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
@@ -71,11 +77,11 @@ test('first-run setup, login, compose and delete over HTTP', async () => {
 		const setupResponse = await fetch(`${base}/api/setup`, {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ login: 'tester' }),
+			body: JSON.stringify({ callsign: 'OK1ABC' }),
 		});
 		assert.equal(setupResponse.status, 201);
 		const me = (await setupResponse.json()) as Me;
-		assert.equal(me.user.login, 'tester');
+		assert.equal(me.user.callsign, 'OK1ABC', 'the callsign is the account and the login');
 		assert.equal(me.user.hasPassword, false);
 		assert.equal(me.folders.length, 5);
 		const cookie = cookieFrom(setupResponse);
@@ -84,7 +90,7 @@ test('first-run setup, login, compose and delete over HTTP', async () => {
 		const secondSetup = await fetch(`${base}/api/setup`, {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ login: 'intruder' }),
+			body: JSON.stringify({ callsign: 'OK9XXX' }),
 		});
 		assert.equal(secondSetup.status, 409);
 
@@ -154,18 +160,18 @@ test('login with a wrong name is refused and login requires a password once set'
 		const setup = await fetch(`${base}/api/setup`, {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ login: 'tester' }),
+			body: JSON.stringify({ callsign: 'OK1ABC' }),
 		});
 		assert.equal(setup.status, 201);
 
 		const badLogin = await fetch(`${base}/api/login`, {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ login: 'nobody' }),
+			body: JSON.stringify({ callsign: 'OK8UNK' }),
 		});
 		assert.equal(badLogin.status, 401);
 
-		const user = await store.findUserByLogin('tester');
+		const user = await store.findUserByLogin('OK1ABC');
 		assert.ok(user);
 		const { hashPassword } = await import('@rfmail/store');
 		await store.setUserPassword(user.id, hashPassword('s3cret'));
@@ -173,7 +179,7 @@ test('login with a wrong name is refused and login requires a password once set'
 		const needsPassword = await fetch(`${base}/api/login`, {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ login: 'tester' }),
+			body: JSON.stringify({ callsign: 'OK1ABC' }),
 		});
 		assert.equal(needsPassword.status, 401);
 		const body = (await needsPassword.json()) as { passwordRequired?: boolean };
@@ -182,7 +188,7 @@ test('login with a wrong name is refused and login requires a password once set'
 		const withPassword = await fetch(`${base}/api/login`, {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ login: 'tester', password: 's3cret' }),
+			body: JSON.stringify({ callsign: 'OK1ABC', password: 's3cret' }),
 		});
 		assert.equal(withPassword.status, 200);
 	} finally {
@@ -196,7 +202,7 @@ test('administrators create accounts; accounts manage their own password', async
 		const setup = await fetch(`${base}/api/setup`, {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ login: 'admin' }),
+			body: JSON.stringify({ callsign: 'OK1ADM' }),
 		});
 		assert.equal(setup.status, 201);
 		const me = (await setup.json()) as Me;
@@ -207,7 +213,7 @@ test('administrators create accounts; accounts manage their own password', async
 		const created = await fetch(`${base}/api/users`, {
 			method: 'POST',
 			headers: auth,
-			body: JSON.stringify({ login: 'operator', callsign: 'OK4RM', role: 'user' }),
+			body: JSON.stringify({ callsign: 'OK4RM', role: 'user' }),
 		});
 		assert.equal(created.status, 201);
 		const operator = (await created.json()) as User;
@@ -215,7 +221,7 @@ test('administrators create accounts; accounts manage their own password', async
 		assert.equal(operator.hasPassword, false);
 
 		const list = (await (await fetch(`${base}/api/users`, { headers: { cookie } })).json()) as User[];
-		assert.deepEqual(list.map((user) => user.login).sort(), ['admin', 'operator']);
+		assert.deepEqual(list.map((user) => user.callsign).sort(), ['OK1ADM', 'OK4RM']);
 
 		const renamed = await fetch(`${base}/api/users/${operator.id}`, {
 			method: 'PATCH',
@@ -252,7 +258,7 @@ test('administrators create accounts; accounts manage their own password', async
 		const relogin = await fetch(`${base}/api/login`, {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ login: 'admin', password: 'second-secret' }),
+			body: JSON.stringify({ callsign: 'OK1ADM', password: 'second-secret' }),
 		});
 		assert.equal(relogin.status, 200);
 
@@ -284,13 +290,17 @@ test('the Winlink password is stored sealed and never handed back', async () => 
 		const setup = await fetch(`${base}/api/setup`, {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ login: 'admin' }),
+			body: JSON.stringify({ callsign: 'OK1ADM' }),
 		});
 		const me = (await setup.json()) as Me;
 		const cookie = cookieFrom(setup);
 		const auth = { cookie, 'x-csrf-token': me.csrf, 'content-type': 'application/json' };
+		assert.equal(me.user.callsign, 'OK1ADM');
+		assert.equal('login' in me.user, false, 'one name for one account: the DTO carries the callsign only');
 
-		// No callsign yet: the credential has nowhere to live.
+		// Without a callsign the credential has nowhere to live. An account is born
+		// with one now, so this is the pre-migration row: clear it to reach the case.
+		await store.setCallsign(me.user.id, null);
 		const tooEarly = await fetch(`${base}/api/account`, {
 			method: 'PATCH',
 			headers: auth,
@@ -339,7 +349,7 @@ test('the Winlink password is stored sealed and never handed back', async () => 
 		const clash = await fetch(`${base}/api/users`, {
 			method: 'POST',
 			headers: auth,
-			body: JSON.stringify({ login: 'intruder', callsign: 'OK4RM-10' }),
+			body: JSON.stringify({ callsign: 'OK4RM-10' }),
 		});
 		assert.equal(clash.status, 409);
 
@@ -392,7 +402,7 @@ test('transceivers are configured, listed and their link reports a state', async
 		const setup = await fetch(`${base}/api/setup`, {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ login: 'admin' }),
+			body: JSON.stringify({ callsign: 'OK1ADM' }),
 		});
 		const me = (await setup.json()) as Me;
 		const cookie = cookieFrom(setup);
@@ -474,7 +484,7 @@ test('modems are configured, edited and removed, and must name a real transceive
 		const setup = await fetch(`${base}/api/setup`, {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ login: 'owner' }),
+			body: JSON.stringify({ callsign: 'OK1OWN' }),
 		});
 		const owner = (await setup.json()) as Me;
 		const headers = { cookie: cookieFrom(setup), 'x-csrf-token': owner.csrf, 'content-type': 'application/json' };
@@ -566,7 +576,7 @@ test('the WW-locator is set when an account is created, edited, and by its owner
 		const setup = await fetch(`${base}/api/setup`, {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ login: 'owner' }),
+			body: JSON.stringify({ callsign: 'OK1OWN' }),
 		});
 		const owner = (await setup.json()) as Me;
 		const headers = { cookie: cookieFrom(setup), 'x-csrf-token': owner.csrf, 'content-type': 'application/json' };
@@ -575,7 +585,7 @@ test('the WW-locator is set when an account is created, edited, and by its owner
 		const created = await fetch(`${base}/api/users`, {
 			method: 'POST',
 			headers,
-			body: JSON.stringify({ login: 'club', callsign: 'OK9ZZZ', locator: 'jo70aa' }),
+			body: JSON.stringify({ callsign: 'OK9ZZZ', locator: 'jo70aa' }),
 		});
 		assert.equal(created.status, 201);
 		const club = (await created.json()) as User;
@@ -626,7 +636,7 @@ test('an account without a password takes an empty password and nothing else', a
 		const setup = await fetch(`${base}/api/setup`, {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ login: 'nopassword' }),
+			body: JSON.stringify({ callsign: 'OK1NPW' }),
 		});
 		assert.equal(setup.status, 201, 'the first account starts without a password');
 		const me = (await setup.json()) as Me;
@@ -636,7 +646,7 @@ test('an account without a password takes an empty password and nothing else', a
 		const empty = await fetch(`${base}/api/login`, {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ login: 'nopassword' }),
+			body: JSON.stringify({ callsign: 'OK1NPW' }),
 		});
 		assert.equal(empty.status, 200);
 
@@ -645,7 +655,7 @@ test('an account without a password takes an empty password and nothing else', a
 		const invented = await fetch(`${base}/api/login`, {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ login: 'nopassword', password: 'anything' }),
+			body: JSON.stringify({ callsign: 'OK1NPW', password: 'anything' }),
 		});
 		assert.equal(invented.status, 401);
 	} finally {
@@ -660,7 +670,7 @@ test('an ordinary account configures the station radios without an administrator
 		const setup = await fetch(`${base}/api/setup`, {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ login: 'owner' }),
+			body: JSON.stringify({ callsign: 'OK1OWN' }),
 		});
 		const owner = (await setup.json()) as Me;
 		const ownerHeaders = { cookie: cookieFrom(setup), 'x-csrf-token': owner.csrf, 'content-type': 'application/json' };
@@ -668,13 +678,13 @@ test('an ordinary account configures the station radios without an administrator
 		await fetch(`${base}/api/users`, {
 			method: 'POST',
 			headers: ownerHeaders,
-			body: JSON.stringify({ login: 'operator', role: 'user', password: 'hunter2' }),
+			body: JSON.stringify({ callsign: 'OK4RM', role: 'user', password: 'hunter2' }),
 		});
 
 		const login = await fetch(`${base}/api/login`, {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ login: 'operator', password: 'hunter2' }),
+			body: JSON.stringify({ callsign: 'OK4RM', password: 'hunter2' }),
 		});
 		assert.equal(login.status, 200);
 		const me = (await login.json()) as Me;
@@ -735,7 +745,7 @@ test('an ordinary account configures the station radios without an administrator
 		const forbidden = await fetch(`${base}/api/users`, {
 			method: 'POST',
 			headers: asUser,
-			body: JSON.stringify({ login: 'intruder' }),
+			body: JSON.stringify({ callsign: 'OK9XXX' }),
 		});
 		assert.equal(forbidden.status, 403);
 	} finally {
@@ -774,7 +784,7 @@ test('a session moves mail through the modem and into the mailbox over HTTP', as
 		const setup = await fetch(`${base}/api/setup`, {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ login: 'admin' }),
+			body: JSON.stringify({ callsign: 'OK1ADM' }),
 		});
 		const me = (await setup.json()) as Me;
 		const cookie = cookieFrom(setup);
@@ -861,12 +871,12 @@ test('a session moves mail through the modem and into the mailbox over HTTP', as
 });
 
 test('a session needs the CSRF token and a callsign before anything is transmitted', async () => {
-	const { base, close } = await harness();
+	const { base, store, close } = await harness();
 	try {
 		const setup = await fetch(`${base}/api/setup`, {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ login: 'admin' }),
+			body: JSON.stringify({ callsign: 'OK1ADM' }),
 		});
 		const me = (await setup.json()) as Me;
 		const cookie = cookieFrom(setup);
@@ -877,7 +887,96 @@ test('a session needs the CSRF token and a callsign before anything is transmitt
 			body: JSON.stringify({ modemId: 1, target: 'OK1RAA', frequencyHz: 3_597_000 }),
 		});
 		assert.equal(noToken.status, 403, 'a session keys a transmitter and needs the CSRF token');
-		assert.equal(me.user.callsign, null);
+
+		// Every account is created with a callsign (decision 25), so the "no callsign"
+		// refusal is reached by a row that has lost its own — the state a pre-migration
+		// account could be in. A modem row is enough: the check comes before the radio.
+		await store.createModem({ name: 'Bench', kind: 'vara', host: '127.0.0.1', commandPort: 1 });
+		const own = await store.findUserByLogin('OK1ADM');
+		assert.ok(own);
+		await store.setCallsign(own.id, null);
+		const noCallsign = await fetch(`${base}/api/session/run`, {
+			method: 'POST',
+			headers: { cookie, 'x-csrf-token': me.csrf, 'content-type': 'application/json' },
+			body: JSON.stringify({ modemId: 1, target: 'OK1RAA', frequencyHz: 3_597_000 }),
+		});
+		assert.equal(noCallsign.status, 400);
+		assert.equal(((await noCallsign.json()) as { fields?: { callsign?: string } }).fields?.callsign, 'required');
+	} finally {
+		await close();
+	}
+});
+
+test('the post office owner is one account, and its credential is sealed', async () => {
+	const { base, store, close } = await harness();
+	try {
+		const setup = await fetch(`${base}/api/setup`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ callsign: 'OK1ADM' }),
+		});
+		const me = (await setup.json()) as Me;
+		const headers = { cookie: cookieFrom(setup), 'x-csrf-token': me.csrf, 'content-type': 'application/json' };
+
+		// Nothing listens before an account owns the role and a modem is armed.
+		const status = (await (await fetch(`${base}/api/postoffice/status`, { headers })).json()) as {
+			armed: boolean;
+			owner: string | null;
+		};
+		assert.equal(status.armed, false);
+		assert.equal(status.owner, null);
+		const noOwner = await fetch(`${base}/api/postoffice/arm`, {
+			method: 'POST',
+			headers,
+			body: JSON.stringify({ modemId: 1, frequencyHz: 3_597_000 }),
+		});
+		assert.equal(noOwner.status, 400);
+		assert.equal(((await noOwner.json()) as { fields?: { owner?: string } }).fields?.owner, 'missing');
+
+		const second = await fetch(`${base}/api/users`, {
+			method: 'POST',
+			headers,
+			body: JSON.stringify({ callsign: 'OK2XYZ' }),
+		});
+		const other = (await second.json()) as User;
+
+		const madeOwner = await fetch(`${base}/api/users/${me.user.id}`, {
+			method: 'PATCH',
+			headers,
+			body: JSON.stringify({ isPostOffice: true }),
+		});
+		assert.equal(((await madeOwner.json()) as User).isPostOffice, true);
+
+		// One owner: marking another account unseats the first.
+		await fetch(`${base}/api/users/${other.id}`, {
+			method: 'PATCH',
+			headers,
+			body: JSON.stringify({ isPostOffice: true }),
+		});
+		const list = (await (await fetch(`${base}/api/users`, { headers })).json()) as User[];
+		assert.deepEqual(
+			list.filter((user) => user.isPostOffice).map((user) => user.callsign),
+			['OK2XYZ'],
+		);
+
+		// The post-office password is sealed, never returned, and reported as a flag.
+		const saved = await fetch(`${base}/api/users/${other.id}`, {
+			method: 'PATCH',
+			headers,
+			body: JSON.stringify({ postOfficePassword: 'stations-secret' }),
+		});
+		const savedText = await saved.text();
+		assert.ok(!savedText.includes('stations-secret'), 'the password must not come back');
+		assert.equal((JSON.parse(savedText) as User).hasPostOfficePassword, true);
+		const sealed = await store.getPostOfficeSecret(other.id);
+		assert.match(sealed ?? '', /^v1\./);
+		assert.ok(!(sealed ?? '').includes('stations-secret'));
+
+		// The owner's callsign is what the station would answer as.
+		const after = (await (await fetch(`${base}/api/postoffice/status`, { headers })).json()) as {
+			owner: string | null;
+		};
+		assert.equal(after.owner, 'OK2XYZ');
 	} finally {
 		await close();
 	}

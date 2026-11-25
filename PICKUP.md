@@ -4,8 +4,8 @@ Written the evening of 25 November 2026. Everything below was run, measured or r
 from the real thing — where it was not, it says so.
 
 Repository `/home/jvavruska/dev/rfmail`, branch `main`, working tree dirty with the
-B2F session work described below (the last commit is `e915d63`, this file). 141 tests
-pass, `tsc` and `svelte-check` are clean.
+B2F session work described below, plus migration 007 (the login is the callsign).
+171 tests pass, `tsc` and `svelte-check` are clean.
 
 ---
 
@@ -14,12 +14,13 @@ pass, `tsc` and `svelte-check` are clean.
 **Mail.** Its own store (SQLite via `node:sqlite`), SMTP submission, POP3 and
 IMAP4rev1 (IDLE, APPEND, EXPUNGE, ENVELOPE, BODYSTRUCTURE), a browser GUI with
 folders, reader, composer, search, `.eml` export. A mail program signs in with the
-account name, the bare callsign or `CALLSIGN@winlink.org`; inside the station
-addresses are bare callsigns, and `@winlink.org` is added only when serving a mail
-program and stripped on receipt, `winlink.org` only.
+callsign in any case, or with `CALLSIGN@winlink.org`; inside the station addresses
+are bare callsigns, and `@winlink.org` is added only when serving a mail program and
+stripped on receipt, `winlink.org` only. The callsign *is* the account and the login
+(decision 25) — there is no separate account name.
 
-**Accounts.** scrypt passwords; one callsign per account (a club or expedition
-callsign is its own account); a WW-Locator per station; the Winlink password sealed
+**Accounts.** scrypt passwords; one callsign per account, which is also the login
+(a club or expedition callsign is its own account); a WW-Locator per station; the Winlink password sealed
 with AES-256-GCM under a `store_key` separate from the session secret. Any account
 may configure the station's radios, modems and sessions (decision 14).
 
@@ -34,6 +35,21 @@ by the estimate; VHF and up carry no estimate at all.
 
 **Modems.** A registry (type, host, command/data/KISS ports, transceiver, rig mode)
 and a live check that shows whether each one is actually listening.
+
+**Post office — new.** A station can now answer calls instead of only making them:
+`packages/server/src/postoffice.ts` arms one modem (`MYCALL`, `LISTEN ON`, the command
+socket stays open because `CONNECTED` is the only notice of a call), challenges the
+caller with a fresh `;PQ:` nonce, files inbound mail in the INBOX of every local
+callsign it names, offers what the caller's own mailbox has not collected yet, hangs
+the call up properly (`DISCONNECT`, `DISCONNECTED`, a quiet channel — keeping its own
+command socket, which a dial would destroy), and re-arms after every call. The owner account (`users.is_post_office`, at most one via
+a partial unique index) is the callsign the station answers as; its password may be
+the Winlink one or the account's new *post-office password* (sealed, per account), and
+either authenticates. A message for an address nobody holds is deferred when the peer
+names it in `;PM:`, and otherwise held in the owner's mailbox and logged — never
+dropped, never answered `-`. Screen: **Post office** in the top bar; API:
+`GET /api/postoffice/status`, `POST /api/postoffice/arm` (`modemId`, `frequencyHz`),
+`POST /api/postoffice/disarm`. No gateway registration is involved.
 
 **The B2F exchange — new, and the point of the last day's work.** A session now
 dials, runs the FBB B2 protocol over the modem's data port, and files the mail away:
@@ -79,9 +95,11 @@ HOME="$T/home" node apps/backend/src/main.ts --config "$T/rfmail.toml" --log inf
 * POP3 1110, SMTP 1025, IMAP 1143, all on `0.0.0.0`, access `strict` with
   `192.168.132.0/23`
 * config `$T/rfmail.toml`; database `$T/home/.local/share/rfmail/rfmail.db`, schema
-  v6 (the session work added no migration)
-* accounts jvavruska (OK1ABC, admin, **no mail password**), ok4rm (OK4RM),
-  operator (OK2XYZ, has a password set while testing)
+  v7 (migration 007 copied each callsign into its login)
+* accounts OK1ABC (admin, **no mail password**), OK4RM, OK2XYZ (has a password set
+  while testing) — the callsigns are the logins now, so the old names `jvavruska`,
+  `ok4rm` and `operator` no longer sign in. The running instance still has the code
+  from before migration 007; restart it and the database migrates itself.
 * modems: ARDOP `192.168.133.222:8515`+8516, Data2G `.222:8300`+8301+KISS 8100,
   VARA FM `192.168.132.6:8300`, VARA HF `.222:8300`, XARA `192.168.133.50:8300`
 
@@ -136,6 +154,12 @@ the framed message or `FQ`. With an empty OUTBOX it will be the short shape —
 
 Proven by tests (over real sockets, not stubs of the engine):
 
+* `test/postoffice.test.ts` — a calling station dials a scripted modem, authenticates
+  with its post-office password, leaves a message for the owner and collects what was
+  waiting for it; the collected message is not offered a second time; a wrong password
+  is refused before anything is offered (the client sees `*** the secure-login response
+  did not match…`); an account with no credential gets nothing.
+
 * `test/session.test.ts` — the exchange against a hand-written gateway: outbound
   accepted/rejected/deferred, inbound LZHUF and gzip, a duplicated proposal, an
   offset resume, a secure-login challenge answered with the response in the log,
@@ -149,6 +173,13 @@ Proven by tests (over real sockets, not stubs of the engine):
   rigctld and a scripted modem, including CSRF.
 
 Not proven, in order of how much it matters:
+
+0. **The post office has never been armed on the air.** Everything above is a scripted
+   modem and two in-memory stores. The accept path assumes the VARA-family data port
+   can be opened after `CONNECTED` (as the client path already does) and that `LISTEN
+   ON` survives while the post office holds its own command socket; both need one real
+   call to confirm. The rig is tuned before arming, because an inbound call cannot be
+   tuned for.
 
 1. **Nothing has been on the air.** No session has run against a real gateway — the
    modem is not reachable (above). Everything above is sockets and stores.
@@ -215,6 +246,12 @@ Not proven, in order of how much it matters:
   cannot be prevented — Data2G 0.5.3 reports no busy state while listening. And a
   hang-up waits for `DISCONNECTED` plus a few seconds of silence, because the ID frame
   is still on the air after `DISCONNECT`. (R4.4.1.2, R4.4.1.3)
+* **25** The callsign is the account: one name at the sign-in form, POP3, IMAP and
+  SMTP, matched without regard to case, and `CALLSIGN@winlink.org` is the same name.
+  The store keeps `login` as the callsign so the unique index is the sign-in key;
+  renaming the station renames the login. An account is created with a callsign;
+  migration 007 copied existing callsigns into their logins, and an account without
+  one keeps its old login until it gets a callsign (never invented). (R7.2, R7.3)
 
 ---
 
@@ -263,7 +300,21 @@ Not proven, in order of how much it matters:
   for now).
 * Modem parameter screens beyond type/host/ports/rig mode — bandwidth, ARQ retries,
   launch commands, autostart, readiness probes (R3.1 lists them).
-* Gateway relay and post office as running roles: the engine's answering half exists,
-  but nothing listens for an inbound session yet.
+* Gateway relay (M12c) and forwarding/store-and-forward (M12b): the post office answers
+  calls, but nothing relays to a CMS yet and nothing retries a deferred message.
 * Nothing is transmitted unless a session is started, and nothing is left connected:
   every path (connected, failed, error, aborted) hangs up.
+* **26** The post office is the station answering calls: sessions terminate locally, the
+  mailboxes are the store (an inbound message is filed for every local callsign it
+  names; what the caller's mailbox holds and has not collected is what it is offered),
+  collection is a flag so nothing is deleted by being collected, an address nobody holds
+  is deferred when `;PM:` names it and otherwise held for the postmaster, one modem
+  carries the role, and arming tunes the radio first. No registration. (R4.4.3)
+* **27** The station challenges every caller with a fresh nonce, and either the Winlink
+  password or the account's post-office password authenticates; both are sealed, not
+  hashed, because `;PR` is checked by recomputation, and both are dropped when the
+  callsign changes. No guest access; unknown callsigns are challenged too, so the
+  refusal does not reveal which callsigns exist. (R4.4.3, R7.2)
+* **28** The post office's duplicate check is the station's and matches only mail that
+  arrived: a MID in somebody's OUTBOX is a message this station is sending, and
+  answering `-` for it would lose the peer's message. (R4.4.3)

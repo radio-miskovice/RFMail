@@ -28,20 +28,37 @@ export const FLAG_FLAGGED = 2;
 export const FLAG_ANSWERED = 4;
 /** IMAP \Deleted: hidden until EXPUNGE removes it. */
 export const FLAG_DELETED = 8;
+/**
+ * Collected by the station over the air (a post-office session), so the same mail
+ * is not offered again. Internal to this station: it has no IMAP name, and the
+ * message stays in the mailbox — collecting is not deleting (decision 27).
+ */
+export const FLAG_COLLECTED = 16;
 
 export interface User {
   id: number;
-  login: string;
   role: Role;
   enabled: boolean;
   quotaBytes: number;
-  /** The session callsign: the originator of everything this account sends. */
+  /**
+   * The account's identity: its callsign, which is also the login at every door
+   * — the browser, POP3, IMAP and SMTP (decision 25). One callsign is one
+   * account; `null` only on a row that has not been given one yet.
+   */
   callsign: string | null;
   /** Maidenhead grid square of this station, `JO70AA`; the origin of distances. */
   locator: string | null;
   hasPassword: boolean;
   /** Whether the primary callsign has a Winlink (CMS) password stored. */
   hasWinlinkPassword: boolean;
+  /**
+   * Whether the account has a post-office password stored: the credential a
+   * non-Winlink station authenticates with when it collects mail from this
+   * post office (decision 27).
+   */
+  hasPostOfficePassword: boolean;
+  /** Whether this account is the post office's owner: the station's own identity. */
+  isPostOffice: boolean;
   /** ISO 8601, UTC. */
   createdAt: string;
 }
@@ -115,22 +132,22 @@ export interface Me {
 }
 
 export interface LoginRequest {
-  login: string;
+  /** The callsign, in any case: it is the account's one name (decision 25). */
+  callsign: string;
   password?: string;
 }
 
 export interface SetupRequest {
-  login: string;
-  /** Optional: the station callsign can be set later on the Account page. */
-  callsign?: string;
+  /** The station's callsign, which becomes the account's login. */
+  callsign: string;
 }
 
 export interface CreateUserRequest {
-  login: string;
+  /** The new account's callsign, which is also its login. */
+  callsign: string;
   /** Empty or omitted: the account starts without a password. */
   password?: string;
   role?: Role;
-  callsign?: string;
   /** Maidenhead (WW) locator of that station, e.g. `JO70AA`. */
   locator?: string;
 }
@@ -140,6 +157,13 @@ export interface UpdateUserRequest {
   enabled?: boolean;
   /** null clears it; a different value drops the stored Winlink credential. */
   callsign?: string | null;
+  /**
+   * The post-office password of that account, which an administrator may reset.
+   * Stored sealed; the API answers only `hasPostOfficePassword`.
+   */
+  postOfficePassword?: string | null;
+  /** Makes this account the post office's owner; only one account can be. */
+  isPostOffice?: boolean;
   /** Maidenhead (WW) locator; null clears it. */
   locator?: string | null;
   quotaBytes?: number;
@@ -261,6 +285,33 @@ export const BAND_NAMES: readonly string[] = BAND_RANGES.map((band) => band.name
 
 export function bandOf(frequencyHz: number): string {
   return BAND_RANGES.find((band) => frequencyHz >= band.lowHz && frequencyHz <= band.highHz)?.name ?? 'unknown';
+}
+
+/**
+ * A client identity in the shape a B2F SID carries: `NAME-VERSION`, as in
+ * `[RMS Express-1.8.6.0-B2FHM$]`. The station's own identity is `rfmail-0.1`; an operator
+ * may present another program's instead, and this is the rule that decides whether the
+ * string can go into a SID line at all.
+ */
+export interface ClientIdentity {
+  application: string;
+  version: string;
+}
+
+/**
+ * Parses and validates a SID identity. Null means "do not use it": the brackets and the
+ * flags share the line, so a name containing `[` or `]`, a control character, or anything
+ * that is not `NAME-VERSION` would corrupt the handshake for both stations. Deliberately
+ * strict — the version is digits and dots, the name is one to thirty-one printable
+ * characters starting with a letter, and one hyphen separates them.
+ */
+export function parseClientIdentity(value: string): ClientIdentity | null {
+  const text = value.trim();
+  if (text === '' || text.length > 63) return null;
+  if (/[[\]\r\n]/.test(text)) return null;
+  const match = /^([A-Za-z][A-Za-z0-9 ._+!?]{0,30})-([0-9]+(?:\.[0-9]+){0,3})$/.exec(text);
+  if (!match) return null;
+  return { application: match[1]!, version: match[2]! };
 }
 
 /**
@@ -666,6 +717,11 @@ export type SessionMode = 'cms' | 'p2p' | 'postoffice';
 export interface SessionRunRequest extends SessionTestRequest {
   /** Defaults to `cms`: a Winlink RMS gateway or the CMS. */
   mode?: SessionMode;
+  /**
+   * Present this client identity in the SID instead of `rfmail-<version>`, e.g.
+   * `RMS Express-1.8.6.0`. Ignored when it does not fit the SID's format.
+   */
+  fakeClient?: string;
 }
 
 /** One protocol line of a session, in the direction it travelled. */
@@ -707,8 +763,53 @@ export interface UpdateAccountRequest {
    * asks for it during a radio session. Empty string or null clears it.
    */
   winlinkPassword?: string | null;
+  /**
+   * The post-office password: what a station without a Winlink password answers
+   * this station's `;PQ` challenge with (decision 27). Empty string or null
+   * clears it. Stored sealed, never returned.
+   */
+  postOfficePassword?: string | null;
+  /** Only an administrator sets this; it is the station's own post-office identity. */
+  isPostOffice?: boolean;
   /** Maidenhead grid square of this station; null clears it. */
   locator?: string | null;
+}
+
+/**
+ * Arming the post office: it answers calls on one modem, on one dial frequency,
+ * as the owner account's callsign. The mode is the modem's own rig mode.
+ */
+export interface ArmPostOfficeRequest {
+  modemId: number;
+  /** The dial frequency in hertz (the station's carrier, not the AF centre). */
+  frequencyHz: number;
+}
+
+/** An inbound session the post office ran or is running. */
+export interface PostOfficeSession {
+  peer: string;
+  startedAt: string;
+  elapsedMs: number;
+  /** null while the session is still up. */
+  result: 'complete' | 'failed' | 'aborted' | 'error' | null;
+  sent: number;
+  received: number;
+  reason: string | null;
+}
+
+export interface PostOfficeStatus {
+  armed: boolean;
+  /** A call is up right now, as opposed to merely listening. */
+  busy: boolean;
+  /** The accounting owning the station's post-office identity, or null. */
+  owner: string | null;
+  modemId: number | null;
+  modemName: string | null;
+  frequencyHz: number | null;
+  /** Why it stopped, when it is not armed after being armed once. */
+  error: string | null;
+  /** The session in progress, or the most recent finished ones, newest first. */
+  sessions: PostOfficeSession[];
 }
 
 export interface PasswordRequest {

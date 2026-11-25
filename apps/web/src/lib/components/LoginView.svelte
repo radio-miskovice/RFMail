@@ -16,16 +16,16 @@
 		fresh?: boolean;
 	} = $props();
 
-	let login = $state('');
+	let callsignTyped = $state('');
 
 	onMount(() => {
 		// Arriving through "Change user" means the field starts empty: the point is
 		// to type a different callsign, not to keep the last one.
 		if (fresh) return;
 		try {
-			login = localStorage.getItem('rfmail.login') ?? '';
+			callsignTyped = localStorage.getItem('rfmail.callsign') ?? '';
 		} catch {
-			login = '';
+			callsignTyped = '';
 		}
 	});
 	let password = $state('');
@@ -39,10 +39,10 @@
 		error = '';
 		busy = true;
 		try {
-			const name = login.trim();
-			const me = mode === 'setup' ? await api.setup(name) : await api.login(name, needsPassword ? password : undefined);
+			const callsign = callsignTyped.trim();
+			const me = mode === 'setup' ? await api.setup(callsign) : await api.login(callsign, needsPassword ? password : undefined);
 			try {
-				localStorage.setItem('rfmail.login', me.user.login);
+				localStorage.setItem('rfmail.callsign', me.user.callsign ?? callsign);
 			} catch {
 				// private mode: remembering the name is a convenience, not a requirement
 			}
@@ -53,7 +53,7 @@
 					needsPassword = true;
 					error = 'This account has a password.';
 				} else {
-					error = err.fields?.['login'] ?? err.message;
+					error = err.fields?.['callsign'] ?? err.message;
 				}
 			} else {
 				error = 'Cannot reach the backend.';
@@ -70,14 +70,15 @@
 		<h1>{mode === 'setup' ? 'Create the station account' : fresh ? 'Change user' : 'Sign in'}</h1>
 		<p class="lede">
 			{#if mode === 'setup'}
-				This is the first start. Choose the account name for the operator of this station. No password is set
-				at this stage — mail access from this machine is enough for now, and a password can be added later.
+				This is the first start. Type the callsign of this station, which is also the account: the callsign
+				signs in, receives its own mail and is the originator of everything the station sends. No password is
+				set at this stage — mail access from this machine is enough for now, and one can be added later.
 			{:else if fresh}
 				Type the callsign whose mailbox you want. {needsPassword
 					? 'This account has a password.'
 					: 'An account without a password needs nothing else.'}
 			{:else}
-				Enter the callsign or the account name. {needsPassword ? 'This account also has a password.' : ''}
+				Type your callsign. {needsPassword ? 'This account also has a password.' : ''}
 			{/if}
 		</p>
 
@@ -87,9 +88,9 @@
 				<!-- svelte-ignore a11y_autofocus -->
 				<input
 					type="text"
-					name="login"
+					name="callsign"
 					autocomplete="username"
-					bind:value={login}
+					bind:value={callsignTyped}
 					required
 					autofocus
 					placeholder="OK4RM"
@@ -108,7 +109,7 @@
 				<p class="error" role="alert">{error}</p>
 			{/if}
 
-			<button class="btn primary submit" type="submit" disabled={busy || !login.trim()}>
+			<button class="btn primary submit" type="submit" disabled={busy || !callsignTyped.trim()}>
 				{busy ? 'Working…' : mode === 'setup' ? 'Create account' : 'Sign in'}
 			</button>
 		</form>
