@@ -4,7 +4,7 @@ import { findMimePart, parseMimeTree } from '@rfmail/core-b2f';
 
 const MESSAGE = Buffer.from(
 	[
-		'From: OK1ABC@winlink.org',
+		'From: OK4RM@winlink.org',
 		'To: OK2XYZ@winlink.org',
 		'Subject: Structure',
 		'MIME-Version: 1.0',

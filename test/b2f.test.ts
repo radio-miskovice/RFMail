@@ -28,7 +28,7 @@ const MESSAGE = {
 	mid: 'ABCDEFGHJKLM',
 	dateUtc: Date.UTC(2026, 10, 24, 18, 20),
 	from: 'OK4RM',
-	to: ['LA5NTA', 'OK1ABC'],
+	to: ['LA5NTA', 'OK4RM'],
 	cc: ['DL1XYZ'],
 	subject: 'Pozdrav z Prahy',
 	type: 'Private' as const,
@@ -56,7 +56,7 @@ test('a B2 message round-trips through the wire form', () => {
 	const parsed = parseB2Message(new Uint8Array(Buffer.from(raw, 'latin1')));
 	assert.equal(parsed.mid, 'ABCDEFGHJKLM');
 	assert.equal(parsed.from, 'OK4RM');
-	assert.deepEqual(parsed.to, ['LA5NTA', 'OK1ABC']);
+	assert.deepEqual(parsed.to, ['LA5NTA', 'OK4RM']);
 	assert.deepEqual(parsed.cc, ['DL1XYZ']);
 	assert.equal(parsed.subject, 'Pozdrav z Prahy');
 	assert.equal(parsed.body, MESSAGE.body);

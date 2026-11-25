@@ -1,12 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createServer, type Server, type Socket } from 'node:net';
+import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import {
 	ardopBandwidth,
 	bandwidthOfMode,
 	dialModem,
+	hangUpModem,
 	nearestBandwidth,
-	probeModem
+	probeModem,
+	setModemListening
 } from '../packages/server/src/modem-dial.ts';
 
 /** A modem that speaks whatever the test tells it to, and records what it hears. */
@@ -49,7 +51,7 @@ async function fakeModem(
 
 const base = {
 	host: '127.0.0.1',
-	myCallsign: 'OK1ABC',
+	myCallsign: 'OK4RM',
 	target: 'OK1RAA',
 	bandwidthHz: 2300,
 	timeoutMs: 4_000,
@@ -57,9 +59,9 @@ const base = {
 
 test('VARA dialect: a call that is answered succeeds, and is hung up', async () => {
 	const modem = await fakeModem((line, socket) => {
-		if (line === 'CONNECT OK1ABC OK1RAA') {
+		if (line === 'CONNECT OK4RM OK1RAA') {
 			socket.write('PTT ON\r');
-			socket.write('CONNECTED OK1ABC OK1RAA\r');
+			socket.write('CONNECTED OK4RM OK1RAA\r');
 		}
 		if (line === 'DISCONNECT') socket.write('DISCONNECTED\r');
 	});
@@ -76,42 +78,77 @@ test('VARA dialect: a call that is answered succeeds, and is hung up', async () 
 		// The reference order: MYCALL, LISTEN OFF, COMPRESSION TEXT, WINLINK SESSION,
 		// BW<bandwidth>, CONNECT <my> <target> — bandwidth is not a CONNECT argument.
 		assert.deepEqual(modem.heard.slice(0, 6), [
-			'MYCALL OK1ABC',
+			'MYCALL OK4RM',
 			'LISTEN OFF',
 			'COMPRESSION TEXT',
 			'WINLINK SESSION',
 			'BW2300',
-			'CONNECT OK1ABC OK1RAA'
+			'CONNECT OK4RM OK1RAA'
 		]);
 		assert.ok(modem.heard.includes('DISCONNECT'), 'the link was dropped again');
-		assert.ok(outcome.log.includes('PTT ON'));
+		// Lines carry the moment they arrived: "+1.23s < PTT ON".
+		assert.ok(outcome.log.some((line) => /^\+\d+\.\d\ds < PTT ON$/.test(line)), outcome.log.join(' | '));
 		assert.ok(outcome.elapsedMs >= 0);
 	} finally {
 		await modem.close();
 	}
 });
 
-test('VARA dialect: a busy frequency is a failure, not an error', async () => {
-	const modem = await fakeModem((line, socket) => {
+test('VARA dialect: a busy frequency is reported, and does not end a call that then connects', async () => {
+	// Data2G 0.5.3 sends `BUSY ON` a few hundred milliseconds before `CONNECTED` on a
+	// call that comes up perfectly well, so busy is a report, not a verdict.
+	const connects = await fakeModem((line, socket) => {
+		if (line.startsWith('CONNECT ')) {
+			socket.write('BUSY ON\r');
+			setTimeout(() => socket.write('CONNECTED OK4RM OK1RAA 2300\rBUSY OFF\r'), 30);
+		}
+	});
+	try {
+		const outcome = await dialModem({ ...base, port: connects.port, dialect: 'vara', timeoutMs: 2_000 });
+		assert.equal(outcome.result, 'connected', outcome.message);
+	} finally {
+		await connects.close();
+	}
+
+	// A channel that stays busy is a failed call, and the reason says so.
+	const busy = await fakeModem((line, socket) => {
 		if (line.startsWith('CONNECT ')) socket.write('BUSY ON\r');
 	});
 	try {
-		const outcome = await dialModem({ ...base, port: modem.port, dialect: 'vara' });
+		const outcome = await dialModem({ ...base, port: busy.port, dialect: 'vara', timeoutMs: 600 });
 		assert.equal(outcome.result, 'failed');
-		assert.match(outcome.message, /busy/);
+		assert.match(outcome.message, /frequency was busy/);
 	} finally {
-		await modem.close();
+		await busy.close();
 	}
 });
 
-test('VARA dialect: DISCONNECTED means the gateway did not answer', async () => {
+test('VARA dialect: DISCONNECTED means the gateway did not answer, and the log says so', async () => {
 	const modem = await fakeModem((line, socket) => {
 		if (line.startsWith('CONNECT ')) setTimeout(() => socket.write('DISCONNECTED\r'), 20);
 	});
 	try {
 		const outcome = await dialModem({ ...base, port: modem.port, dialect: 'vara' });
 		assert.equal(outcome.result, 'failed');
-		assert.match(outcome.message, /did not answer/);
+		assert.match(outcome.message, /disconnect frame/);
+		assert.ok(
+			outcome.log.some((line) => line.includes('the far end sent a disconnect frame before the call was up')),
+			'our own record distinguishes the peer ending it from our deadline expiring',
+		);
+	} finally {
+		await modem.close();
+	}
+});
+
+test('a timing-out dial says the deadline expired, not that the far end disconnected', async () => {
+	const modem = await fakeModem(() => undefined);
+	try {
+		const outcome = await dialModem({ ...base, port: modem.port, dialect: 'vara', timeoutMs: 500 });
+		assert.equal(outcome.result, 'failed');
+		assert.match(outcome.message, /no answer from OK1RAA within 1 seconds/);
+		assert.ok(!outcome.log.some((line) => line.includes('disconnect frame')), 'nobody disconnected us');
+		// Everything is timestamped, commands and answers alike.
+		assert.ok(outcome.log.some((line) => /^\+\d+\.\d\ds > CONNECT OK4RM OK1RAA$/.test(line)), outcome.log.join(' | '));
 	} finally {
 		await modem.close();
 	}
@@ -133,7 +170,7 @@ test('ARDOP dialect: MYCALL, ARQBW and ARQCALL, then CONNECTED with the bandwidt
 			connectRequests: 6
 		});
 		assert.equal(outcome.result, 'connected', outcome.message);
-		assert.deepEqual(modem.heard.slice(0, 3), ['MYCALL OK1ABC', 'ARQBW 500MAX', 'ARQCALL OK1RAA 6']);
+		assert.deepEqual(modem.heard.slice(0, 3), ['MYCALL OK4RM', 'ARQBW 500MAX', 'ARQCALL OK1RAA 6']);
 		assert.equal(outcome.connectedBandwidthHz, 500, "the modem's own report of the bandwidth");
 	} finally {
 		await modem.close();
@@ -177,7 +214,7 @@ test('Data2G dials at its own bandwidths, not VARA\'s', async () => {
 
 test('Data2G gets the common commands only, not VARA\'s session preamble', async () => {
 	const modem = await fakeModem((line, socket) => {
-		if (line.startsWith('CONNECT ')) setTimeout(() => socket.write('CONNECTED OK1ABC OK1RAA 2300\r'), 20);
+		if (line.startsWith('CONNECT ')) setTimeout(() => socket.write('CONNECTED OK4RM OK1RAA 2300\r'), 20);
 	});
 	try {
 		const outcome = await dialModem({
@@ -190,10 +227,10 @@ test('Data2G gets the common commands only, not VARA\'s session preamble', async
 			bandwidthChoices: [500, 1200, 2300, 2750]
 		});
 		assert.equal(outcome.result, 'connected', outcome.message);
-		assert.deepEqual(modem.heard.slice(0, 3), ['MYCALL OK1ABC', 'LISTEN OFF', 'BW2300']);
+		assert.deepEqual(modem.heard.slice(0, 3), ['MYCALL OK4RM', 'LISTEN OFF', 'BW2300']);
 		assert.ok(!modem.heard.includes('WINLINK SESSION'), 'Data2G has no WINLINK SESSION');
 		assert.ok(!modem.heard.includes('COMPRESSION TEXT'), 'nor COMPRESSION');
-		assert.ok(modem.heard.includes('CONNECT OK1ABC OK1RAA'));
+		assert.ok(modem.heard.includes('CONNECT OK4RM OK1RAA'));
 	} finally {
 		await modem.close();
 	}
@@ -278,4 +315,90 @@ test('bandwidths are written the way each dialect expects', () => {
 	assert.equal(nearestBandwidth(500, data2g), 500);
 	assert.equal(nearestBandwidth(2000, data2g), 2300);
 	assert.equal(nearestBandwidth(200, data2g), 200);
+});
+
+test('a steady signal in the channel abandons the call; a voice-like one is dialled through', async () => {
+	// BUSY ON means the modem hears someone. A data station holds the channel without a
+	// gap; a voice breaks it up. The first is not transmitted into, the second is.
+	const steady = await fakeModem((line, socket) => {
+		if (line.startsWith('CONNECT ')) socket.write('BUSY ON\r');
+	});
+	try {
+		const outcome = await dialModem({ ...base, port: steady.port, dialect: 'vara', timeoutMs: 9_000 });
+		assert.equal(outcome.result, 'failed');
+		assert.match(outcome.message, /carrying another station/);
+		assert.ok(steady.heard.includes('DISCONNECT'), 'the call is dropped rather than left running');
+	} finally {
+		await steady.close();
+	}
+
+	const voice = await fakeModem((line, socket) => {
+		if (!line.startsWith('CONNECT ')) return;
+		// Syllables: on and off every 250 ms, then the call comes up.
+		for (let index = 0; index < 6; index += 1) {
+			setTimeout(() => socket.write(index % 2 === 0 ? 'BUSY ON\r' : 'BUSY OFF\r'), 100 + index * 250);
+		}
+		setTimeout(() => socket.write('CONNECTED OK4RM OK1RAA 2300\r'), 1_800);
+	});
+	try {
+		const outcome = await dialModem({ ...base, port: voice.port, dialect: 'vara', timeoutMs: 5_000 });
+		assert.equal(outcome.result, 'connected', outcome.message);
+		assert.ok(outcome.log.some((line) => line.includes('watching the shape')));
+	} finally {
+		await voice.close();
+	}
+});
+
+test('hanging up waits for DISCONNECTED and for the closing ID to finish', async () => {
+	// The modem keeps keying after DISCONNECT, and both stations send an ID frame once
+	// the exchange is over. The link is closed only when the air has been quiet.
+	const modem = await fakeModem((line, socket) => {
+		if (line !== 'DISCONNECT') return;
+		socket.write('OK\r');
+		setTimeout(() => socket.write('DISCONNECTED\r'), 150);
+		setTimeout(() => socket.write('PTT ON\r'), 250);
+		setTimeout(() => socket.write('PTT OFF\r'), 500);
+	});
+	const socket = createConnection({ host: '127.0.0.1', port: modem.port });
+	await new Promise<void>((resolve) => socket.once('connect', () => resolve()));
+
+	try {
+		const startedAt = Date.now();
+		const report = await hangUpModem(socket, { disconnectedMs: 2_000, quietMs: 400, hardMs: 8_000 });
+		const elapsed = Date.now() - startedAt;
+		assert.equal(report.sawDisconnected, true, 'the modem confirmed the far end ended it');
+		assert.equal(report.timedOut, false);
+		assert.ok(report.lines.some((line) => line.includes('DISCONNECTED')), 'its lines are kept for the record');
+		assert.ok(elapsed >= 700, `the link stayed open through the ID frame (closed after ${elapsed} ms)`);
+		assert.ok(elapsed < 6_000, 'and did not sit there until the hard ceiling');
+		assert.equal(socket.destroyed, true);
+	} finally {
+		await modem.close();
+	}
+});
+
+test('LISTEN ON and OFF are sent, and what the modem answers is reported', async () => {
+	// A modem that takes the command answers OK; one that does not says WRONG, and the
+	// operator should see that rather than a checkbox that lies.
+	const heard: string[] = [];
+	const modem = await fakeModem((line, socket) => {
+		heard.push(line);
+		if (line === 'LISTEN ON') socket.write('OK\r');
+		if (line === 'LISTEN OFF') socket.write('WRONG\r');
+	});
+	try {
+		const on = await setModemListening('127.0.0.1', modem.port, true);
+		assert.equal(on.ok, true);
+		assert.equal(on.answer, 'OK');
+		const off = await setModemListening('127.0.0.1', modem.port, false);
+		assert.equal(off.ok, false);
+		assert.equal(off.answer, 'WRONG', 'a refusal is reported, not hidden');
+		assert.deepEqual(heard, ['LISTEN ON', 'LISTEN OFF']);
+
+		const nowhere = await setModemListening('127.0.0.1', 1, true);
+		assert.equal(nowhere.ok, false);
+		assert.ok(nowhere.error, 'a modem that is not there is an error with a reason');
+	} finally {
+		await modem.close();
+	}
 });

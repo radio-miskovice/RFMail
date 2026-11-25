@@ -37,6 +37,12 @@
 	const recipients = $derived(
 		message ? [...message.to, ...message.cc.map((cc) => `${cc} (cc)`)].map(addressOnly).join(', ') : ''
 	);
+	/**
+	 * Which end of the message is the interesting one. An arriving message is from
+	 * somebody; a message this station sent is to somebody, and its sender is always us —
+	 * so the heading line is swapped rather than repeating this station's own address.
+	 */
+	const outgoing = $derived(message?.direction === 'out');
 
 	const renderedHtml = $derived(
 		message?.bodyHtml
@@ -58,12 +64,20 @@
 			<div class="subject-block">
 				<h2>{message.subject || '(no subject)'}</h2>
 				<p class="meta">
-					<strong>{senderName(message.from)}</strong>
-					<span class="addr">&lt;{addressOnly(message.from)}&gt;</span>
+					{#if outgoing}
+						<strong>to {recipients || '—'}</strong>
+					{:else}
+						<strong>{senderName(message.from)}</strong>
+						<span class="addr">&lt;{addressOnly(message.from)}&gt;</span>
+					{/if}
 					<span class="when">{formatDateTime(message.date)}</span>
 				</p>
 				<p class="meta small">
-					to {recipients || '—'}
+					{#if outgoing}
+						from <span class="addr">{addressOnly(message.from)}</span>
+					{:else}
+						to {recipients || '—'}
+					{/if}
 					<span class="when">· {formatBytes(message.size)} · MID {message.mid}</span>
 				</p>
 			</div>

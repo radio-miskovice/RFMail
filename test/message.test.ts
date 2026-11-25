@@ -64,7 +64,7 @@ test('serialises to CRLF and parses back to the same message', () => {
 
 test('plain text message without attachments round-trips', () => {
 	const message = composeMessage({
-		from: 'OK1ABC',
+		from: 'OK4RM',
 		to: 'LA5NTA@winlink.org',
 		subject: 'Žluťoučký kůň',
 		body: 'Line one\nLine two with ünïcode',
@@ -84,8 +84,8 @@ test('empty and non-UTF-8 headers do not throw', () => {
 });
 
 test('MID is 12 characters of base32 and changes over time', () => {
-	const a = generateMid('OK1ABC', 1);
-	const b = generateMid('OK1ABC', 2);
+	const a = generateMid('OK4RM', 1);
+	const b = generateMid('OK4RM', 2);
 	assert.equal(a.length, 12);
 	assert.match(a, /^[A-Z2-7]{12}$/);
 	assert.notEqual(a, b);

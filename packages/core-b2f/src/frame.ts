@@ -94,10 +94,21 @@ export class TransferDecoder {
   push(chunk: Uint8Array): TransferEvent[] {
     if (this.finished) return [];
     this.buffer = Buffer.concat([this.buffer, Buffer.from(chunk)]);
-    return this.drain();
+    return this.drainEvents();
   }
 
-  private drain(): TransferEvent[] {
+  /**
+   * Bytes that arrived after the message ended — the next protocol line, when a
+   * peer sends it in the same packet as the EOT. Hand them back to the line
+   * reader, or they are lost with the decoder.
+   */
+  drain(): Uint8Array {
+    const rest = this.buffer;
+    this.buffer = Buffer.alloc(0);
+    return new Uint8Array(rest);
+  }
+
+  private drainEvents(): TransferEvent[] {
     const events: TransferEvent[] = [];
     for (;;) {
       if (this.header === null) {

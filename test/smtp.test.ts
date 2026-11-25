@@ -8,7 +8,7 @@ import { SmtpTestClient } from './helpers/protocol-clients.ts';
 const silent = createLogger('error', () => {});
 
 const MESSAGE = [
-	'From: OK1ABC@winlink.org',
+	'From: OK4RM@winlink.org',
 	'To: LA5NTA@winlink.org',
 	'Subject: Hello from SMTP',
 	'Date: Tue, 24 Nov 2026 16:00:00 +0000',
@@ -32,7 +32,7 @@ async function harness(options: { password?: string; maxMessageBytes?: number } 
 	const store = new SqliteStore({ path: ':memory:' });
 	await store.migrate();
 	const user = await store.createUser({ login: 'tester', pwHash: null, role: 'admin' });
-	await store.setCallsign(user.id, 'OK1ABC');
+	await store.setCallsign(user.id, 'OK4RM');
 	const events = new MailEvents();
 	const server = new SmtpServer({
 		store,
@@ -69,7 +69,7 @@ test('accepts an authenticated submission into OUTBOX and notifies', async () =>
 		assert.match(await client.cmd('EHLO test'), /^250/);
 		const auth = await client.cmd(`AUTH PLAIN ${Buffer.from('\u0000tester\u0000').toString('base64')}`);
 		assert.match(auth, /^235/);
-		assert.match(await client.cmd('MAIL FROM:<OK1ABC@winlink.org>'), /^250/);
+		assert.match(await client.cmd('MAIL FROM:<OK4RM@winlink.org>'), /^250/);
 		assert.match(await client.cmd('RCPT TO:<LA5NTA@winlink.org>'), /^250/);
 		const queued = await client.data(MESSAGE);
 		assert.match(queued, /^250 .*queued as [A-Z2-7]{12}/);
@@ -82,12 +82,12 @@ test('accepts an authenticated submission into OUTBOX and notifies', async () =>
 		assert.equal(list.total, 1);
 		const stored = await store.getMailMessage(userId, list.messages[0]?.id ?? 0);
 		assert.ok(stored);
-		assert.equal(stored.from, 'OK1ABC', 'the OUTBOX keeps the bare callsign');
+		assert.equal(stored.from, 'OK4RM', 'the OUTBOX keeps the bare callsign');
 		assert.deepEqual(stored.to, ['LA5NTA'], 'recipients likewise');
 		const wire = Buffer.from(
 			(await import('@rfmail/core-b2f')).serialiseRfc822(stored),
 		).toString('latin1');
-		assert.match(wire, /^From: OK1ABC@winlink\.org\r$/m, 'a client sees the domain');
+		assert.match(wire, /^From: OK4RM@winlink\.org\r$/m, 'a client sees the domain');
 		assert.match(wire, /^To: LA5NTA@winlink\.org\r$/m);
 		assert.equal(stored.subject, 'Hello from SMTP');
 		assert.equal(stored.body, 'Line one.\n.dot line preserved\nKonec.\n');
@@ -135,7 +135,7 @@ test('rejects a wrong password and an oversized message', async () => {
 			await client.cmd(`AUTH PLAIN ${Buffer.from('\u0000tester\u0000secret').toString('base64')}`),
 			/^235/,
 		);
-		assert.match(await client.cmd('MAIL FROM:<OK1ABC>'), /^250/);
+		assert.match(await client.cmd('MAIL FROM:<OK4RM>'), /^250/);
 		assert.match(await client.cmd('RCPT TO:<LA5NTA@winlink.org>'), /^250/);
 		const payload = `${MESSAGE}\r\n${'x'.repeat(600)}`;
 		assert.match(await client.data(payload), /^552/);

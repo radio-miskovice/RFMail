@@ -27,6 +27,9 @@ import {
   type ModemKind,
   type PatchMessageRequest,
   type PasswordRequest,
+  type ModemListenRequest,
+  type SessionMode,
+  type SessionRunRequest,
   type SessionTestRequest,
   type SetupRequest,
   type CreateTransceiverRequest,
@@ -64,8 +67,9 @@ import { findUserByCredential, type MailEvents, type PeerPolicy } from '@rfmail/
 import type { TransceiverConfig, TransceiverLinks } from '@rfmail/rig';
 import { sanitiseHtml } from './html.ts';
 import { SESSION_COOKIE, parseCookies, type Sessions } from './auth.ts';
-import { sealSecret } from './secrets.ts';
-import { bandwidthOfMode, dialModem, probeModem } from './modem-dial.ts';
+import { openSecret, sealSecret } from './secrets.ts';
+import { bandwidthOfMode, dialModem, identifyModem, probeModem, setModemListening } from './modem-dial.ts';
+import { runSession } from './session-run.ts';
 import {
   MODEM_FAMILIES,
   MODEM_LABELS,
@@ -619,16 +623,27 @@ export function createApi(services: ApiServices): {
   });
 
   /** Validates the fields a create or update carries; unknown keys are ignored. */
-  const readTransceiverInput = (body: Partial<CreateTransceiverRequest>): CreateTransceiverInput => {
-    const input: CreateTransceiverInput = { name: body.name ?? '', host: body.host ?? '' };
-    if (body.name !== undefined && typeof body.name !== 'string') {
-      throw new HttpError(400, 'the name must be a string', { name: 'invalid' });
+  /**
+   * A transceiver from a request body. Only the fields the request names are
+   * returned, so a PATCH that moves a radio's address cannot blank its name — the
+   * shape that always returns every field turns a one-field edit into a wipe.
+   * `creating` makes the two required fields required.
+   */
+  const readTransceiverInput = (
+    body: Partial<CreateTransceiverRequest>,
+    creating = false,
+  ): Partial<CreateTransceiverInput> => {
+    const input: Partial<CreateTransceiverInput> = {};
+    if (body.name !== undefined || creating) {
+      const name = typeof body.name === 'string' ? body.name.trim() : '';
+      if (!name) throw new HttpError(400, 'a name is required', { name: 'required' });
+      input.name = name;
     }
-    if (body.host !== undefined && typeof body.host !== 'string') {
-      throw new HttpError(400, 'the host must be a string', { host: 'invalid' });
+    if (body.host !== undefined || creating) {
+      const host = typeof body.host === 'string' ? body.host.trim() : '';
+      if (!host) throw new HttpError(400, 'a host is required', { host: 'required' });
+      input.host = host;
     }
-    input.name = (body.name ?? '').trim();
-    input.host = (body.host ?? '').trim();
     if (body.port !== undefined) {
       const port = Number(body.port);
       if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -690,11 +705,48 @@ export function createApi(services: ApiServices): {
         if (!record.commandPort) {
           return { id: record.id, running: false, error: 'no command port configured' };
         }
-        const probe = await probeModem(record.host, record.commandPort);
-        return { id: record.id, running: probe.running, error: probe.error };
+        // Ask who is listening, not merely whether something is: the same ports carry
+        // VARA, XARA, Data2G and Mercury, and which one answers decides the digital mode.
+        const probe = await identifyModem(record.host, record.commandPort);
+        return {
+          id: record.id,
+          running: probe.running,
+          error: probe.error,
+          listening: listenStates.get(record.id) ?? null,
+          // The program that answered, or null when it did not say.
+          reportedKind: probe.identity?.kind ?? null,
+          reportedVersion: probe.identity?.version ?? null,
+          // The record's kind and the program that answered disagree.
+          mismatch: probe.identity?.kind != null && probe.identity.kind !== record.kind,
+        };
       }),
     );
     sendJson(ctx.res, 200, { statuses, checkedAt: new Date().toISOString() });
+  });
+
+  /**
+   * `LISTEN ON` / `LISTEN OFF`: whether the modem accepts inbound calls. It is operator
+   * state, not configuration, so it lives in memory beside the links and is forgotten on
+   * restart — the modem's own state is the truth, and the host protocol cannot be asked.
+   */
+  const listenStates = new Map<number, boolean>();
+
+  router.add('POST', '/api/modems/:id/listen', async (ctx) => {
+    const authed = requireLogin(ctx);
+    requireCsrf(ctx);
+    const record = await store.getModem(Number(ctx.params.id));
+    if (!record) throw new HttpError(404, 'modem not found');
+    if (!record.commandPort) throw new HttpError(400, 'this modem has no command port');
+    const body = await readJson<ModemListenRequest>(ctx.req);
+    const on = body.on === true;
+
+    const result = await setModemListening(record.host, record.commandPort, on);
+    if (result.error) {
+      throw new HttpError(502, `${record.name} did not answer: ${result.error}`, { modemId: 'offline' });
+    }
+    listenStates.set(record.id, on);
+    logger.info('modem listening', { modem: record.name, listening: on, answer: result.answer, by: authed.user.login });
+    sendJson(ctx.res, 200, { modemId: record.id, listening: on, answer: result.answer });
   });
 
   router.add('POST', '/api/modems', async (ctx) => {
@@ -742,13 +794,13 @@ export function createApi(services: ApiServices): {
     const authed = requireLogin(ctx);
     requireCsrf(ctx);
     const body = await readJson<CreateTransceiverRequest>(ctx.req);
-    const input = readTransceiverInput(body);
+    const input = readTransceiverInput(body, true);
     if (!input.name) throw new HttpError(400, 'a name is required', { name: 'required' });
     if (!input.host) throw new HttpError(400, 'a host is required', { host: 'required' });
-    if (await store.listTransceivers().then((rows) => rows.some((row) => row.name.toLowerCase() === input.name.toLowerCase()))) {
+    if (await store.listTransceivers().then((rows) => rows.some((row) => row.name.toLowerCase() === input.name?.toLowerCase()))) {
       throw new HttpError(409, 'a transceiver with that name exists', { name: 'duplicate' });
     }
-    const created = await store.createTransceiver(input);
+    const created = await store.createTransceiver({ ...input, name: input.name, host: input.host });
     logger.info('transceiver created', {
       name: created.name,
       host: created.host,
@@ -923,15 +975,18 @@ export function createApi(services: ApiServices): {
   });
 
   /**
-   * The connect test: tune the radio, dial the gateway through the chosen modem,
-   * report what the modem said, and hang up again. No B2F exchange happens here —
-   * this is a check that the chain modem → radio → gateway answers at all.
+   * The shared front half of a session: the modem, a validated target, the dial
+   * frequency and the radio tuned to it. Both the connect test and the exchange
+   * start here, so neither can transmit wherever the dial was left.
    */
-  router.add('POST', '/api/session/test', async (ctx) => {
-    const authed = requireLogin(ctx);
-    requireCsrf(ctx);
-    const body = await readJson<SessionTestRequest>(ctx.req);
-
+  async function prepareDial(authed: AuthedContext, body: SessionTestRequest): Promise<{
+    modem: ModemRecord;
+    target: string;
+    frequencyHz: number;
+    bandwidthHz: number;
+    rig: { frequencyHz: number; mode: string } | null;
+    transceiverName: string | null;
+  }> {
     const modem = await store.getModem(Number(body.modemId));
     if (!modem) throw new HttpError(404, 'modem not found');
     if (!modem.commandPort) {
@@ -941,8 +996,7 @@ export function createApi(services: ApiServices): {
     if (!/^[A-Z0-9]{3,10}([-/][A-Z0-9]{1,3})?$/.test(target)) {
       throw new HttpError(400, `not a callsign: ${body.target}`, { target: 'invalid' });
     }
-    const callsign = authed.user.callsign;
-    if (!callsign) {
+    if (!authed.user.callsign) {
       throw new HttpError(400, 'this account has no callsign to put on the air', {
         callsign: 'required',
       });
@@ -955,43 +1009,57 @@ export function createApi(services: ApiServices): {
     }
     const bandwidthHz = Number(body.bandwidthHz ?? bandwidthOfMode('VARA'));
 
-    // The radio must be tuned before the modem transmits: a connect test that keys
-    // the transmitter wherever the dial happened to be left is not acceptable.
+    // The radio must be tuned before the modem transmits: a session that keys the
+    // transmitter wherever the dial happened to be left is not acceptable.
     let rig: { frequencyHz: number; mode: string } | null = null;
     let transceiverName: string | null = null;
-    if (modem.transceiverId !== null) {
-      const radio = await store.getTransceiver(modem.transceiverId);
-      transceiverName = radio?.name ?? null;
-      if (!radio) {
-        throw new HttpError(400, 'the modem names a transceiver that no longer exists', {
-          modemId: 'stale',
-        });
-      }
-      try {
-        const tuned = await links.tune(radio.id, frequencyHz, modem.rigMode);
-        rig = { frequencyHz: tuned.frequencyHz, mode: tuned.mode };
-      } catch (error) {
-        throw new HttpError(
-          409,
-          `the transceiver ${radio.name} is not connected: ${error instanceof Error ? error.message : String(error)}`,
-          { transceiverId: 'offline' },
-        );
-      }
-    } else {
+    if (modem.transceiverId === null) {
       throw new HttpError(409, 'the modem has no transceiver assigned, so the dial cannot be set', {
         transceiverId: 'missing',
       });
     }
+    const radio = await store.getTransceiver(modem.transceiverId);
+    transceiverName = radio?.name ?? null;
+    if (!radio) {
+      throw new HttpError(400, 'the modem names a transceiver that no longer exists', {
+        modemId: 'stale',
+      });
+    }
+    try {
+      const tuned = await links.tune(radio.id, frequencyHz, modem.rigMode);
+      rig = { frequencyHz: tuned.frequencyHz, mode: tuned.mode };
+    } catch (error) {
+      throw new HttpError(
+        409,
+        `the transceiver ${radio.name} is not connected: ${error instanceof Error ? error.message : String(error)}`,
+        { transceiverId: 'offline' },
+      );
+    }
+
+    return { modem, target, frequencyHz, bandwidthHz, rig, transceiverName };
+  }
+
+  /**
+   * The connect test: tune the radio, dial the gateway through the chosen modem,
+   * report what the modem said, and hang up again. No B2F exchange happens here —
+   * this is a check that the chain modem → radio → gateway answers at all.
+   */
+  router.add('POST', '/api/session/test', async (ctx) => {
+    const authed = requireLogin(ctx);
+    requireCsrf(ctx);
+    const body = await readJson<SessionTestRequest>(ctx.req);
+    const prepared = await prepareDial(authed, body);
+    const { modem, target, frequencyHz, bandwidthHz, rig, transceiverName } = prepared;
 
     logger.info('connect test', { modem: modem.name, target, frequencyHz, by: authed.user.login });
     const outcome = await dialModem({
       host: modem.host,
-      port: modem.commandPort,
+      port: modem.commandPort ?? 0,
       dialect: modem.kind === 'ardop' ? 'ardop' : 'vara',
       hf: modem.kind !== 'vara-fm',
       plainVara: modem.kind === 'data2g' || modem.kind === 'mercury',
       bandwidthChoices: modemKindInfo(modem.kind).bandwidths,
-      myCallsign: callsign,
+      myCallsign: authed.user.callsign ?? '',
       target,
       bandwidthHz,
     });
@@ -1011,6 +1079,77 @@ export function createApi(services: ApiServices): {
       transceiverName,
       frequencyHz,
       bandwidthHz: outcome.connectedBandwidthHz ?? bandwidthHz,
+      rig,
+    });
+  });
+
+  /**
+   * The session itself: dial, run the B2 exchange over the modem's data port, and
+   * put what arrived into INBOX and what was accepted into SENT.
+   *
+   * The request is held open for as long as the airtime takes — one session on HF
+   * can be several minutes — which is honest for a single operator watching it and
+   * is the first thing to change when sessions move to a queue (M7).
+   */
+  router.add('POST', '/api/session/run', async (ctx) => {
+    const authed = requireLogin(ctx);
+    requireCsrf(ctx);
+    const body = await readJson<SessionRunRequest>(ctx.req);
+    const mode: SessionMode = body.mode ?? 'cms';
+    if (mode !== 'cms' && mode !== 'p2p' && mode !== 'postoffice') {
+      return sendJson(ctx.res, 400, { error: 'mode must be cms, p2p or postoffice' });
+    }
+    const prepared = await prepareDial(authed, body);
+    const { modem, target, frequencyHz, bandwidthHz, rig, transceiverName } = prepared;
+
+    const secret = authed.user.winlinkSecret ? openSecret(authed.user.winlinkSecret, services.storeKey) : null;
+    const startedAt = Date.now();
+    logger.info('session start', { modem: modem.name, target, mode, frequencyHz, by: authed.user.login });
+
+    const report = await runSession({
+      store,
+      account: authed.user,
+      modem: {
+        name: modem.name,
+        kind: modem.kind,
+        host: modem.host,
+        commandPort: modem.commandPort ?? 0,
+        dataPort: modem.dataPort,
+      },
+      target,
+      mode,
+      bandwidthHz,
+      password: secret,
+      logger,
+    });
+
+    logger.info('session ended', {
+      modem: modem.name,
+      target,
+      mode,
+      result: report.result,
+      sent: report.sent.length,
+      received: report.received.length,
+      // Why it ended the way it did, when there is a reason to give.
+      reason: report.result === 'complete' ? null : report.message,
+      dialResult: report.dial?.result ?? null,
+    });
+
+    sendJson(ctx.res, 200, {
+      result: report.result,
+      message: report.message,
+      sent: report.sent,
+      received: report.received,
+      deferred: report.exchange?.deferred ?? [],
+      failed: report.exchange?.failed ?? [],
+      dialLog: report.dial?.log ?? [],
+      log: report.exchange?.log ?? [],
+      remoteSid: report.exchange?.remoteSid ?? '',
+      elapsedMs: Date.now() - startedAt,
+      modemName: modem.name,
+      transceiverName,
+      frequencyHz,
+      bandwidthHz: report.dial?.connectedBandwidthHz ?? bandwidthHz,
       rig,
     });
   });

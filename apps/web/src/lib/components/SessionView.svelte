@@ -9,18 +9,23 @@
 	// dial frequency in hertz, and that mode.
 	import { onMount } from 'svelte';
 	import {
+		dialFromCarrier,
 		modemDrivesMode,
+		modemForChannel,
 		modemKindInfo,
 		type GatewayChannelView,
 		type GatewayList,
 		type Modem,
 		type ModemKind,
+		type ModemStatus,
 		type SessionOptions,
+		type SessionRunResponse,
 		type SessionTestResponse,
 		type Transceiver
 	} from '@rfmail/shared';
 	import { api, ApiRequestError } from '../api/client';
 	import { bandContains } from '@rfmail/shared';
+	import { chooseSessionMode } from '../session-default';
 	import {
 		dialNumber,
 		dialUnitFor,
@@ -41,6 +46,8 @@
 	let radios = $state<Transceiver[]>([]);
 	/** Which modems answer on their command port right now. */
 	let runningModems = $state<Record<number, boolean>>({});
+	/** What each command port says it is, when it names itself. */
+	let reportedModems = $state<Record<number, ModemStatus>>({});
 	let modemId = $state<number | null>(null);
 	let modem = $state<ModemKind>('ardop');
 	let band = $state<string>('40m');
@@ -49,6 +56,12 @@
 	let emcomm = $state(false);
 
 	let callsign = $state('');
+	/**
+	 * What is on the far end. It changes what the session asks the peer for and which
+	 * messages it may offer: a CMS routes for all of Winlink, a peer for itself alone,
+	 * a post office for its own users.
+	 */
+	let sessionMode = $state<'cms' | 'p2p' | 'postoffice'>('cms');
 	/** The dial is held in hertz; the input shows it in kHz or MHz (dial.ts). */
 	let frequencyHz = $state<number | null>(null);
 	let frequencyText = $state('');
@@ -59,6 +72,13 @@
 	let test = $state<{ state: 'calling' | 'done'; response: SessionTestResponse | null; error: string } | null>(
 		null
 	);
+	/** The exchange's state: null before the first run. */
+	let session = $state<{ state: 'running' | 'done'; response: SessionRunResponse | null; error: string } | null>(
+		null
+	);
+
+	/** Told after an exchange, so the folder list behind the screen catches up. */
+	let { onSent }: { onSent?: () => void } = $props();
 	let loading = $state(false);
 	let error = $state('');
 
@@ -83,6 +103,39 @@
 		}
 	}
 
+	/** The mode this browser chose last, or null when it has never chosen one. */
+	function readLastMode(): ModemKind | null {
+		try {
+			const stored = localStorage.getItem('rfmail.sessionMode');
+			return stored ? (stored as ModemKind) : null;
+		} catch {
+			return null;
+		}
+	}
+
+	/** Remembered on every change, so a reopened browser starts where it left off. */
+	function rememberMode(mode: ModemKind): void {
+		try {
+			localStorage.setItem('rfmail.sessionMode', mode);
+		} catch {
+			// As above: losing storage loses a convenience, not a session.
+		}
+	}
+
+	/** The opening mode is decided once, after the modems and their ports are known. */
+	let modeChosen = false;
+
+	function chooseOpeningMode(): void {
+		if (modeChosen) return;
+		modeChosen = true;
+		modem = chooseSessionMode({
+			kinds: (options?.modems ?? []).map((entry) => entry.kind),
+			modems,
+			running: runningModems,
+			saved: readLastMode()
+		});
+	}
+
 	async function loadOptions(): Promise<void> {
 		try {
 			const [session, configured, rigs] = await Promise.all([
@@ -97,6 +150,12 @@
 			runningModems = status
 				? Object.fromEntries(status.statuses.map((entry) => [entry.id, entry.running]))
 				: {};
+			reportedModems = status
+				? Object.fromEntries(status.statuses.map((entry) => [entry.id, entry]))
+				: {};
+			// A mode whose modem is listening beats a remembered one that is not; only when
+			// nothing is listening does the browser's last choice decide.
+			chooseOpeningMode();
 		} catch (err) {
 			error = err instanceof ApiRequestError ? err.message : 'Could not load the session options.';
 		}
@@ -122,13 +181,16 @@
 		callsign = channel.callsign;
 		pickedMode = channel.mode;
 		test = null;
-		frequencyHz = channel.frequencyHz;
-		frequencyText = dialNumber(channel.frequencyHz);
-		typedUnit = dialUnitFor(channel.frequencyHz);
+		// The catalogue lists the AF carrier, 1500 Hz above the dial: a session tunes the
+		// transceiver 1.5 kHz lower so the signal lands centred in the modem's passband.
+		const dial = dialFromCarrier(channel.frequencyHz);
+		frequencyHz = dial;
+		frequencyText = dialNumber(dial);
+		typedUnit = dialUnitFor(dial);
 		band = channel.band;
-		if (channel.family === 'vara-fm') modem = 'vara-fm';
-		else if (channel.family === 'ardop') modem = 'ardop';
-		else if (channel.family === 'vara') modem = modem === 'xara' ? 'xara' : 'vara';
+		// The service code decides: `VARA (DATA2G)` is a Data2G channel, whatever the mode
+		// string says, and picking it has to set Data2G or the session dials the wrong modem.
+		modem = modemForChannel(channel.family, channel.serviceCode);
 	}
 
 	/** Typing sets the hertz value; the text is left alone so the caret stays put. */
@@ -178,6 +240,18 @@
 		chosenModem === null ? null : (runningModems[chosenModem.id] ?? null)
 	);
 
+	/**
+	 * The program on the port, when it is not the one this record claims. VARA, XARA,
+	 * Data2G and Mercury share ports, so a record can be right about the address and wrong
+	 * about the modem — and then the digital mode and the transceiver's mode are wrong too.
+	 */
+	const chosenReport = $derived(chosenModem === null ? null : (reportedModems[chosenModem.id] ?? null));
+	const chosenMismatch = $derived(
+		chosenReport?.mismatch === true && chosenReport.reportedKind
+			? `This port answers as ${modemKindInfo(chosenReport.reportedKind).label}${chosenReport.reportedVersion ? ` · ${chosenReport.reportedVersion}` : ''}, but the modem is configured as ${modemKindInfo(chosenModem!.kind).label}. A session would set the wrong digital mode.`
+			: ''
+	);
+
 	/** `VARA 40m, @TS-590SG : PKTUSB` — what the modem is, on which radio, in which mode. */
 	function modemLabel(entry: Modem): string {
 		const radio = radios.find((candidate) => candidate.id === entry.transceiverId);
@@ -198,6 +272,9 @@
 		const candidate =
 			compatibleModems.find((entry) => entry.id === remembered) ?? compatibleModems[0]!;
 		modemId = candidate.id;
+		// The pair that is now in effect is the pair to open on next time, whether the
+		// operator picked the modem or the mode change picked it for them.
+		rememberModem(modem, candidate.id);
 	});
 
 	const ready = $derived({ ...readouts(), modem: chosenModem !== null });
@@ -206,8 +283,8 @@
 	let pickedMode = $state<string | null>(null);
 
 	/**
-	 * The connect test. It tunes the radio, dials the gateway, reports what the modem
-	 * said, and hangs up — there is no FBB exchange behind this yet.
+	 * The connect test: tune the radio, dial the gateway through the modem, report what
+	 * the modem said and hang up. It proves the chain answers, nothing more.
 	 */
 	async function runTest(): Promise<void> {
 		if (!chosenModem || !isDial(frequencyHz)) return;
@@ -225,6 +302,34 @@
 				state: 'done',
 				response: null,
 				error: err instanceof ApiRequestError ? err.message : 'The connect test failed.'
+			};
+		}
+	}
+
+	/**
+	 * The session itself: the radio is tuned, the modem dials, the mail moves both ways
+	 * and the link is dropped again. This is the one that keys the transmitter, so it
+	 * carries what the exchange did, not just whether it dialled.
+	 */
+	async function runExchange(): Promise<void> {
+		if (!chosenModem || !isDial(frequencyHz)) return;
+		session = { state: 'running', response: null, error: '' };
+		try {
+			const response = await api.runSession({
+				modemId: chosenModem.id,
+				mode: sessionMode,
+				target: callsign.trim().toUpperCase(),
+				frequencyHz: frequencyHz!,
+				bandwidthHz: pickedMode ? bandwidthOfMode(pickedMode) : undefined
+			});
+			session = { state: 'done', response, error: '' };
+			// The mailbox changed under the screen: let the folder list catch up.
+			onSent?.();
+		} catch (err) {
+			session = {
+				state: 'done',
+				response: null,
+				error: err instanceof ApiRequestError ? err.message : 'The session failed.'
 			};
 		}
 	}
@@ -280,7 +385,13 @@
 		<div class="row">
 			<label class="field">
 				<span>Digital mode</span>
-				<select bind:value={modem} onchange={() => void loadGateways()}>
+				<select
+					bind:value={modem}
+					onchange={() => {
+						rememberMode(modem);
+						void loadGateways();
+					}}
+				>
 					{#each options?.modems ?? [] as entry (entry.kind)}
 						<option value={entry.kind}>{entry.label}</option>
 					{/each}
@@ -302,7 +413,10 @@
 				<select
 					bind:value={modemId}
 					onchange={() => {
-						if (modemId !== null) rememberModem(modem, modemId);
+						if (modemId !== null) {
+							rememberModem(modem, modemId);
+							rememberMode(modem);
+						}
 					}}
 				>
 					{#each compatibleModems as entry (entry.id)}
@@ -322,7 +436,9 @@
 			</label>
 		</div>
 
-		{#if chosenModem && chosenRunning === false}
+		{#if chosenMismatch}
+			<p class="warn">{chosenMismatch}</p>
+		{:else if chosenModem && chosenRunning === false}
 			<p class="warn">
 				{chosenModem.name} is configured but nothing is listening on
 				{chosenModem.host}:{chosenModem.commandPort ?? '?'} — start it before a session.
@@ -335,7 +451,7 @@
 
 		<div class="row">
 			<label class="field narrow">
-				<span>Target RMS gateway</span>
+				<span>Target</span>
 				<input
 					class="call"
 					bind:value={callsign}
@@ -358,12 +474,21 @@
 					autocomplete="off"
 				/>
 			</label>
+
+			<label class="field narrow">
+				<span>Session type</span>
+				<select bind:value={sessionMode}>
+					<option value="cms">Winlink RMS gateway</option>
+					<option value="p2p">Peer to peer</option>
+					<option value="postoffice">Post office</option>
+				</select>
+			</label>
 		</div>
 
 		<p class="hint">
 			{#if isDial(frequencyHz)}
-				{formatDial(frequencyHz!)} — the carrier the receiver is tuned to
-				{band === 'any' ? '' : `on ${band}`}.
+				{formatDial(frequencyHz!)} — the dial {band === 'any' ? '' : `on ${band}`}, 1.5 kHz below
+				the AF carrier the gateway lists.
 			{:else}
 				Below 10 MHz the dial is written in kilohertz (7053.5), from 10 MHz upwards in megahertz (14.1096).
 			{/if}
@@ -374,16 +499,24 @@
 				{list ? 'Refresh list' : 'Find gateways'}
 			</button>
 			<button
-				class="btn primary"
-				type="submit"
-				disabled={!ready.callsign || !ready.frequency || !ready.modem || test?.state === 'calling'}
+				class="btn"
+				type="button"
+				disabled={!ready.callsign || !ready.frequency || !ready.modem || test?.state === 'calling' || session?.state === 'running'}
 				onclick={() => void runTest()}
 			>
-				{test?.state === 'calling' ? 'Calling…' : 'Start session'}
+				{test?.state === 'calling' ? 'Calling…' : 'Test the link'}
+			</button>
+			<button
+				class="btn primary"
+				type="submit"
+				disabled={!ready.callsign || !ready.frequency || !ready.modem || session?.state === 'running' || test?.state === 'calling'}
+				onclick={() => void runExchange()}
+			>
+				{session?.state === 'running' ? 'In session…' : 'Start session'}
 			</button>
 			<span class="blocked">
-				This is a connect test: the radio is tuned, the modem dials, the answer is reported and the link is
-				dropped again. The mail exchange over that link comes later.
+				Start session tunes the radio, dials, exchanges mail in both directions and hangs up. Test the link
+				stops once the call comes up, for when the question is only whether the gateway answers.
 			</span>
 		</div>
 	</form>
@@ -429,6 +562,83 @@
 		</section>
 	{/if}
 
+	{#if session}
+		<section
+			class="report"
+			class:calling={session.state === 'running'}
+			class:ok={session.response?.result === 'complete'}
+			class:bad={session.state === 'done' &&
+				(session.error !== '' || (session.response !== null && session.response.result !== 'complete'))}
+		>
+			{#if session.state === 'running'}
+				<p class="verdict">
+					In session with {callsign.trim().toUpperCase()} on {formatDial(frequencyHz!)} through
+					{chosenModem?.name}…
+				</p>
+				<p class="detail">
+					The modem is transmitting. A session can take several minutes; the link is dropped at the end
+					either way.
+				</p>
+			{:else if session.response}
+				<p class="verdict">
+					{#if session.response.result === 'complete'}
+						Session complete
+					{:else if session.response.result === 'failed'}
+						The session failed
+					{:else if session.response.result === 'aborted'}
+						Session cancelled
+					{:else}
+						The session could not run
+					{/if}
+				</p>
+				<p class="detail">
+					{session.response.message} · {Math.round(session.response.elapsedMs / 100) / 10} s ·
+					{session.response.modemName}{session.response.transceiverName
+						? ` via ${session.response.transceiverName}`
+						: ''}
+				</p>
+				{#if session.response.remoteSid}
+					<p class="detail">The far end identified itself as {session.response.remoteSid}.</p>
+				{/if}
+				{#if session.response.sent.length > 0}
+					<p class="detail">
+						Sent {session.response.sent.join(', ')} — {session.response.sent.length === 1
+							? 'moved'
+							: 'each moved'} to SENT.
+					</p>
+				{/if}
+				{#if session.response.received.length > 0}
+					<p class="detail">
+						Received {session.response.received.join(', ')} — waiting in INBOX.
+					</p>
+				{/if}
+				{#if session.response.deferred.length > 0}
+					<p class="detail">
+						Asked for again later, still in OUTBOX: {session.response.deferred.join(', ')}.
+					</p>
+				{/if}
+				{#if session.response.failed.length > 0}
+					<p class="detail">
+						Arrived damaged: {session.response.failed
+							.map((entry) => `${entry.mid} (${entry.reason})`)
+							.join('; ')}.
+					</p>
+				{/if}
+				<details class="log">
+					<summary>The exchange ({session.response.log.length} lines)</summary>
+					<pre>{session.response.log.map((entry) => `${entry.direction} ${entry.text}`).join('\n')}</pre>
+				</details>
+				<details class="log">
+					<summary>What the modem said while dialling ({session.response.dialLog.length} lines)</summary>
+					<pre>{session.response.dialLog.join('\n')}</pre>
+				</details>
+			{:else}
+				<p class="verdict">The session did not run</p>
+				<p class="detail">{session.error}</p>
+			{/if}
+		</section>
+	{/if}
+
 	{#if list}
 		<div class="list-head">
 			<h3>RMS gateways</h3>
@@ -464,7 +674,7 @@
 			<thead>
 				<tr>
 					<th>Gateway</th>
-					<th class="num">Frequency</th>
+					<th class="num" title="AF carrier frequency as the gateway publishes it; the dial is 1.5 kHz lower">AF carrier</th>
 					<th>Locator</th>
 					<th>Mode</th>
 					<th>Hours</th>

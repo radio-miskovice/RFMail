@@ -12,10 +12,12 @@ import type {
 	MessageDetail,
 	MessageListResponse,
 	Modem,
+	SessionRunResponse,
 	StatusResponse,
 	Transceiver,
 	User
 } from '@rfmail/shared';
+import { ScriptedModem, outboundMessage } from './helpers/scripted-gateway.ts';
 
 const silent = createLogger('error', () => {});
 
@@ -205,11 +207,11 @@ test('administrators create accounts; accounts manage their own password', async
 		const created = await fetch(`${base}/api/users`, {
 			method: 'POST',
 			headers: auth,
-			body: JSON.stringify({ login: 'operator', callsign: 'ok1abc', role: 'user' }),
+			body: JSON.stringify({ login: 'operator', callsign: 'OK4RM', role: 'user' }),
 		});
 		assert.equal(created.status, 201);
 		const operator = (await created.json()) as User;
-		assert.equal(operator.callsign, 'OK1ABC', 'the callsign is upper-cased');
+		assert.equal(operator.callsign, 'OK4RM', 'the callsign is upper-cased');
 		assert.equal(operator.hasPassword, false);
 
 		const list = (await (await fetch(`${base}/api/users`, { headers: { cookie } })).json()) as User[];
@@ -299,14 +301,14 @@ test('the Winlink password is stored sealed and never handed back', async () => 
 		const saved = await fetch(`${base}/api/account`, {
 			method: 'PATCH',
 			headers: auth,
-			body: JSON.stringify({ callsign: 'ok1abc', winlinkPassword: 'cms-secret' }),
+			body: JSON.stringify({ callsign: 'OK4RM', winlinkPassword: 'cms-secret' }),
 		});
 		assert.equal(saved.status, 200);
 		const savedText = await saved.text();
 		assert.ok(!savedText.includes('cms-secret'), 'the password must not come back in the response');
 		const updated = (JSON.parse(savedText) as Me).user;
 		assert.equal(updated.hasWinlinkPassword, true);
-		assert.equal(updated.callsign, 'OK1ABC');
+		assert.equal(updated.callsign, 'OK4RM');
 		assert.equal(updated.hasPassword, false, 'the mail password is a different setting');
 
 		const sealed = await store.getWinlinkSecret(me.user.id);
@@ -318,7 +320,7 @@ test('the Winlink password is stored sealed and never handed back', async () => 
 		const again = await fetch(`${base}/api/account`, {
 			method: 'PATCH',
 			headers: auth,
-			body: JSON.stringify({ callsign: 'OK1ABC' }),
+			body: JSON.stringify({ callsign: 'OK4RM' }),
 		});
 		assert.equal(((await again.json()) as Me).user.hasWinlinkPassword, true);
 
@@ -327,17 +329,17 @@ test('the Winlink password is stored sealed and never handed back', async () => 
 		const renamed = await fetch(`${base}/api/account`, {
 			method: 'PATCH',
 			headers: auth,
-			body: JSON.stringify({ callsign: 'OK1ABC-10' }),
+			body: JSON.stringify({ callsign: 'OK4RM-10' }),
 		});
 		const renamedUser = ((await renamed.json()) as Me).user;
-		assert.equal(renamedUser.callsign, 'OK1ABC-10');
+		assert.equal(renamedUser.callsign, 'OK4RM-10');
 		assert.equal(renamedUser.hasWinlinkPassword, false, 'the credential belonged to the old callsign');
 
 		// Another account cannot take a callsign that is already in use.
 		const clash = await fetch(`${base}/api/users`, {
 			method: 'POST',
 			headers: auth,
-			body: JSON.stringify({ login: 'intruder', callsign: 'OK1ABC-10' }),
+			body: JSON.stringify({ login: 'intruder', callsign: 'OK4RM-10' }),
 		});
 		assert.equal(clash.status, 409);
 
@@ -695,7 +697,26 @@ test('an ordinary account configures the station radios without an administrator
 			body: JSON.stringify({ pttInput: 'front' }),
 		});
 		assert.equal(patched.status, 200);
-		assert.equal(((await patched.json()) as Transceiver).pttInput, 'front');
+		const afterPtt = (await patched.json()) as Transceiver;
+		assert.equal(afterPtt.pttInput, 'front');
+		assert.equal(afterPtt.name, 'Bench', 'a one-field edit leaves the name alone');
+		assert.equal(afterPtt.host, '127.0.0.1');
+
+		// Moving a radio's address must not wipe its name, which a create-shaped body
+		// (name: body.name ?? '') did until this test existed.
+		const moved = await fetch(`${base}/api/transceivers/${radio.id}`, {
+			method: 'PATCH',
+			headers: asUser,
+			// Never the operator's own network: a test that expects "unreachable" must not
+			// flip to reachable because a rigctld happened to be running on the LAN.
+			body: JSON.stringify({ host: '127.0.0.1', port: 1 }),
+		});
+		assert.equal(moved.status, 200);
+		const afterMove = (await moved.json()) as Transceiver;
+		assert.equal(afterMove.name, 'Bench');
+		assert.equal(afterMove.host, '127.0.0.1');
+		assert.equal(afterMove.port, 1);
+		assert.equal(afterMove.pttInput, 'front', 'the connector choice survives too');
 
 		const connect = await fetch(`${base}/api/transceivers/${radio.id}/connect`, {
 			method: 'POST',
@@ -717,6 +738,146 @@ test('an ordinary account configures the station radios without an administrator
 			body: JSON.stringify({ login: 'intruder' }),
 		});
 		assert.equal(forbidden.status, 403);
+	} finally {
+		await close();
+	}
+});
+
+test('a session moves mail through the modem and into the mailbox over HTTP', async () => {
+	// A rigctld and a modem, both scripted: the route tunes the radio, dials, runs the
+	// exchange over the data port and reports what moved.
+	const rigSockets = new Set<import('node:net').Socket>();
+	const rigServer = createServer2((socket) => {
+		rigSockets.add(socket);
+		socket.on('close', () => rigSockets.delete(socket));
+		let buffer = '';
+		socket.on('data', (chunk) => {
+			buffer += chunk.toString('latin1');
+			for (let index = buffer.indexOf('\n'); index !== -1; index = buffer.indexOf('\n')) {
+				const line = buffer.slice(0, index).trim();
+				buffer = buffer.slice(index + 1);
+				if (line === '+\\get_freq') socket.write('get_freq:\nFrequency: 3597000\nRPRT 0\n');
+				else if (line === '+\\get_mode') socket.write('get_mode:\nMode: PKTUSB\nPassband: 2000\nRPRT 0\n');
+				else if (line === '+\\get_ptt') socket.write('get_ptt:\nPTT: 0\nRPRT 0\n');
+				else socket.write('RPRT 0\n');
+			}
+		});
+	});
+	await new Promise<void>((resolve) => rigServer.listen(0, '127.0.0.1', () => resolve()));
+	const rigPort = (rigServer.address() as AddressInfo).port;
+
+	const modem = new ScriptedModem([outboundMessage('INBOUND00001', 'OK1RAA', ['OK4RM'], 'Z gateway', 'Dobry den.\n')]);
+	await modem.listen();
+
+	const { base, store, close } = await harness();
+	try {
+		const setup = await fetch(`${base}/api/setup`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ login: 'admin' }),
+		});
+		const me = (await setup.json()) as Me;
+		const cookie = cookieFrom(setup);
+		const auth = { cookie, 'x-csrf-token': me.csrf, 'content-type': 'application/json' };
+
+		// The callsign and the locator a session puts on the air.
+		const account = await fetch(`${base}/api/account`, {
+			method: 'PATCH',
+			headers: auth,
+			body: JSON.stringify({ callsign: 'OK4RM', locator: 'JO70AA' }),
+		});
+		assert.equal(account.status, 200);
+
+		const radioResponse = await fetch(`${base}/api/transceivers`, {
+			method: 'POST',
+			headers: auth,
+			body: JSON.stringify({ name: 'TS-590S', host: '127.0.0.1', port: rigPort, pttInput: 'rear' }),
+		});
+		const radio = (await radioResponse.json()) as Transceiver;
+		await fetch(`${base}/api/transceivers/${radio.id}/connect`, { method: 'POST', headers: auth });
+
+		const modemResponse = await fetch(`${base}/api/modems`, {
+			method: 'POST',
+			headers: auth,
+			body: JSON.stringify({
+				name: 'Data2G',
+				kind: 'data2g',
+				host: '127.0.0.1',
+				commandPort: modem.commandPort,
+				dataPort: modem.dataPort,
+				transceiverId: radio.id,
+			}),
+		});
+		const configured = (await modemResponse.json()) as Modem;
+		assert.equal(configured.dataPort, modem.dataPort);
+
+		// One message waiting in OUTBOX, as the composer leaves it.
+		const composed = await fetch(`${base}/api/messages`, {
+			method: 'POST',
+			headers: auth,
+			body: JSON.stringify({ to: 'OK1RAA', subject: 'Hello from the bench', body: 'Test.\n' }),
+		});
+		assert.equal(composed.status, 201);
+
+		const run = await fetch(`${base}/api/session/run`, {
+			method: 'POST',
+			headers: auth,
+			body: JSON.stringify({ modemId: configured.id, target: 'OK1RAA', frequencyHz: 3_597_000, bandwidthHz: 2300 }),
+		});
+		const runText = await run.text();
+		assert.equal(run.status, 200, runText);
+		const report = JSON.parse(runText) as SessionRunResponse;
+
+		assert.equal(report.result, 'complete', report.message);
+		assert.equal(report.sent.length, 1);
+		assert.deepEqual(report.received, ['INBOUND00001']);
+		assert.equal(report.transceiverName, 'TS-590S');
+		assert.equal(report.rig?.mode, 'PKTUSB');
+		assert.ok(report.log.some((entry) => entry.direction === '<' && entry.text.startsWith('[WL2K')));
+		assert.ok(modem.commandLines.includes('CONNECT OK4RM OK1RAA'));
+
+		// The inbound message is in the account's INBOX, addressed as a Winlink address.
+		const inbox = me.folders.find((folder) => folder.kind === 'inbox');
+		assert.ok(inbox);
+		const listing = (await (
+			await fetch(`${base}/api/folders/${inbox.id}/messages`, { headers: { cookie } })
+		).json()) as MessageListResponse;
+		assert.equal(listing.total, 1);
+		assert.equal(listing.messages[0]?.subject, 'Z gateway');
+
+		// OUTBOX is empty: the message left when the gateway accepted it.
+		const outbox = me.folders.find((folder) => folder.kind === 'outbox');
+		assert.ok(outbox);
+		const outboxListing = (await (
+			await fetch(`${base}/api/folders/${outbox.id}/messages`, { headers: { cookie } })
+		).json()) as MessageListResponse;
+		assert.equal(outboxListing.total, 0);
+	} finally {
+		await close();
+		await modem.close();
+		for (const socket of rigSockets) socket.destroy();
+		await new Promise<void>((resolve) => rigServer.close(() => resolve()));
+	}
+});
+
+test('a session needs the CSRF token and a callsign before anything is transmitted', async () => {
+	const { base, close } = await harness();
+	try {
+		const setup = await fetch(`${base}/api/setup`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ login: 'admin' }),
+		});
+		const me = (await setup.json()) as Me;
+		const cookie = cookieFrom(setup);
+
+		const noToken = await fetch(`${base}/api/session/run`, {
+			method: 'POST',
+			headers: { cookie, 'content-type': 'application/json' },
+			body: JSON.stringify({ modemId: 1, target: 'OK1RAA', frequencyHz: 3_597_000 }),
+		});
+		assert.equal(noToken.status, 403, 'a session keys a transmitter and needs the CSRF token');
+		assert.equal(me.user.callsign, null);
 	} finally {
 		await close();
 	}

@@ -5,3 +5,4 @@ apps/web/.svelte-kit/
 *.db-shm
 *.db-wal
 rfmail.toml
+b2f-live-test.ts

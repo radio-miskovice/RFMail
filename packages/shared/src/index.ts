@@ -263,6 +263,58 @@ export function bandOf(frequencyHz: number): string {
   return BAND_RANGES.find((band) => frequencyHz >= band.lowHz && frequencyHz <= band.highHz)?.name ?? 'unknown';
 }
 
+/**
+ * What a modem says it is.
+ *
+ * VARA, XARA, Data2G and Mercury share the same TCP ports and largely the same command
+ * set, so a port number cannot tell them apart — and the digital mode to run (and the
+ * transceiver's mode with it) depends on which program is actually answering. `VERSION`
+ * is the one command that answers it: VARA returns its own version string, XARA and
+ * Mercury answer in the same shape, Data2G names itself (measured: `VERSION Data2G 0.5.3`).
+ * Old VARA builds answer `WRONG`; then the program is VARA-dialect but unnamed.
+ */
+export interface ModemIdentity {
+  /** The program that answered, or null when the reply names something we do not know. */
+  kind: ModemKind | null;
+  /** The words it answered with, for the operator and the log. */
+  version: string | null;
+  /** The line as it arrived, newlines folded, for the record. */
+  line: string;
+}
+
+export function parseModemVersion(reply: string): ModemIdentity {
+  const line = reply.replace(/[\r\n]+/g, ' ').trim();
+  const match = /^VERSION\b\s*(.*)$/i.exec(line);
+  if (!match) return { kind: null, version: null, line };
+  const version = (match[1] ?? '').trim();
+  const upper = version.toUpperCase();
+  const kind: ModemKind | null = /DATA\s*-?\s*2\s*G/.test(upper)
+    ? 'data2g'
+    : /XARA/.test(upper)
+      ? 'xara'
+      : /VARA\s*FM/.test(upper)
+        ? 'vara-fm'
+        : /VARA/.test(upper)
+          ? 'vara'
+          : /MERCURY/.test(upper)
+            ? 'mercury'
+            : null;
+  return { kind, version, line };
+}
+
+/**
+ * The Winlink catalogue publishes the frequency of a channel's **AF carrier** — the audio
+ * centre inside the passband, 1500 Hz above the suppressed carrier — while a transceiver
+ * is tuned to the dial frequency. Dialling the published number would put every signal
+ * 1.5 kHz off centre in the modem, so a channel is turned into a dial by subtracting it.
+ */
+export const AF_CARRIER_OFFSET_HZ = 1500;
+
+/** The transceiver dial for a channel the catalogue publishes as an AF carrier. */
+export function dialFromCarrier(carrierHz: number): number {
+  return Math.max(0, carrierHz - AF_CARRIER_OFFSET_HZ);
+}
+
 export function bandContains(band: string, frequencyHz: number): boolean {
   const range = BAND_RANGES.find((entry) => entry.name === band);
   return range ? frequencyHz >= range.lowHz && frequencyHz <= range.highHz : true;
@@ -467,6 +519,24 @@ export function modemsForMode(mode: ModemKind): ModemKind[] {
 }
 
 /** Can a configured modem of this kind run that session mode? */
+/**
+ * The modem a catalogue channel belongs to.
+ *
+ * A gateway advertises its waveform in `SupportedModes` (`VARA`, `ARDOP`, …) and, for a
+ * modem whose waveform is its own, adds a service code — `DATA2G`, `XARA`, `MERCURY`. The
+ * mode string therefore lies about the modem in exactly those cases: `VARA (DATA2G)` is a
+ * Data2G channel, and picking it must set Data2G or the session would dial a modem that
+ * cannot work the signal. The service code wins; the mode family is the fallback.
+ */
+export function modemForChannel(family: string, serviceCode: string | null | undefined): ModemKind {
+  const code = (serviceCode ?? '').toUpperCase();
+  const tagged = MODEM_KINDS.find((entry) => entry.serviceCode !== null && entry.serviceCode === code);
+  if (tagged) return tagged.kind;
+  if (family === 'vara-fm') return 'vara-fm';
+  if (family === 'ardop') return 'ardop';
+  return 'vara';
+}
+
 export function modemDrivesMode(modem: ModemKind, mode: ModemKind): boolean {
   return modemsForMode(mode).includes(modem);
 }
@@ -521,10 +591,38 @@ export interface GatewayList {
 }
 
 /** Whether a configured modem is actually listening, as of the last check. */
+/** Whether a modem is armed to accept inbound calls (`LISTEN ON`). */
+export interface ModemListenRequest {
+  on: boolean;
+}
+
+export interface ModemListenResponse {
+  modemId: number;
+  listening: boolean;
+  /** What the modem answered, for the operator: `OK`, `WRONG`, or the reason it failed. */
+  answer: string;
+}
+
 export interface ModemStatus {
   id: number;
   running: boolean;
   error: string | null;
+  /**
+   * The program whose `VERSION` came back on the command port, when it named itself.
+   * Ports are shared by VARA, XARA, Data2G and Mercury, so this is the only reliable way
+   * to know which modem a session will actually talk to.
+   */
+  reportedKind?: ModemKind | null;
+  /** Its version words, e.g. "Data2G 0.5.3". */
+  reportedVersion?: string | null;
+  /** The record says one thing and the program on the port another. */
+  mismatch?: boolean;
+  /**
+   * Whether this modem has been armed for inbound calls from here, or null when nothing
+   * has asked it yet. It is the last value we set, not a reading: the host protocol has
+   * no command that queries listening.
+   */
+  listening?: boolean | null;
 }
 
 export interface ModemStatusResponse {
@@ -556,6 +654,48 @@ export interface SessionTestResponse {
   frequencyHz: number;
   bandwidthHz: number;
   /** What the radio reported after being tuned, when it could be read. */
+  rig: { frequencyHz: number; mode: string } | null;
+}
+
+/**
+ * What the far end is, and therefore how the session is run: a Winlink gateway, another
+ * operator's station, or a post office that holds mail instead of relaying.
+ */
+export type SessionMode = 'cms' | 'p2p' | 'postoffice';
+
+export interface SessionRunRequest extends SessionTestRequest {
+  /** Defaults to `cms`: a Winlink RMS gateway or the CMS. */
+  mode?: SessionMode;
+}
+
+/** One protocol line of a session, in the direction it travelled. */
+export interface SessionLogLine {
+  direction: '>' | '<';
+  text: string;
+}
+
+export interface SessionRunResponse {
+  /** `complete` when both sides quit; the exchange itself succeeded. */
+  result: 'complete' | 'failed' | 'aborted' | 'error';
+  message: string;
+  /** MIDs transmitted and moved to SENT. */
+  sent: string[];
+  /** MIDs that arrived and are now in INBOX. */
+  received: string[];
+  /** MIDs the peer asked to be offered again; they stay in OUTBOX. */
+  deferred: string[];
+  /** MIDs that arrived damaged, with the reason. */
+  failed: Array<{ mid: string; reason: string }>;
+  /** What the modem said while dialling. */
+  dialLog: string[];
+  /** The B2 exchange, line by line. */
+  log: SessionLogLine[];
+  remoteSid: string;
+  elapsedMs: number;
+  modemName: string;
+  transceiverName: string | null;
+  frequencyHz: number;
+  bandwidthHz: number;
   rig: { frequencyHz: number; mode: string } | null;
 }
 

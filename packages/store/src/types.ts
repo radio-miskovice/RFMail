@@ -233,6 +233,12 @@ export interface Store {
     options?: ListOptions,
   ): Promise<{ total: number; messages: MessageEnvelope[] }>;
   getMessage(userId: number, messageId: number): Promise<MessageRecord | null>;
+  /**
+   * The message carrying this MID anywhere in the account's mailbox, or null.
+   * The B2 exchange asks before accepting a proposal: a peer that offers a MID
+   * already stored is offering something this station has.
+   */
+  findMessageByMid(userId: number, mid: string): Promise<MessageEnvelope | null>;
   /** A message with its attachment bytes, ready for serialisation. */
   getMailMessage(userId: number, messageId: number): Promise<MailMessage | null>;
   getAttachment(

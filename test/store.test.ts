@@ -173,23 +173,23 @@ test('one callsign per account, and the Winlink credential belongs to it', async
 	assert.equal(await store.setWinlinkSecret(user.id, 'sealed-blob'), false, 'no callsign yet');
 	assert.equal(await store.getWinlinkSecret(user.id), null);
 
-	await store.setCallsign(user.id, 'ok1abc');
-	assert.equal((await store.getUser(user.id))?.callsign, 'OK1ABC', 'stored upper-cased');
+	await store.setCallsign(user.id, 'OK4RM');
+	assert.equal((await store.getUser(user.id))?.callsign, 'OK4RM', 'stored upper-cased');
 	assert.equal(await store.setWinlinkSecret(user.id, 'sealed-blob'), true);
 	assert.equal(await store.getWinlinkSecret(user.id), 'sealed-blob');
 
 	// Setting the same callsign again keeps the credential.
-	await store.setCallsign(user.id, 'OK1ABC');
+	await store.setCallsign(user.id, 'OK4RM');
 	assert.equal(await store.getWinlinkSecret(user.id), 'sealed-blob');
 
 	// A different callsign must not inherit the previous callsign's password.
-	await store.setCallsign(user.id, 'OK1ABC-10');
+	await store.setCallsign(user.id, 'OK4RM-10');
 	assert.equal(await store.getWinlinkSecret(user.id), null);
 
 	// A callsign belongs to one mailbox.
 	const other = await store.createUser({ login: 'other', pwHash: null, role: 'user' });
-	await assert.rejects(() => store.setCallsign(other.id, 'OK1ABC-10'), /UNIQUE|constraint/i);
-	assert.equal((await store.findUserByCallsign('ok1abc-10'))?.id, user.id, 'lookup is case-insensitive');
+	await assert.rejects(() => store.setCallsign(other.id, 'OK4RM-10'), /UNIQUE|constraint/i);
+	assert.equal((await store.findUserByCallsign('OK4RM-10'))?.id, user.id, 'lookup is case-insensitive');
 
 	// Clearing the callsign clears the credential with it.
 	await store.setWinlinkSecret(user.id, 'sealed-blob');
@@ -198,7 +198,7 @@ test('one callsign per account, and the Winlink credential belongs to it', async
 	assert.equal(await store.getWinlinkSecret(user.id), null);
 
 	// Clearing the credential on its own.
-	await store.setCallsign(user.id, 'OK1ABC');
+	await store.setCallsign(user.id, 'OK4RM');
 	assert.equal(await store.setWinlinkSecret(user.id, 'sealed-blob'), true);
 	assert.equal(await store.setWinlinkSecret(user.id, null), true);
 	assert.equal(await store.getWinlinkSecret(user.id), null);

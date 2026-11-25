@@ -14,11 +14,15 @@
 		type ModemKind,
 		type Transceiver
 	} from '@rfmail/shared';
+	import type { ModemStatus } from '@rfmail/shared';
 	import { api, ApiRequestError } from '../api/client';
 
 	let modems = $state<Modem[]>([]);
-	/** Whether each modem answers on its command port — configuration is not liveness. */
-	let running = $state<Record<number, boolean>>({});
+	/**
+	 * What each command port says: whether it answers, and — since VARA, XARA, Data2G and
+	 * Mercury share the same ports — which program answered.
+	 */
+	let statuses = $state<Record<number, ModemStatus>>({});
 	let radios = $state<Transceiver[]>([]);
 	let loading = $state(true);
 	let error = $state('');
@@ -48,10 +52,24 @@
 	async function checkRunning(): Promise<void> {
 		try {
 			const answer = await api.modemStatus();
-			running = Object.fromEntries(answer.statuses.map((entry) => [entry.id, entry.running]));
+			statuses = Object.fromEntries(answer.statuses.map((entry) => [entry.id, entry]));
 		} catch {
-			running = {};
+			statuses = {};
 		}
+	}
+
+	/** `running`, `not running`, or `?` while the answer is unknown. */
+	function stateWord(id: number): string {
+		const state = statuses[id];
+		if (!state) return '?';
+		return state.running ? 'running' : 'not running';
+	}
+
+	/** What the port named itself, in the operator's words. */
+	function answerLine(id: number): string {
+		const state = statuses[id];
+		if (!state || !state.reportedKind) return '';
+		return `answers as ${modemKindInfo(state.reportedKind).label}${state.reportedVersion ? ` · ${state.reportedVersion}` : ''}`;
 	}
 
 	const kindInfo = $derived(modemKindInfo(kind));
@@ -200,11 +218,16 @@
 					<td>
 						<span
 							class="led"
-							class:on={running[modem.id] === true}
-							class:off={running[modem.id] === false}
-							title={running[modem.id] ? 'the command port answers' : 'nothing is listening on the command port'}
+							class:on={statuses[modem.id]?.running === true}
+							class:off={statuses[modem.id]?.running === false}
+							title={statuses[modem.id]?.running
+								? 'the command port answers'
+								: 'nothing is listening on the command port'}
 						></span>
-						<span class="state-word">{running[modem.id] ? 'running' : running[modem.id] === false ? 'not running' : '?'}</span>
+						<span class="state-word">{stateWord(modem.id)}</span>
+						{#if answerLine(modem.id)}
+							<span class="answers" class:mismatch={statuses[modem.id]?.mismatch}>{answerLine(modem.id)}</span>
+						{/if}
 					</td>
 					<td>{modem.name}</td>
 					<td>{modemKindInfo(modem.kind).label}</td>
@@ -395,6 +418,17 @@
 	.state-word {
 		font-size: 0.78rem;
 		color: var(--muted);
+	}
+
+	/* What the port said it is; red when it is not what this record claims. */
+	.answers {
+		display: block;
+		font-size: 0.72rem;
+		color: var(--faint);
+	}
+
+	.answers.mismatch {
+		color: var(--danger);
 	}
 
 	.actions {

@@ -14,6 +14,7 @@ import type {
 	MessageDetail,
 	MessageListResponse,
 	Modem,
+	ModemListenResponse,
 	ModemStatusResponse,
 	CreateModemRequest,
 	UpdateModemRequest,
@@ -22,6 +23,8 @@ import type {
 	PasswordRequest,
 	CreateTransceiverRequest,
 	SessionOptions,
+	SessionRunRequest,
+	SessionRunResponse,
 	SessionTestRequest,
 	SessionTestResponse,
 	SetupRequest,
@@ -212,9 +215,17 @@ export const api = {
 		return request('GET', `/api/gateways?${query.toString()}`);
 	},
 
-	/** Dials the gateway through a modem and hangs up; no B2F exchange yet. */
+	/** Dials the gateway through a modem and hangs up, to prove the chain answers. */
 	testSession: (body: SessionTestRequest): Promise<SessionTestResponse> =>
 		request('POST', '/api/session/test', body),
+
+	/** The exchange itself: dial, move mail both ways, file it away, hang up. */
+	runSession: (body: SessionRunRequest): Promise<SessionRunResponse> =>
+		request('POST', '/api/session/run', body),
+
+	/** Arms or disarms a modem for inbound calls: `LISTEN ON` / `LISTEN OFF`. */
+	setModemListening: (id: number, on: boolean): Promise<ModemListenResponse> =>
+		request('POST', `/api/modems/${id}/listen`, { on }),
 
 	/** Opens the rig link; a 502 carries the reason the LED is red. */
 	connectTransceiver: (id: number): Promise<{ transceiver: Transceiver; error: string | null }> =>

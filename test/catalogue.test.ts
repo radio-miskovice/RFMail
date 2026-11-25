@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { AF_CARRIER_OFFSET_HZ, dialFromCarrier } from '@rfmail/shared';
 import {
 	bandOf,
 	distanceKm,
@@ -409,4 +410,15 @@ test('with no cache and no network the list is empty and explains itself', async
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
+});
+
+test('a channel the catalogue publishes as an AF carrier is dialled 1.5 kHz lower', () => {
+	// The published number is the audio centre inside the passband; a transceiver is tuned
+	// to the suppressed carrier, 1500 Hz below it. Dialling the published value would put
+	// the signal 1.5 kHz off centre in the modem.
+	assert.equal(AF_CARRIER_OFFSET_HZ, 1500);
+	assert.equal(dialFromCarrier(3_597_000), 3_595_500);
+	assert.equal(dialFromCarrier(14_109_600), 14_108_100);
+	// Nothing below the offset is turned into a negative frequency.
+	assert.equal(dialFromCarrier(1_000), 0);
 });

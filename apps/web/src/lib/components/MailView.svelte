@@ -9,6 +9,7 @@
 	import ModemView from './ModemView.svelte';
 	import Composer from './Composer.svelte';
 	import MessageList from './MessageList.svelte';
+	import ModemControl from './ModemControl.svelte';
 	import Reader from './Reader.svelte';
 	import UsersView from './UsersView.svelte';
 
@@ -41,6 +42,12 @@
 	let replyTo = $state<MessageDetail | null>(null);
 
 	const activeFolder = $derived(folders.find((folder) => folder.id === activeFolderId) ?? null);
+	/**
+	 * OUTBOX and SENT are mail *this* station sent, so every row has the same sender;
+	 * listing the recipient is what makes the list readable. DRAFTS are not a folder kind
+	 * here — an unsent message sits in OUTBOX until a session takes it.
+	 */
+	const listShowsRecipient = $derived(activeFolder?.kind === 'outbox' || activeFolder?.kind === 'sent');
 	const unreadTotal = $derived(folders.reduce((sum, folder) => sum + (folder.kind === 'inbox' ? folder.unread : 0), 0));
 
 	onMount(() => {
@@ -196,6 +203,7 @@
 		{#if status.imap}
 			<span class="badge hide-narrow">IMAP {status.imap.address}</span>
 		{/if}
+		<ModemControl />
 		<RadioControl onopenconfig={() => (view = 'radio')} />
 	</header>
 
@@ -204,7 +212,7 @@
 	{:else if view === 'modems'}
 		<ModemView />
 	{:else if view === 'session'}
-		<SessionView />
+		<SessionView onSent={() => void loadFolders()} />
 	{:else if view === 'users'}
 		<UsersView {me} onmechanged={onmechange} />
 	{:else if view === 'account'}
@@ -281,7 +289,13 @@
 				<p class="error banner" role="alert">{error}</p>
 			{/if}
 
-			<MessageList {messages} selectedId={selected?.id ?? null} {loading} onselect={openMessage} />
+			<MessageList
+				{messages}
+				selectedId={selected?.id ?? null}
+				{loading}
+				showRecipient={listShowsRecipient}
+				onselect={openMessage}
+			/>
 		</section>
 
 		<div class="pane-reader" class:open={showReader}>

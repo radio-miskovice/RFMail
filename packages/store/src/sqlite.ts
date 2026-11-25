@@ -683,6 +683,18 @@ export class SqliteStore implements Store {
     };
   }
 
+  async findMessageByMid(userId: number, mid: string): Promise<MessageEnvelope | null> {
+    const row = this.get<MessageRow>(
+      'SELECT * FROM messages WHERE user_id = ? AND mid = ?',
+      userId,
+      mid.toUpperCase(),
+    );
+    if (!row) return null;
+    const { to, cc } = this.recipients(row.id);
+    const count = this.get<{ n: number }>('SELECT COUNT(*) AS n FROM attachments WHERE message_id = ?', row.id);
+    return this.envelopeFrom(row, count?.n ?? 0, to, cc);
+  }
+
   async listMessages(
     userId: number,
     folderId: number,

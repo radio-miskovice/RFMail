@@ -166,8 +166,8 @@ export function supportsB2(sid: Sid): boolean {
   return /\bB2\b/.test(sid.flags) || sid.flags.includes('B2');
 }
 
-/** The SID this station sends; `G` advertises gzip proposals. */
-export function localSid(application = 'rfmail', version = '0.1', flags = 'B2FHM$G'): string {
+/** The SID this station sends; `G` advertises gzip proposals, and `$` is always last. */
+export function localSid(application = 'rfmail', version = '0.1', flags = 'B2FHMG$'): string {
   const safeVersion = version.replace(/-/g, '.');
   return `[${application}-${safeVersion}-${flags}]`;
 }

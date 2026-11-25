@@ -1,18 +1,31 @@
 <script lang="ts">
 	import type { MessageSummary } from '@rfmail/shared';
-	import { formatBytes, formatDate, senderName } from '../format';
+	import { addressOnly, formatBytes, formatDate, senderName } from '../format';
 
 	let {
 		messages,
 		selectedId,
 		loading,
+		showRecipient = false,
 		onselect
 	}: {
 		messages: MessageSummary[];
 		selectedId: number | null;
 		loading: boolean;
+		/**
+		 * Where the mail is *going* rather than where it came from. In OUTBOX and SENT the
+		 * sender is always this station, so the row would say the same thing on every line;
+		 * the recipient is what tells one message from another.
+		 */
+		showRecipient?: boolean;
 		onselect: (id: number) => void;
 	} = $props();
+
+	function who(message: MessageSummary): string {
+		if (!showRecipient) return senderName(message.from);
+		const recipients = message.to.map(addressOnly);
+		return recipients.length > 0 ? recipients.join(', ') : '(no recipient)';
+	}
 </script>
 
 <div class="list" aria-busy={loading}>
@@ -26,7 +39,7 @@
 		>
 			<span class="line1">
 				<span class="dot" aria-hidden="true"></span>
-				<span class="from">{senderName(message.from)}</span>
+				<span class="who" title={showRecipient ? 'to' : 'from'}>{who(message)}</span>
 				<span class="date">{formatDate(message.date)}</span>
 			</span>
 			<span class="subject">{message.subject || '(no subject)'}</span>
@@ -98,14 +111,14 @@
 		background: var(--accent);
 	}
 
-	.from {
+	.who {
 		font-size: 0.9rem;
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
 	}
 
-	.row.unread .from {
+	.row.unread .who {
 		font-weight: 650;
 	}
 

@@ -23,7 +23,7 @@ async function harness(options: { password?: string } = {}): Promise<{
 		pwHash: options.password ? hashPassword(options.password) : null,
 		role: 'admin',
 	});
-	await store.setCallsign(user.id, 'OK1ABC');
+	await store.setCallsign(user.id, 'OK4RM');
 	const events = new MailEvents();
 	const server = new ImapServer({
 		store,
@@ -296,7 +296,7 @@ test('body sections return the parts a client asks for, not the whole message', 
 			userId,
 			inbox.id,
 			composeMessage({
-				from: 'OK1ABC',
+				from: 'OK4RM',
 				to: 'OK2XYZ',
 				subject: 'Parts',
 				body: 'the text part\n',

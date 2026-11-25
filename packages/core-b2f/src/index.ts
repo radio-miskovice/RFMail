@@ -6,4 +6,5 @@ export * from './mime.ts';
 export * from './b2msg.ts';
 export * from './proposal.ts';
 export * from './frame.ts';
+export * from './session.ts';
 export * from './lzhuf.ts';

@@ -439,13 +439,71 @@ over radio, or a P2P peer. Outbound messages from that user's outbox for the
 remote's forwarder list are proposed; inbound messages are stored for that
 user. This is the pat-equivalent behaviour.
 
+**R4.4.1.1 Three kinds of far end.** The client session is one exchange with one
+parameter, the peer's kind, because that parameter is the only thing the
+protocol asks before the first message:
+
+* `cms` — a Winlink RMS gateway or the CMS. `;FW:` names this callsign and every
+  auxiliary address, because a CMS routes for the whole system; every outbox
+  message may be offered. A `;PQ` challenge is answered, and having no Winlink
+  password ends the session before the greeting goes out: the password is what
+  decides who may collect the mail.
+* `p2p` — another operator's station. `;FW:` names this callsign alone, and only
+  messages addressed to that station are proposed, because a peer cannot route
+  for anybody else. A `;PQ` challenge from a peer is answered if a password
+  happens to be set and otherwise recorded and passed over: no authority holds
+  the peer's password, so there is nothing for the challenge to establish and the
+  session runs unauthenticated. An HF VARA modem is dialled with `P2P SESSION`
+  instead of `WINLINK SESSION`.
+* `postoffice` — a B2F server that terminates sessions and holds mail (our own
+  post office, or an FBB-style BBS). It may hold mail for several of our
+  addresses, so `;FW:` names them all, and it may hold mail for its own users,
+  so anything its `;FW:` list accepts may be offered. It holds accounts, so it can
+  challenge and check, exactly as a CMS does; an unanswered challenge is refused,
+  as at a CMS, because a server that asks must not be served by a station that
+  cannot say who it is.
+
+**R4.4.1.2 The channel is not ours to take.** `BUSY ON` from the modem means it hears
+a real signal in the channel, and it is a hint, not a verdict: the same modem sends it
+a fraction of a second before `CONNECTED` on a call that comes up. The shape decides.
+One unbroken stretch of about four seconds, with no more than a handful of on/off
+transitions around it, is a data station, and the call is abandoned and reported rather
+than transmitted into. Short irregular stretches — syllables of a voice — are dialled
+through. The thresholds are a heuristic and say so. Note that Data2G 0.5.3 reports
+nothing while merely listening (`LISTEN ON` for eight seconds produced no `BUSY` line),
+so the first connect frame may still go out before the modem knows the channel is
+occupied; what is preventable is the rest of the call, not the first frame.
+
+**R4.4.1.2.1 The modem may own the transceiver.** Measured with Data2G 0.5.3: it connects
+to rigctld by itself (whatever its "use rig control" box says), keys through it — `\set_ptt 3`
+for the rear input first, falling back to `1` — and also changes the receiver's filter,
+leaving a 1000 Hz passband where the station had 2000. A session therefore must not assume
+that the mode and passband it set are still in force when the exchange runs, and the
+operator must be told when the modem has narrowed the filter, because a 2300 Hz waveform
+through a 1 kHz filter is inaudible to the decoder.
+
+**R4.4.1.3 Hang-up is not DISCONNECT.** After `DISCONNECT` the modem goes on keying —
+measured at eight seconds — and both stations send an identification frame before the
+air goes quiet. A session's link is closed when the modem has said `DISCONNECTED` and
+then been quiet for a few seconds; the hard ceiling closes it regardless, because a
+station must never be left holding a transmitter.
+
+The exchange itself is identical in all three: same SID, same turns, same
+compression and offsets. Only `;FW:`, the password rule, the modem's session
+type and the choice of what to propose differ. Note that `;PQ`/`;PR` is all the
+authentication B2F has — an MD5 of the challenge, password and salt — and it
+only means anything where the challenger holds the password: a CMS, or a post
+office. Two peer stations can use the same arithmetic only with a pre-shared
+key, and that is not implemented.
+
 **R4.4.2 Gateway relay.** An inbound RF B2F session from a user's station is
 piped to a CMS connection (or to a configured RMS Relay) so that the CMS sees
 the user's callsign and secure login end to end. The relay does not interpret,
 rewrite or terminate the B2F stream; it copies both directions, enforces an
 access policy (default: deny unless the callsign is in the gateway's allow list
 or the policy is explicitly "any"), tears both ends down together, and logs both
-directions with the user's `;PR` responses redacted. The station has its own
+directions verbatim, `;PR` included — it is a hash of the nonce and the password, not
+the password, and it is what makes a refused login diagnosable. The station has its own
 gateway callsign with an SSID and its own Winlink password — the registration
 and credentials an RMS gateway operator obtains from the Winlink Development
 Team, used for the station's own forwarding sessions and not for the relayed

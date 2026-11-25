@@ -317,7 +317,8 @@ which is visible in wl2k-go's `Peek`-based special-casing; the state machine
 avoids that by classifying every line before deciding.
 
 Every transition is logged with direction, and the log is the artifact the
-tests assert against (redacting `;PR`, R9.1).
+tests assert against. `;PR` is logged as sent: it is a hash of the nonce and the
+password, so it cannot be replayed against a different challenge (R9.1).
 
 ### 6.4 Transports
 
@@ -351,7 +352,7 @@ POST   /api/session                    {profileId|rigId,modemId,target,freq,bw,r
 GET    /api/session                    current session
 POST   /api/session/abort             {hard?: boolean}
 GET    /api/sessions                   history (paged, filterable)
-GET    /api/sessions/:id/log           protocol log (redacted)
+GET    /api/sessions/:id/log           protocol log
 GET    /api/rigs  POST/PATCH/DELETE /api/rigs/:id   POST /api/rigs/:id/test
 GET    /api/modems POST/PATCH/DELETE /api/modems/:id  start/stop/state/log
 GET    /api/config  PUT /api/config   validate + reload
