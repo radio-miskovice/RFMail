@@ -1,51 +1,128 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	// Radio interfaces.
+	//
+	// Each tile is one rigctld: the host it answers on, whether the rig behind it is talking,
+	// and the transceiver's own name — host, LED, state, and that is all. Everything about it
+	// (port, serial line, dial, filter, transmit connector, power, on/off) opens under the
+	// click. A station may run several: one per rig, or one per serial line.
+	//
+	// The interface the operator used last is remembered in the database (`last_used_at`), so
+	// the header chip keeps pointing at the one that matters after a restart.
+	import { onDestroy, onMount } from 'svelte';
 	import type { PttInput, Transceiver } from '@rfmail/shared';
 	import { api, ApiRequestError } from '../api/client';
 	import { PTT_INPUT_LABELS } from '../labels';
 
 	let radios = $state<Transceiver[]>([]);
+	/** LAN names of the configured addresses, when a name service answers (decision 42). */
+	let names = $state<Record<string, string | null>>({});
 	let loading = $state(true);
 	let error = $state('');
 	let notice = $state('');
 	let busy = $state(false);
 
-	let name = $state('');
-	let host = $state('');
-	let port = $state('4532');
-	let pttInput = $state<PttInput>('rear');
-	let editingId = $state<number | null>(null);
+	let openId = $state<number | null>(null);
+	let powerPct = $state<number | null>(null);
 
-	onMount(() => void load());
+	let formOpen = $state(false);
+	let editingId = $state<number | null>(null);
+	let host = $state('');
+	let port = $state('');
+	let serialPort = $state('');
+	let serialSpeed = $state('');
+	let enabled = $state(true);
+
+	let timer: ReturnType<typeof setInterval> | undefined;
+
+	onMount(() => {
+		void load();
+		// The names arrive on their own: the tile draws the address first, never waiting for
+		// a name service that may not answer at all.
+		void loadNames();
+		timer = setInterval(() => void poll(), 3000);
+	});
+
+	async function loadNames(): Promise<void> {
+		try {
+			const answer = await api.hostNames();
+			names = answer.names;
+		} catch {
+			/* a name is decoration; the address is the truth */
+		}
+	}
+
+	onDestroy(() => {
+		if (timer) clearInterval(timer);
+	});
 
 	async function load(): Promise<void> {
-		loading = true;
 		try {
 			radios = await api.transceivers();
 			error = '';
 		} catch (err) {
-			error = err instanceof ApiRequestError ? err.message : 'Could not load the transceivers.';
+			error = err instanceof ApiRequestError ? err.message : 'Could not read the radio interfaces.';
 		} finally {
 			loading = false;
 		}
 	}
 
-	function reset(): void {
-		editingId = null;
-		name = '';
-		host = '';
-		port = '4532';
-		pttInput = 'rear';
+	async function poll(): Promise<void> {
+		if (busy || formOpen) return;
+		try {
+			radios = await api.transceivers();
+		} catch {
+			// The next tick tries again.
+		}
 	}
 
-	function edit(radio: Transceiver): void {
-		editingId = radio.id;
-		name = radio.name;
-		host = radio.host;
-		port = String(radio.port);
-		pttInput = radio.pttInput;
+	/** The LED of one interface: grey off, amber dialling, green the rig answers, red failed. */
+	function ledOf(radio: Transceiver): string {
+		if (!radio.enabled) return 'grey';
+		return radio.link.state === 'connected'
+			? radio.link.rig?.active
+				? 'green'
+				: 'amber'
+			: radio.link.state === 'error'
+				? 'red'
+				: radio.link.state === 'connecting'
+					? 'amber'
+					: 'grey';
+	}
+
+	/** `active`, `dialling`, `unavailable`, `off` — the state in one word. */
+	function stateWord(radio: Transceiver): string {
+		if (!radio.enabled) return 'off';
+		if (radio.link.state === 'connected') return radio.link.rig?.active ? 'active' : 'dialling';
+		return radio.link.state === 'connecting' ? 'dialling' : 'unavailable';
+	}
+
+	function beginCreate(): void {
+		editingId = null;
+		host = '';
+		port = '';
+		serialPort = '';
+		serialSpeed = '';
+		enabled = true;
 		error = '';
 		notice = '';
+		formOpen = true;
+	}
+
+	function beginEdit(radio: Transceiver): void {
+		editingId = radio.id;
+		host = radio.host;
+		port = String(radio.port);
+		serialPort = radio.serialPort ?? '';
+		serialSpeed = radio.serialSpeed === null ? '' : String(radio.serialSpeed);
+		enabled = radio.enabled;
+		error = '';
+		notice = '';
+		formOpen = true;
+	}
+
+	function closeForm(): void {
+		formOpen = false;
+		editingId = null;
 	}
 
 	async function save(event: SubmitEvent): Promise<void> {
@@ -53,77 +130,112 @@
 		busy = true;
 		error = '';
 		notice = '';
+		const body = {
+			host: host.trim() || 'localhost',
+			port: port.trim() ? Number(port) : 4532,
+			serialPort: serialPort.trim() || null,
+			serialSpeed: serialSpeed.trim() ? Number(serialSpeed) : null,
+			enabled,
+		};
 		try {
-			const body = {
-				name: name.trim(),
-				host: host.trim(),
-				port: Number(port),
-				pttInput
-			};
 			if (editingId === null) {
-				await api.createTransceiver(body);
-				notice = `${body.name} added.`;
+				// An interface is named for where it answers; there is no name field to fill.
+				await api.createTransceiver({ name: `${body.host}:${body.port}`, ...body });
+				notice = 'Interface added.';
 			} else {
 				await api.updateTransceiver(editingId, body);
-				notice = `${body.name} saved.`;
+				notice = 'Interface saved.';
 			}
-			reset();
+			closeForm();
 			await load();
+			void loadNames();
 		} catch (err) {
 			error =
 				err instanceof ApiRequestError
 					? (Object.values(err.fields ?? {})[0] ?? err.message)
-					: 'Could not save the transceiver.';
+					: 'Could not save the interface.';
 		} finally {
 			busy = false;
 		}
 	}
 
-	async function toggle(radio: Transceiver): Promise<void> {
+	async function open(radio: Transceiver): Promise<void> {
+		if (openId === radio.id) {
+			openId = null;
+			return;
+		}
+		openId = radio.id;
+		powerPct =
+			radio.link.rig?.rfPower === null || radio.link.rig?.rfPower === undefined
+				? null
+				: Math.round(radio.link.rig.rfPower * 100);
+		// Opening an interface is using it: it becomes the current one.
+		try {
+			await api.selectTransceiver(radio.id);
+		} catch {
+			/* a failed select is not worth an alert; the next poll shows the truth */
+		}
+	}
+
+	async function applyPower(radio: Transceiver, percent: number): Promise<void> {
 		busy = true;
 		error = '';
 		notice = '';
 		try {
-			if (radio.link.state === 'connected') {
-				const result = await api.disconnectTransceiver(radio.id);
-				radios = radios.map((entry) => (entry.id === radio.id ? result.transceiver : entry));
-				notice = `${radio.name} disconnected.`;
-			} else {
-				const result = await api.connectTransceiver(radio.id);
-				radios = radios.map((entry) => (entry.id === radio.id ? result.transceiver : entry));
-				if (result.error) error = `${radio.name}: ${result.error}`;
-				else notice = `${radio.name} connected.`;
-			}
+			const updated = await api.setTransceiverPower(radio.id, percent / 100);
+			radios = radios.map((entry) => (entry.id === updated.id ? updated : entry));
+			powerPct =
+				updated.link.rig?.rfPower === null || updated.link.rig?.rfPower === undefined
+					? null
+					: Math.round(updated.link.rig.rfPower * 100);
+			notice = `Power set to ${powerPct ?? 0} %.`;
 		} catch (err) {
-			error = err instanceof ApiRequestError ? err.message : 'The backend did not answer.';
-			await load();
+			error =
+				err instanceof ApiRequestError
+					? (Object.values(err.fields ?? {})[0] ?? err.message)
+					: 'The radio did not take the power setting.';
 		} finally {
 			busy = false;
 		}
 	}
 
-	/** A red state is cleared by a successful connect or by dropping back to grey. */
-	async function clearError(radio: Transceiver): Promise<void> {
+	async function applyPttInput(radio: Transceiver, value: PttInput): Promise<void> {
 		busy = true;
+		error = '';
+		notice = '';
 		try {
-			const result = await api.disconnectTransceiver(radio.id);
-			radios = radios.map((entry) => (entry.id === radio.id ? result.transceiver : entry));
-			error = '';
-			notice = `${radio.name}: error cleared.`;
+			const updated = await api.updateTransceiver(radio.id, { pttInput: value });
+			radios = radios.map((entry) => (entry.id === updated.id ? updated : entry));
+			notice = `Transmitting through ${PTT_INPUT_LABELS[value].toLowerCase()}.`;
 		} catch (err) {
-			error = err instanceof ApiRequestError ? err.message : 'Could not clear it.';
+			error = err instanceof ApiRequestError ? err.message : 'Could not save that choice.';
+		} finally {
+			busy = false;
+		}
+	}
+
+	async function setEnabled(radio: Transceiver, on: boolean): Promise<void> {
+		busy = true;
+		error = '';
+		notice = '';
+		try {
+			const updated = await api.updateTransceiver(radio.id, { enabled: on });
+			radios = radios.map((entry) => (entry.id === updated.id ? updated : entry));
+			notice = on ? `${radio.host} switched on.` : `${radio.host} switched off.`;
+		} catch (err) {
+			error = err instanceof ApiRequestError ? err.message : 'Could not switch it.';
 		} finally {
 			busy = false;
 		}
 	}
 
 	async function remove(radio: Transceiver): Promise<void> {
-		if (!window.confirm(`Remove ${radio.name}? The rig itself is untouched.`)) return;
+		if (!window.confirm(`Remove the interface at ${radio.host}? The daemon is untouched.`)) return;
 		busy = true;
 		try {
 			await api.deleteTransceiver(radio.id);
-			notice = `${radio.name} removed.`;
-			if (editingId === radio.id) reset();
+			if (openId === radio.id) openId = null;
+			notice = 'Interface removed.';
 			await load();
 		} catch (err) {
 			error = err instanceof ApiRequestError ? err.message : 'Could not remove it.';
@@ -131,110 +243,221 @@
 			busy = false;
 		}
 	}
+
+	function mhz(hz: number | null): string {
+		return hz === null ? '—' : (hz / 1_000_000).toFixed(4);
+	}
 </script>
 
 <div class="panel">
 	<header>
-		<h1>Transceivers</h1>
+		<h1>Radio</h1>
 		<p class="muted small">
-			Each entry is one rigctld the station can talk to. The station never opens a serial port itself; it
-			connects to the daemon you run (or that it launches), reads the frequency and mode, and keys the
-			transmitter through it.
+			Each interface is one rigctld. The station dials every enabled one by itself and stays dialled; the
+			one you open last is the one the rest of the station follows.
 		</p>
 	</header>
 
 	{#if notice}<p class="notice" role="status">{notice}</p>{/if}
 	{#if error}<p class="error" role="alert">{error}</p>{/if}
 
-	<div class="table" aria-busy={loading}>
-		<div class="head row">
-			<span>Name</span>
-			<span>rigctld</span>
-			<span>Transmit audio</span>
-			<span>State</span>
-			<span></span>
-		</div>
-		{#each radios as radio (radio.id)}
-			<div class="row">
-				<span class="name">{radio.name}</span>
-				<span class="mono">{radio.host}:{radio.port}</span>
-				<span class="small">{PTT_INPUT_LABELS[radio.pttInput]}</span>
-				<span class="state">
-					<span
-						class="led {radio.link.state === 'connected'
-							? 'green'
-							: radio.link.state === 'error'
-								? 'red'
-								: radio.link.state === 'connecting'
-									? 'amber'
-									: 'grey'}"></span>
-					{#if radio.link.state === 'connected' && radio.link.frequencyHz !== null}
-						{(radio.link.frequencyHz / 1_000_000).toFixed(4)} MHz {radio.link.mode ?? ''}
-					{:else if radio.link.state === 'error'}
-						<span class="red-text" title={radio.link.error ?? ''}>{radio.link.error ?? 'error'}</span>
-					{:else}
-						{radio.link.state}
-					{/if}
-				</span>
-				<span class="actions">
-					<button class="btn ghost small-btn" type="button" disabled={busy} onclick={() => toggle(radio)}>
-						{radio.link.state === 'connected' ? 'Disconnect' : radio.link.state === 'error' ? 'Reconnect' : 'Connect'}
-					</button>
-					{#if radio.link.state === 'error'}
-						<button class="btn ghost small-btn" type="button" disabled={busy} onclick={() => clearError(radio)}>
-							Clear
-						</button>
-					{/if}
-					<button class="btn ghost small-btn" type="button" onclick={() => edit(radio)}>Edit</button>
-					<button class="btn ghost small-btn danger" type="button" disabled={busy} onclick={() => remove(radio)}>
-						Delete
-					</button>
-				</span>
-			</div>
-		{/each}
-		{#if radios.length === 0 && !loading}
-			<p class="muted">No transceiver configured yet.</p>
-		{/if}
-	</div>
+	<section class="card">
+		<header class="card-head">
+			<h2>Interfaces</h2>
+			<button class="btn ghost small" type="button" onclick={beginCreate}>+ Add</button>
+		</header>
 
-	<section>
-		<h2>{editingId === null ? 'Add a transceiver' : 'Edit the transceiver'}</h2>
-		<form onsubmit={save}>
-			<div class="fields">
-				<label class="field">
-					<span>Name</span>
-					<input type="text" name="name" bind:value={name} placeholder="TS-590SG" required />
-				</label>
-				<label class="field">
-					<span>rigctld address</span>
-					<input type="text" name="host" bind:value={host} placeholder="192.168.133.222" required />
-				</label>
-				<label class="field">
-					<span>Port</span>
-					<input type="number" name="port" bind:value={port} min="1" max="65535" />
-				</label>
-				<label class="field">
-					<span>Transmit audio input</span>
-					<select name="pttInput" bind:value={pttInput}>
-						<option value="rear">{PTT_INPUT_LABELS.rear}</option>
-						<option value="front">{PTT_INPUT_LABELS.front}</option>
-						<option value="auto">{PTT_INPUT_LABELS.auto}</option>
-					</select>
-				</label>
-			</div>
-			<p class="hint muted small">
-				The rear input is the connector a modem feeds; the front microphone connector transmits the room
-				instead, and the far end hears nothing usable.
-			</p>
-			<div class="row-buttons">
-				<button class="btn primary" type="submit" disabled={busy || !name.trim() || !host.trim()}>
-					{busy ? 'Saving…' : editingId === null ? 'Add transceiver' : 'Save changes'}
+		{#if formOpen}
+			<form onsubmit={save}>
+				<div class="fields">
+					<label class="field">
+						<span>Address or host name</span>
+						<input type="text" name="host" bind:value={host} placeholder="localhost" autocomplete="off" />
+					</label>
+					<label class="field">
+						<span>Port</span>
+						<input
+							type="text"
+							name="port"
+							bind:value={port}
+							placeholder="4532"
+							inputmode="numeric"
+							autocomplete="off"
+						/>
+					</label>
+					<label class="field">
+						<span>Serial port</span>
+						<input
+							type="text"
+							name="serialPort"
+							bind:value={serialPort}
+							placeholder="as rigctld runs it"
+							autocomplete="off"
+						/>
+					</label>
+					<label class="field">
+						<span>Speed</span>
+						<input
+							type="text"
+							name="serialSpeed"
+							bind:value={serialSpeed}
+							placeholder="baud"
+							inputmode="numeric"
+							autocomplete="off"
+						/>
+					</label>
+					<label class="field check">
+						<input type="checkbox" bind:checked={enabled} />
+						<span>Switched on</span>
+					</label>
+				</div>
+				<div class="row-buttons">
+					<button class="btn primary" type="submit" disabled={busy}>
+						{busy ? 'Saving…' : editingId === null ? 'Add interface' : 'Save'}
+					</button>
+					<button class="btn" type="button" onclick={closeForm}>Cancel</button>
+					<span class="muted small">
+						Empty address means localhost, empty port means 4532. Serial port and speed are noted for
+						the tile: rigctld never reports the ones it was started with.
+					</span>
+				</div>
+			</form>
+		{/if}
+
+		{#if loading}
+			<p class="muted small">Reading…</p>
+		{:else if radios.length === 0 && !formOpen}
+			<p class="muted small">No interface yet: “+ Add” sets where rigctld answers.</p>
+		{/if}
+
+		<div class="tiles">
+			{#each radios as radio (radio.id)}
+				<button
+					class="tile"
+					class:bad={ledOf(radio) === 'red'}
+					type="button"
+					aria-expanded={openId === radio.id}
+					onclick={() => void open(radio)}
+				>
+					<span class="line">
+						<span
+							class="led {ledOf(radio)}"
+							role="img"
+							aria-label={stateWord(radio)}
+							title={stateWord(radio)}
+						></span>
+						<span class="label">
+							<strong>{names[radio.host] ?? radio.host}</strong><span class="port">:{radio.port}</span>
+						</span>
+					</span>
+					{#if names[radio.host]}
+						<span class="line2 addr mono">{radio.host}</span>
+					{/if}
+					<span class="line2">
+						{radio.link.rig?.model ?? '—'}
+						{#if radio.serialPort}
+							<span class="muted">
+								· {radio.serialPort}{radio.serialSpeed ? ` @ ${radio.serialSpeed}` : ''}
+							</span>
+						{/if}
+					</span>
 				</button>
-				{#if editingId !== null}
-					<button class="btn" type="button" onclick={reset}>Cancel</button>
+
+				{#if openId === radio.id}
+					<div class="details">
+						{#if radio.link.state !== 'connected'}
+							<p class="muted small">
+								{radio.link.error ?? (radio.enabled ? 'the link is closed' : 'this interface is switched off')}
+							</p>
+						{:else if !radio.link.rig}
+							<p class="muted small">rigctld is up; it has not described the radio yet.</p>
+						{:else}
+							<div class="readout">
+								<div class="value">
+									<span class="big">{mhz(radio.link.rig.frequencyHz)}</span>
+									<span class="unit">MHz</span>
+									{#if radio.link.rig.mode}<span class="mode">{radio.link.rig.mode}</span>{/if}
+								</div>
+								<div class="value">
+									<span class="label">Filter</span>
+									<span class="value-text">
+										{radio.link.rig.filterHz === null ? 'not reported' : `${radio.link.rig.filterHz} Hz`}
+									</span>
+									{#if radio.link.rig.shiftHz !== null}
+										<span
+											class="shift"
+											class:off={radio.link.rig.shiftHz !== 1500}
+											title="The rig's IF shift in the data mode; 1500 Hz is centred"
+										>
+											{#if radio.link.rig.shiftHz === 1500}
+												· centred
+											{:else}
+												· shift {radio.link.rig.shiftHz} Hz —
+												{radio.link.rig.usableHz ?? 0} Hz usable
+											{/if}
+										</span>
+									{/if}
+								</div>
+							</div>
+
+							<div class="controls">
+								<label class="control">
+									<span class="label">Transmit audio</span>
+									<select
+										value={radio.pttInput}
+										disabled={busy}
+										onchange={(event) =>
+											void applyPttInput(radio, event.currentTarget.value as PttInput)}
+									>
+										<option value="rear">{PTT_INPUT_LABELS.rear}</option>
+										<option value="front">{PTT_INPUT_LABELS.front}</option>
+										<option value="auto">{PTT_INPUT_LABELS.auto}</option>
+									</select>
+								</label>
+
+								<label class="control power">
+									<span class="label">RF power</span>
+									<input
+										type="range"
+										min="5"
+										max="100"
+										step="5"
+										value={powerPct ?? 100}
+										disabled={busy || powerPct === null}
+										onchange={(event) => void applyPower(radio, Number(event.currentTarget.value))}
+									/>
+									<span class="value-text">{powerPct === null ? 'not reported' : `${powerPct} %`}</span>
+								</label>
+							</div>
+						{/if}
+
+						<div class="controls foot">
+							<label class="control check">
+								<input
+									type="checkbox"
+									checked={radio.enabled}
+									disabled={busy}
+									onchange={(event) => void setEnabled(radio, event.currentTarget.checked)}
+								/>
+								<span>Switched on</span>
+							</label>
+							<span class="muted small mono">{radio.host}:{radio.port}</span>
+							<button class="btn ghost small" type="button" onclick={() => beginEdit(radio)}>
+								Edit
+							</button>
+							<button
+								class="btn ghost small danger"
+								type="button"
+								disabled={busy}
+								onclick={() => void remove(radio)}
+							>
+								Delete
+							</button>
+						</div>
+					</div>
 				{/if}
-			</div>
-		</form>
+			{/each}
+		</div>
 	</section>
 </div>
 
@@ -243,6 +466,7 @@
 		padding: 1.5rem;
 		overflow-y: auto;
 		min-height: 0;
+		max-width: 56rem;
 	}
 
 	h1 {
@@ -250,68 +474,84 @@
 		margin: 0 0 0.3rem;
 	}
 
-	header {
-		margin-bottom: 1rem;
+	h2 {
+		font-size: 0.95rem;
+		margin: 0;
 	}
 
 	.small {
 		font-size: 0.82rem;
 	}
 
-	.table {
+	.card {
+		border: 1px solid var(--line);
+		border-radius: 12px;
+		background: var(--bg-panel);
+		padding: 0.9rem 1rem;
+		margin-top: 1rem;
+	}
+
+	.card-head {
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+		margin-bottom: 0.7rem;
+	}
+
+	.card-head .btn {
+		margin-left: auto;
+	}
+
+	.tiles {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(20rem, 1fr));
+		gap: 0.5rem;
+	}
+
+	/* Two lines: host and LED, then the transceiver it serves. Nothing else. */
+	.tile {
 		display: flex;
 		flex-direction: column;
+		gap: 0.15rem;
+		padding: 0.45rem 0.7rem;
 		border: 1px solid var(--line);
 		border-radius: 10px;
-		overflow: hidden;
+		background: var(--bg);
+		color: var(--text);
+		font: inherit;
+		text-align: left;
+		cursor: pointer;
 	}
 
-	.row {
-		display: grid;
-		grid-template-columns: minmax(7rem, 1fr) minmax(9rem, 1.1fr) minmax(10rem, 1.4fr) minmax(11rem, 1.4fr) auto;
-		gap: 0.6rem;
-		align-items: center;
-		padding: 0.55rem 0.8rem;
-		border-top: 1px solid var(--line);
-		font-size: 0.88rem;
+	.tile:hover {
+		border-color: color-mix(in oklab, var(--accent) 40%, var(--line));
 	}
 
-	.row:first-child {
-		border-top: none;
+	.tile.bad {
+		border-color: color-mix(in oklab, var(--danger) 40%, var(--line));
 	}
 
-	.head {
-		background: var(--bg-raised);
-		font-size: 0.72rem;
-		text-transform: uppercase;
-		letter-spacing: 0.05em;
-		color: var(--muted);
-	}
-
-	.name {
-		font-weight: 600;
-	}
-
-	.mono {
-		font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
-		font-size: 0.82rem;
-	}
-
-	.state {
+	.line {
 		display: flex;
 		align-items: center;
-		gap: 0.4rem;
-		font-size: 0.82rem;
-		color: var(--muted);
+		gap: 0.45rem;
+	}
+
+	.line2 {
+		font-size: 0.8rem;
 		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 
 	.led {
-		width: 0.55rem;
-		height: 0.55rem;
+		width: 0.6rem;
+		height: 0.6rem;
 		border-radius: 50%;
 		background: var(--faint);
 		flex: 0 0 auto;
+		/* The LED is the state; the word lives in its accessibility label and tooltip. */
+		cursor: help;
 	}
 
 	.led.green {
@@ -319,104 +559,199 @@
 		box-shadow: 0 0 6px color-mix(in oklab, var(--ok) 70%, transparent);
 	}
 
-	.led.red {
-		background: var(--danger);
-	}
-
 	.led.amber {
 		background: #d9a441;
 	}
 
-	.red-text {
-		color: var(--danger);
+	.led.red {
+		background: var(--danger);
+	}
+
+	/* `Quantum-Q1:4532` — the machine's name in bold, the port in the same line, lighter. */
+	.label {
+		font-size: 0.88rem;
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
+		min-width: 0;
 	}
 
-	.actions {
+	.label strong {
+		font-weight: 600;
+	}
+
+	.label .port {
+		color: var(--muted);
+		font-weight: 400;
+		font-variant-numeric: tabular-nums;
+	}
+
+	.addr {
+		font-size: 0.76rem;
+		color: var(--muted);
+	}
+
+	/* The LED is the state; the word lives in its accessibility label and tooltip. */
+	.led {
+		cursor: help;
+	}
+
+	.details {
+		grid-column: 1 / -1;
+		padding: 0.5rem 0.2rem 0.2rem 1.1rem;
+		border-left: 2px solid var(--line);
+	}
+
+	.readout {
 		display: flex;
-		gap: 0.25rem;
-		justify-content: flex-end;
 		flex-wrap: wrap;
+		align-items: baseline;
+		gap: 1.6rem;
 	}
 
-	.small-btn {
+	.value {
+		display: flex;
+		align-items: baseline;
+		gap: 0.35rem;
+	}
+
+	.value .label {
+		color: var(--faint);
+		font-size: 0.76rem;
+	}
+
+	.big {
+		font-size: 1.35rem;
+		font-weight: 600;
+		font-variant-numeric: tabular-nums;
+	}
+
+	.unit {
 		font-size: 0.78rem;
-		padding: 0.2rem 0.5rem;
+		color: var(--muted);
 	}
 
-	.danger {
+	.mode {
+		font-family: ui-monospace, 'SFMono-Regular', Consolas, monospace;
+		font-size: 0.82rem;
+		margin-left: 0.2rem;
+	}
+
+	.value-text {
+		font-size: 0.86rem;
+	}
+
+	/* The IF shift, said beside the filter: centred, or how much the filter has lost. */
+	.shift {
+		font-size: 0.72rem;
+		color: var(--muted);
+		font-variant-numeric: tabular-nums;
+	}
+
+	.shift.off {
 		color: var(--danger);
 	}
 
-	section {
+	.mono {
+		font-family: ui-monospace, 'SFMono-Regular', Consolas, monospace;
+	}
+
+	.controls {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 1.2rem;
+		margin-top: 0.7rem;
+	}
+
+	.controls.foot {
 		border-top: 1px solid var(--line);
-		margin-top: 1.25rem;
-		padding-top: 1rem;
+		padding-top: 0.6rem;
+	}
+
+	.control {
 		display: flex;
-		flex-direction: column;
-		gap: 0.75rem;
+		align-items: center;
+		gap: 0.45rem;
+		font-size: 0.84rem;
 	}
 
-	h2 {
-		font-size: 0.95rem;
-		margin: 0;
+	.control.check {
+		gap: 0.4rem;
 	}
 
-	form {
-		display: flex;
-		flex-direction: column;
-		gap: 0.7rem;
-	}
-
-	.fields {
-		display: grid;
-		grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
-		gap: 0.75rem;
-		max-width: 48rem;
+	.control.power input[type='range'] {
+		width: 10rem;
+		accent-color: var(--accent);
 	}
 
 	select {
 		background: var(--bg);
 		border: 1px solid var(--line);
 		border-radius: 8px;
-		padding: 0.55rem 0.7rem;
+		padding: 0.25rem 0.45rem;
 		color: var(--text);
 		font: inherit;
+		font-size: 0.84rem;
 	}
 
-	.hint {
-		margin: 0;
-		max-width: 44rem;
+	form {
+		display: flex;
+		flex-direction: column;
+		gap: 0.7rem;
+		border-bottom: 1px solid var(--line);
+		padding-bottom: 0.9rem;
+		margin-bottom: 0.9rem;
+	}
+
+	.fields {
+		display: grid;
+		grid-template-columns: minmax(10rem, 1fr) 5rem minmax(8rem, 1fr) 5rem auto;
+		gap: 0.6rem;
+		align-items: end;
+	}
+
+	.field {
+		display: grid;
+		gap: 0.2rem;
+		font-size: 0.76rem;
+		color: var(--muted);
+	}
+
+	.field.check {
+		display: flex;
+		align-items: center;
+		gap: 0.35rem;
+		font-size: 0.84rem;
+		color: var(--text);
 	}
 
 	.row-buttons {
 		display: flex;
-		gap: 0.5rem;
+		align-items: center;
+		gap: 0.6rem;
+	}
+
+	.row-buttons .small {
+		max-width: 40rem;
+	}
+
+	.danger {
+		color: var(--danger);
 	}
 
 	.notice {
-		margin: 0 0 0.75rem;
-		padding: 0.5rem 0.75rem;
+		margin: 0.4rem 0 0;
+		padding: 0.45rem 0.7rem;
 		border: 1px solid color-mix(in oklab, var(--ok) 40%, var(--line));
 		background: color-mix(in oklab, var(--ok) 12%, transparent);
 		border-radius: 8px;
-		font-size: 0.88rem;
+		font-size: 0.86rem;
 	}
 
-	@media (max-width: 1100px) {
-		.row {
-			grid-template-columns: 1fr;
-			gap: 0.25rem;
-		}
-
-		.head {
-			display: none;
-		}
-
-		.actions {
-			justify-content: flex-start;
-		}
+	.error {
+		margin: 0.4rem 0 0;
+		font-size: 0.86rem;
+		color: var(--danger);
 	}
 </style>

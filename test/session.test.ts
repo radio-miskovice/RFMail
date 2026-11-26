@@ -244,7 +244,7 @@ test('the station offers its outbound mail and honours every answer', async () =
 	await openGateway(peer);
 	assert.deepEqual(await readStationHandshake(peer), [
 		';FW: OK4RM',
-		'[rfmail-0.1-B2FHM$]',
+		'[RF Mail-0.1-B2FHM$]',
 		'; OK1RAA DE OK4RM (JO70AA)',
 	]);
 
@@ -315,7 +315,7 @@ test('the station receives both compression codes and defers a duplicated propos
 
 	await openGateway(peer);
 	const handshake = await readStationHandshake(peer);
-	assert.equal(handshake[1], '[rfmail-0.1-B2FHMG$]', 'the gzip letter goes before the closing $');
+	assert.equal(handshake[1], '[RF Mail-0.1-B2FHMG$]', 'the gzip letter goes before the closing $');
 	assert.equal(parseSid(handshake[1]!)?.flags, 'B2FHMG$');
 
 	// Nothing outbound: the station says FF on its first turn.
@@ -389,7 +389,7 @@ test('the secure-login challenge is answered, and the response is in the log', a
 	const response = secureLoginResponse('12345678', 'hunter2');
 	assert.deepEqual(await readStationHandshake(peer, 4), [
 		';FW: OK4RM',
-		'[rfmail-0.1-B2FHM$]',
+		'[RF Mail-0.1-B2FHM$]',
 		`;PR: ${response}`,
 		'; OK1RAA DE OK4RM (JO70AA)',
 	]);
@@ -537,7 +537,7 @@ test('the answering half runs the turns the other way round', async () => {
 	// The master opens the handshake and prompts.
 	assert.deepEqual(await readStationHandshake(peer), [
 		';FW: OK4RM',
-		'[rfmail-0.1-B2FHM$]',
+		'[RF Mail-0.1-B2FHM$]',
 		'; OK1RAA DE OK4RM (JO70AA)>',
 	]);
 
@@ -657,10 +657,10 @@ test('a challenge is refused by a server and merely reported by a peer', async (
 	}
 });
 
-test('a claimed client identity replaces rfmail in the SID, and an invalid one does not', async () => {
+test('a claimed client identity replaces ours in the SID, and an invalid one does not', async () => {
 	for (const [claimed, expected] of [
 		[{ application: 'RMS Express', version: '1.8.6.0' }, '[RMS Express-1.8.6.0-B2FHM$]'],
-		[null, '[rfmail-0.1-B2FHM$]'],
+		[null, '[RF Mail-0.1-B2FHM$]'],
 	] as const) {
 		const { station, gateway } = pair();
 		const state = handler();

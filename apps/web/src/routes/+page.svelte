@@ -14,15 +14,10 @@
 	/** True when the sign-in screen was opened by "Change user", not by a restart. */
 	let changingUser = $state(false);
 
-	const statusLine = $derived(
-		status
-			? [
-					`rfmail ${status.version}`,
-					status.accessMode,
-					status.pop3 ? `POP3 ${status.pop3.address}` : 'POP3 disabled'
-				].join(' · ')
-			: ''
-	);
+	// A client session is not a station role: the access policy and the mail interfaces are
+	// the post office's business, so the only thing the sign-in page has to say is what it
+	// is talking to (decision 33).
+	const statusLine = $derived(status ? `rfmail ${status.version}` : '');
 
 	onMount(async () => {
 		try {

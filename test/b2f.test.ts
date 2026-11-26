@@ -154,8 +154,8 @@ test('the SID advertises what a peer needs to see', () => {
 	assert.equal(supportsB2(sid), true);
 	assert.equal(supportsB2(parseSid('[BPQ-1.0-AF$]')!), false);
 
-	const ours = parseSid(localSid('rfmail', '0.1', 'B2FHM$G'));
-	assert.equal(ours?.application, 'rfmail');
+	const ours = parseSid(localSid('RF Mail', '0.1', 'B2FHM$G'));
+	assert.equal(ours?.application, 'RF Mail');
 	assert.equal(ours?.flags, 'B2FHM$G');
 });
 

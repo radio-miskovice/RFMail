@@ -6,8 +6,11 @@
 // cannot widen the access the operator chose.
 
 import { isIP } from 'node:net';
+import type { AccessMode } from '@rfmail/shared';
 
-export type AccessMode = 'very strict' | 'strict';
+// The mode is named where the API and the UI can see it (shared); this module owns the
+// enforcement and the parsing, and re-exports the type for its own callers.
+export type { AccessMode };
 
 interface Cidr {
   family: 4 | 6;
@@ -99,39 +102,77 @@ function matches(peer: Uint8Array, cidr: Cidr): boolean {
   return ((peer[wholeBytes] ?? 0) & mask) === ((cidr.bytes[wholeBytes] ?? 0) & mask);
 }
 
+/**
+ * Validates a mode and its CIDRs in one go, and answers with the parsed forms. The
+ * constructor and `set()` share it, so a policy that could not start cannot be installed
+ * from the UI either.
+ */
+function parsePolicy(mode: AccessMode, cidrs: string[]): { cidrs: Cidr[]; texts: string[] } {
+  const parsed: Cidr[] = [];
+  const texts: string[] = [];
+  for (const entry of cidrs) {
+    const text = entry.trim();
+    if (text === '') continue;
+    const cidr = parseCidr(text);
+    if (!cidr) throw new Error(`invalid CIDR in access policy: ${text}`);
+    parsed.push(cidr);
+    texts.push(text);
+  }
+  if (mode === 'strict' && parsed.length === 0) {
+    throw new Error('access mode "strict" requires at least one CIDR');
+  }
+  return { cidrs: parsed, texts };
+}
+
 export class PeerPolicy {
-  readonly mode: AccessMode;
-  private readonly cidrs: Cidr[];
+  private currentMode: AccessMode;
+  private currentCidrs: Cidr[];
+  private currentTexts: string[];
 
   constructor(mode: AccessMode, cidrs: string[] = []) {
-    this.mode = mode;
-    const parsed: Cidr[] = [];
-    for (const entry of cidrs) {
-      const cidr = parseCidr(entry);
-      if (!cidr) throw new Error(`invalid CIDR in access policy: ${entry}`);
-      parsed.push(cidr);
-    }
-    if (mode === 'strict' && parsed.length === 0) {
-      throw new Error('access mode "strict" requires at least one CIDR');
-    }
-    this.cidrs = parsed;
+    const parsed = parsePolicy(mode, cidrs);
+    this.currentMode = mode;
+    this.currentCidrs = parsed.cidrs;
+    this.currentTexts = parsed.texts;
+  }
+
+  get mode(): AccessMode {
+    return this.currentMode;
+  }
+
+  /** The CIDRs as the operator wrote them, trimmed and in the order given. */
+  get cidrs(): string[] {
+    return [...this.currentTexts];
+  }
+
+  /**
+   * Replaces the policy in a single step: the mode and the CIDRs are validated before
+   * anything is assigned, so a rejected change leaves the station exactly as it was.
+   * Every listener and the HTTP API read this object per connection, so the new policy
+   * applies to the next peer without touching the sockets.
+   */
+  set(mode: AccessMode, cidrs: string[]): void {
+    const parsed = parsePolicy(mode, cidrs);
+    this.currentMode = mode;
+    this.currentCidrs = parsed.cidrs;
+    this.currentTexts = parsed.texts;
   }
 
   allows(remoteAddress: string | undefined): boolean {
     if (!remoteAddress) return false;
-    if (this.mode === 'very strict') return isLoopback(remoteAddress);
+    if (this.currentMode === 'very strict') return isLoopback(remoteAddress);
     const normal = normalisePeer(remoteAddress);
     if (isLoopback(normal)) return true;
     const family = isIP(normal);
     if (family === 0) return false;
     const bytes = family === 4 ? ipv4ToBytes(normal) : ipv6ToBytes(normal);
     if (!bytes) return false;
-    return this.cidrs.some((cidr) => matches(bytes, cidr));
+    return this.currentCidrs.some((cidr) => matches(bytes, cidr));
   }
 
   describe(): string {
-    if (this.mode === 'very strict') return 'very strict (loopback only)';
-    return `strict (${this.cidrs.length} CIDR${this.cidrs.length === 1 ? '' : 's'}: ${this.cidrs
+    if (this.currentMode === 'very strict') return 'very strict (loopback only)';
+    return `strict (${this.currentCidrs.length} CIDR${this.currentCidrs.length === 1 ? '' : 's'}: ${this.currentCidrs
       .map((c) => `${bytesToText(c)}/${c.bits}`)
       .join(', ')})`;
   }

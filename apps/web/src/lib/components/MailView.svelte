@@ -186,14 +186,16 @@
 			<button class="btn ghost" class:active={view === 'session'} type="button" onclick={() => (view = 'session')}>
 				Session
 			</button>
-			<button
-				class="btn ghost"
-				class:active={view === 'postoffice'}
-				type="button"
-				onclick={() => (view = 'postoffice')}
-			>
-				Post office
-			</button>
+			{#if me.postOffice}
+				<button
+					class="btn ghost"
+					class:active={view === 'postoffice'}
+					type="button"
+					onclick={() => (view = 'postoffice')}
+				>
+					Post office
+				</button>
+			{/if}
 			<button class="btn ghost" class:active={view === 'account'} type="button" onclick={() => (view = 'account')}>
 				Account
 			</button>
@@ -202,16 +204,6 @@
 			<span class="badge accent">{unreadTotal} unread</span>
 		{/if}
 		<span class="spacer"></span>
-		<span class="badge hide-narrow" title="Mail access policy">{status.accessMode}</span>
-		{#if status.pop3}
-			<span class="badge hide-narrow">POP3 {status.pop3.address}</span>
-		{/if}
-		{#if status.smtp}
-			<span class="badge hide-narrow">SMTP {status.smtp.address}</span>
-		{/if}
-		{#if status.imap}
-			<span class="badge hide-narrow">IMAP {status.imap.address}</span>
-		{/if}
 		<ModemControl />
 		<RadioControl onopenconfig={() => (view = 'radio')} />
 	</header>
@@ -221,8 +213,8 @@
 	{:else if view === 'modems'}
 		<ModemView />
 	{:else if view === 'session'}
-		<SessionView onSent={() => void loadFolders()} />
-	{:else if view === 'postoffice'}
+		<SessionView {me} onSent={() => void loadFolders()} />
+	{:else if view === 'postoffice' && me.postOffice}
 		<PostOfficeView />
 	{:else if view === 'users'}
 		<UsersView {me} onmechanged={onmechange} />
@@ -557,6 +549,31 @@
 		min-height: 0;
 	}
 
+	/* The header must stay reachable on a phone: the nav scrolls on its own line and the
+	   lamp, modem and rig wrap below it, rather than being pushed off the right edge. */
+	@media (max-width: 860px) {
+		.top {
+			flex-wrap: wrap;
+			row-gap: 0.3rem;
+			padding: 0.35rem 0.6rem;
+		}
+
+		.nav {
+			flex: 1 1 8rem;
+			min-width: 0;
+			margin-left: 0;
+			overflow-x: auto;
+		}
+
+		.nav .btn {
+			flex: 0 0 auto;
+		}
+
+		.spacer {
+			flex: 0 0 0;
+		}
+	}
+
 	@media (max-width: 1000px) {
 		.body {
 			grid-template-columns: minmax(0, 1fr);
@@ -598,8 +615,5 @@
 			transform: none;
 		}
 
-		.hide-narrow {
-			display: none;
-		}
 	}
 </style>

@@ -50,6 +50,12 @@ export interface TransceiverRecord {
   host: string;
   port: number;
   pttInput: 'rear' | 'front' | 'auto';
+  /** The serial device rigctld serves, as the operator recorded it; null when unknown. */
+  serialPort: string | null;
+  /** Its speed in baud, as recorded; null when unknown. */
+  serialSpeed: number | null;
+  /** When this interface was last used, epoch ms; the newest is the station's current one. */
+  lastUsedAt: number;
   launchCommand: string | null;
   launchArgs: string[];
   idleMode: string;
@@ -64,6 +70,9 @@ export interface CreateTransceiverInput {
   host: string;
   port?: number;
   pttInput?: 'rear' | 'front' | 'auto';
+  serialPort?: string | null;
+  serialSpeed?: number | null;
+  lastUsedAt?: number;
   launchCommand?: string | null;
   launchArgs?: string[];
   idleMode?: string;
@@ -92,6 +101,21 @@ export interface ModemRecord {
   transceiverId: number | null;
   enabled: boolean;
   createdAt: number;
+}
+
+/** One gateway this station has called on one dial, and how often (decision 44). */
+export interface SessionTargetRecord {
+  id: number;
+  callsign: string;
+  frequencyHz: number;
+  uses: number;
+  lastUsedAt: number;
+  createdAt: number;
+}
+
+export interface CreateSessionTargetInput {
+  callsign: string;
+  frequencyHz: number;
 }
 
 export interface CreateModemInput {
@@ -239,11 +263,17 @@ export interface Store {
   createModem(input: CreateModemInput): Promise<ModemRecord>;
   updateModem(id: number, patch: Partial<CreateModemInput>): Promise<ModemRecord | null>;
   deleteModem(id: number): Promise<boolean>;
+
   updateTransceiver(
     id: number,
     patch: Partial<CreateTransceiverInput>,
   ): Promise<TransceiverRecord | null>;
   deleteTransceiver(id: number): Promise<boolean>;
+
+  /** Gateways this station has called, most used first (R3.13). */
+  listSessionTargets(limit?: number): Promise<SessionTargetRecord[]>;
+  /** Counts one use of a gateway on one dial, adding the pair when it is new. */
+  recordSessionTarget(input: CreateSessionTargetInput): Promise<SessionTargetRecord>;
 
   listFolders(userId: number): Promise<Array<FolderRecord & FolderCounts>>;
   getFolder(userId: number, folderId: number): Promise<FolderRecord | null>;

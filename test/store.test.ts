@@ -235,6 +235,9 @@ test('the transceiver registry stores what a session needs and nothing about sta
 	assert.equal(created.enabled, true);
 	assert.deepEqual(created.launchArgs, []);
 	assert.equal(created.launchCommand, null);
+	assert.equal(created.serialPort, null, 'the serial line is recorded, so it starts empty');
+	assert.equal(created.serialSpeed, null);
+	assert.equal(created.lastUsedAt, 0, 'nothing has been used yet');
 
 	// A second radio, with everything spelled out.
 	const second = await store.createTransceiver({
@@ -251,9 +254,10 @@ test('the transceiver registry stores what a session needs and nothing about sta
 	assert.equal(second.pttInput, 'front');
 	assert.deepEqual(second.launchArgs, ['-m', '3073', '-r', '/dev/ttyUSB1']);
 
-	// Names are unique, case-insensitively; the registry is listed by name.
+	// Names are unique, case-insensitively; the registry keeps its stable order, and which
+	// interface is *current* is decided by `last_used_at`, not by position.
 	await assert.rejects(() => store.createTransceiver({ name: 'ts-590sg', host: 'x' }), /UNIQUE|constraint/i);
-	assert.deepEqual((await store.listTransceivers()).map((row) => row.name), ['IC-7300', 'TS-590SG']);
+	assert.deepEqual((await store.listTransceivers()).map((row) => row.name), ['TS-590SG', 'IC-7300']);
 
 	const patched = await store.updateTransceiver(created.id, { port: 4534, pttInput: 'auto', enabled: false });
 	assert.equal(patched?.port, 4534);
@@ -288,6 +292,41 @@ test('one post office owner, and its credential follows the callsign', async () 
 	assert.equal(await store.getPostOfficeSecret(second.id), 'sealed-blob');
 	await store.setCallsign(second.id, 'OK2XYZ-5');
 	assert.equal(await store.getPostOfficeSecret(second.id), null, 'a different callsign keeps no credential');
+	await store.close();
+});
+
+test('a gateway is remembered once per dial, ranked by how often it answered', async () => {
+	const store = await freshStore();
+
+	// Nothing called yet.
+	assert.deepEqual(await store.listSessionTargets(), []);
+
+	// Three calls to one gateway on one dial count as one entry used three times.
+	await store.recordSessionTarget({ callsign: 'OK0N', frequencyHz: 3_597_000 });
+	await store.recordSessionTarget({ callsign: 'ok0n', frequencyHz: 3_597_000 });
+	const third = await store.recordSessionTarget({ callsign: 'OK0N', frequencyHz: 3_597_000 });
+	assert.equal(third.uses, 3, 'a repeated pair counts a use, not a second entry');
+	assert.equal(third.callsign, 'OK0N', 'the newest spelling is kept');
+
+	// The same gateway reached on another dial is a different way to call it.
+	await store.recordSessionTarget({ callsign: 'OK0N', frequencyHz: 7_043_000 });
+	// A millisecond apart, so "most recent" is a real ordering rather than a tie.
+	await new Promise((resolve) => setTimeout(resolve, 2));
+	// A gateway called once ranks below one called three times, and below a more recent call.
+	await store.recordSessionTarget({ callsign: 'HB9AK', frequencyHz: 14_109_600 });
+
+	const ranked = await store.listSessionTargets();
+	assert.deepEqual(
+		ranked.map((row) => [row.callsign, row.frequencyHz, row.uses]),
+		[
+			['OK0N', 3_597_000, 3],
+			['HB9AK', 14_109_600, 1],
+			['OK0N', 7_043_000, 1],
+		],
+		'most used first; equal counts fall back to the more recent use',
+	);
+	assert.equal((await store.listSessionTargets(2)).length, 2, 'the list can be capped');
+
 	await store.close();
 });
 

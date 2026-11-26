@@ -5,3 +5,4 @@ export * from './lines.ts';
 export * from './pop3.ts';
 export * from './smtp.ts';
 export * from './identity.ts';
+export * from './interfaces.ts';

@@ -10,11 +10,13 @@ import {
   FLAG_ANSWERED,
   FLAG_FLAGGED,
   FLAG_UNREAD,
+  WINLINK_CLIENT_IDENTITY,
   type ArmPostOfficeRequest,
   type ComposeRequest,
   type CreateUserRequest,
   type FolderWithCounts,
   type LoginRequest,
+  type MailInterfaceRequest,
   type Me,
   type MessageDetail,
   type MessageListResponse,
@@ -29,9 +31,18 @@ import {
   type PatchMessageRequest,
   type PasswordRequest,
   type PostOfficeStatus,
+  type HostNamesResponse,
+  type RadioPatchRequest,
+  type RadioRequest,
+  type RadioStatus,
+  type RegisterRequest,
   type ModemListenRequest,
+  type NetworkAccess,
+  type NetworkAccessRequest,
+  type NetworkAccessSummary,
   type SessionMode,
   type SessionRunRequest,
+  type SessionTargetsResponse,
   type SessionTestRequest,
   type SetupRequest,
   type CreateTransceiverRequest,
@@ -66,7 +77,8 @@ import {
 } from '@rfmail/store';
 import type { CreateModemInput, ModemRecord } from '@rfmail/store';
 import type { PostOffice } from './postoffice.ts';
-import { findUserByCredential, type MailEvents, type PeerPolicy } from '@rfmail/mailservers';
+import { lookupHostName } from './hostnames.ts';
+import { findUserByCredential, isLoopback, type MailEvents, type MailInterfaces, type PeerPolicy } from '@rfmail/mailservers';
 import type { TransceiverConfig, TransceiverLinks } from '@rfmail/rig';
 import { sanitiseHtml } from './html.ts';
 import { SESSION_COOKIE, parseCookies, type Sessions } from './auth.ts';
@@ -91,6 +103,9 @@ const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 const MAX_JSON_BYTES = 16 * 1024 * 1024;
 const LOGIN_WINDOW_MS = 60_000;
 const LOGIN_MAX_ATTEMPTS = 10;
+/** Self-registration is public to whoever the access policy admits; the rate is not. */
+const REGISTRATION_WINDOW_MS = 10 * 60_000;
+const REGISTRATION_MAX = 5;
 
 export interface ApiServices {
   store: Store;
@@ -99,10 +114,10 @@ export interface ApiServices {
   logger: Logger;
   events: MailEvents;
   uiDir: string;
-  accessMode: string;
-  pop3Address: string | null;
-  smtpAddress: string | null;
-  imapAddress: string | null;
+  /** The address the HTTP listener was asked to bind, for the access posture. */
+  httpListen: string;
+  /** POP3, SMTP and IMAP, with a switch on each; see mailservers/interfaces.ts. */
+  mailInterfaces: MailInterfaces;
   secureCookies: boolean;
   /** Seals Winlink passwords at rest; see secrets.ts. */
   storeKey: string;
@@ -200,6 +215,20 @@ function requireAdmin(ctx: Ctx): AuthedContext {
   return authed;
 }
 
+/**
+ * The post office is a seat taken at the door, not an account's property (decision 32):
+ * a session opened from the sign-in form's "post office owner" box, and no other, reaches
+ * its routes. The seat is closed while the post office is shelved, so today this always
+ * refuses — the guard is here so that nothing else can quietly become the post office.
+ */
+function requirePostOffice(ctx: Ctx): AuthedContext {
+  const authed = requireLogin(ctx);
+  if (ctx.session?.postOffice !== true) {
+    throw new HttpError(403, 'the post office is not open in this session');
+  }
+  return authed;
+}
+
 function requireCallsign(value: unknown): string {
   // The account's identity is the callsign (decision 25), so the field is both the
   // login and the station: one validator, and a missing value is a refusal, never a
@@ -213,6 +242,20 @@ function requireCallsign(value: unknown): string {
 
 // ---------------------------------------------------------------------------
 
+/** A stored transceiver as the rig client wants it; the start-up radio loop uses it too. */
+export const transceiverConfigOf = (record: TransceiverRecord): TransceiverConfig => ({
+  id: record.id,
+  name: record.name,
+  host: record.host,
+  port: record.port,
+  pttInput: record.pttInput,
+  launchCommand: record.launchCommand,
+  launchArgs: record.launchArgs,
+  idleMode: record.idleMode,
+  idlePassbandHz: record.idlePassbandHz,
+  timeoutMs: record.timeoutMs,
+});
+
 export function createApi(services: ApiServices): {
   router: Router;
   handle: (req: IncomingMessage, res: ServerResponse) => Promise<void>;
@@ -221,8 +264,9 @@ export function createApi(services: ApiServices): {
   const { store, sessions, policy, logger, storeKey, links, postOffice } = services;
   const router = new Router();
   const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+  const registrations = new Map<string, { count: number; resetAt: number }>();
 
-  const meResponse = async (uid: number, csrf: string): Promise<Me> => {
+  const meResponse = async (uid: number, csrf: string, postOffice = false): Promise<Me> => {
     const user = await store.getUser(uid);
     if (!user) throw new HttpError(401, 'account no longer exists');
     const folders: FolderWithCounts[] = (await store.listFolders(uid)).map((folder) => ({
@@ -234,7 +278,50 @@ export function createApi(services: ApiServices): {
       total: folder.total,
       unread: folder.unread,
     }));
-    return { user: toUser(user), folders, csrf };
+    return { user: toUser(user), folders, csrf, postOffice };
+  };
+
+  // -- network access --------------------------------------------------------
+
+  /** `host:port` to `host`, bracketed IPv6 included. */
+  const hostOf = (address: string): string => {
+    const trimmed = address.trim();
+    if (trimmed.startsWith('[')) {
+      const end = trimmed.indexOf(']');
+      return end === -1 ? trimmed : trimmed.slice(1, end);
+    }
+    const index = trimmed.lastIndexOf(':');
+    return index === -1 ? trimmed : trimmed.slice(0, index);
+  };
+
+  /**
+   * The posture as one answer. `exposed` is the state worth a warning: some listener is
+   * bound beyond loopback while the policy admits only loopback, so the station answers
+   * the network with a refusal — ports open, nobody admitted, usually two settings made
+   * with different intentions.
+   */
+  const networkAccess = (): NetworkAccess => {
+    const interfaces = services.mailInterfaces.status();
+    const addresses = [
+      services.httpListen,
+      ...interfaces.filter((entry) => entry.running).map((entry) => entry.address ?? ''),
+    ];
+    const exposed =
+      policy.mode === 'very strict' &&
+      addresses.some((address) => address !== '' && !isLoopback(hostOf(address)));
+    return {
+      mode: policy.mode,
+      cidrs: policy.cidrs,
+      listen: services.httpListen,
+      listeners: interfaces.filter((entry) => entry.running).length,
+      exposed,
+      summary: policy.describe(),
+    };
+  };
+
+  const networkSummary = (): NetworkAccessSummary => {
+    const { mode, exposed, listeners, summary } = networkAccess();
+    return { mode, exposed, listeners, summary };
   };
 
   // -- public ---------------------------------------------------------------
@@ -246,12 +333,101 @@ export function createApi(services: ApiServices): {
       version: APP_VERSION,
       state: users === 0 ? 'setup' : 'ready',
       database: 'sqlite',
-      accessMode: services.accessMode,
-      pop3: services.pop3Address ? { enabled: true, address: services.pop3Address } : null,
-      smtp: services.smtpAddress ? { enabled: true, address: services.smtpAddress } : null,
-      imap: services.imapAddress ? { enabled: true, address: services.imapAddress } : null,
+      network: networkSummary(),
+      mailInterfaces: services.mailInterfaces.status(),
     };
     sendJson(ctx.res, 200, status);
+  });
+
+  /**
+   * The three mail-access interfaces behind one switch each. They serve mail programs, so
+   * they belong to the post office: a station used as a Winlink client does not listen at
+   * all, and the switches refuse to start one. Stopping is always allowed — an interface
+   * left listening must be closable even after the post office is unseated.
+   */
+  router.add('GET', '/api/mail/interfaces', async (ctx) => {
+    requireLogin(ctx);
+    sendJson(ctx.res, 200, {
+      interfaces: services.mailInterfaces.status(),
+      postOffice: (await store.findPostOfficeOwner()) !== null,
+    });
+  });
+
+  router.add('POST', '/api/mail/interfaces', async (ctx) => {
+    const authed = requireLogin(ctx);
+    requireCsrf(ctx);
+    const body = await readJson<MailInterfaceRequest>(ctx.req);
+    const name = body.name;
+    if (name !== 'pop3' && name !== 'smtp' && name !== 'imap') {
+      throw new HttpError(400, 'name must be pop3, smtp or imap', { name: 'invalid' });
+    }
+    const on = body.on === true;
+    const postOffice = (await store.findPostOfficeOwner()) !== null;
+    if (on && !postOffice) {
+      throw new HttpError(
+        409,
+        'the mail interfaces belong to the post office; this station is a Winlink client',
+        { name: 'post office' },
+      );
+    }
+    let switched;
+    try {
+      switched = await services.mailInterfaces.set(name, on);
+    } catch (err) {
+      // Only a protocol the configuration does not offer lands here.
+      throw new HttpError(409, err instanceof Error ? err.message : String(err), { name: 'not configured' });
+    }
+    logger.info('mail interface switched', {
+      interface: name,
+      on,
+      running: switched.running,
+      error: switched.error,
+      by: authed.user.callsign,
+    });
+    sendJson(ctx.res, 200, {
+      interfaces: services.mailInterfaces.status(),
+      postOffice,
+    });
+  });
+
+  /**
+   * Who may reach the station at all — the HTTP API and the three mail doors together.
+   * Reading it is what any signed-in operator may do; changing it is an administrator's
+   * act, because it decides who may reach every door at once, and a user who shut the LAN
+   * out would shut the other users out with it. The change is runtime: the configuration
+   * file decides again at the next start.
+   */
+  router.add('GET', '/api/network/access', async (ctx) => {
+    requireLogin(ctx);
+    sendJson(ctx.res, 200, networkAccess());
+  });
+
+  router.add('POST', '/api/network/access', async (ctx) => {
+    const authed = requireAdmin(ctx);
+    requireCsrf(ctx);
+    const body = await readJson<NetworkAccessRequest>(ctx.req);
+    const mode = body.mode;
+    if (mode !== 'strict' && mode !== 'very strict') {
+      throw new HttpError(400, 'mode must be "strict" or "very strict"', { mode: 'invalid' });
+    }
+    const raw = Array.isArray(body.cidrs) ? body.cidrs : [];
+    if (raw.some((entry) => typeof entry !== 'string')) {
+      throw new HttpError(400, 'cidrs must be a list of addresses', { cidrs: 'invalid' });
+    }
+    try {
+      policy.set(mode, raw as string[]);
+    } catch (err) {
+      // The same rule as start-up: an invalid CIDR, or strict without one, changes nothing.
+      throw new HttpError(400, err instanceof Error ? err.message : String(err), { cidrs: 'invalid' });
+    }
+    const after = networkAccess();
+    logger.warn('access policy changed', {
+      mode: after.mode,
+      cidrs: after.cidrs,
+      exposed: after.exposed,
+      by: authed.user.callsign,
+    });
+    sendJson(ctx.res, 200, after);
   });
 
   router.add('POST', '/api/setup', async (ctx) => {
@@ -265,6 +441,45 @@ export function createApi(services: ApiServices): {
     ctx.res.setHeader('Set-Cookie', sessions.cookieHeader(token, services.secureCookies));
     logger.info('first account created', { callsign, remote: ctx.remote });
     sendJson(ctx.res, 201, await meResponse(user.id, payload.csrf));
+  });
+
+  /**
+   * An account made by its owner at the sign-in page (decision 34). The Winlink password
+   * is what this callsign answers a peer's `;PQ` challenge with, so it is required — a
+   * mailbox that cannot authenticate cannot collect mail — and it is sealed, never hashed
+   * and never returned. The account is a plain client account: the callsign is the login,
+   * no local password is set here, and it is never the post office.
+   */
+  router.add('POST', '/api/accounts', async (ctx) => {
+    const now = Date.now();
+    const seen = registrations.get(ctx.remote);
+    if (seen && seen.resetAt > now && seen.count >= REGISTRATION_MAX) {
+      throw new HttpError(429, 'too many accounts created from this address, try again later');
+    }
+    const body = await readJson<RegisterRequest>(ctx.req);
+    const callsign = requireCallsign(body.callsign);
+    const password = typeof body.winlinkPassword === 'string' ? body.winlinkPassword : '';
+    if (password.trim() === '') {
+      throw new HttpError(400, 'the Winlink password is required', { winlinkPassword: 'required' });
+    }
+    if (password.length > 128) {
+      throw new HttpError(400, 'the Winlink password is too long', { winlinkPassword: 'too long' });
+    }
+    // The callsign is the account (decision 25): two mailboxes for one callsign would make
+    // every address ambiguous, so an existing one is a refusal, not a second account.
+    await assertCallsignFree(store, callsign, 0);
+    const created = await store.createUser({ callsign, pwHash: null, role: 'user' });
+    if (!(await store.setWinlinkSecret(created.id, sealSecret(password, storeKey)))) {
+      // No callsign could be set: leave nothing half-made behind.
+      await store.deleteUser(created.id);
+      throw new HttpError(500, 'the account could not be given its Winlink password');
+    }
+    if (!seen || seen.resetAt <= now) registrations.set(ctx.remote, { count: 1, resetAt: now + REGISTRATION_WINDOW_MS });
+    else seen.count += 1;
+    const { token, payload } = sessions.issue(created.id);
+    ctx.res.setHeader('Set-Cookie', sessions.cookieHeader(token, services.secureCookies));
+    logger.info('account created by its owner', { callsign, remote: ctx.remote });
+    sendJson(ctx.res, 201, await meResponse(created.id, payload.csrf));
   });
 
   router.add('POST', '/api/login', async (ctx) => {
@@ -308,10 +523,20 @@ export function createApi(services: ApiServices): {
       return;
     }
     loginAttempts.delete(ctx.remote);
+    // The post office is a separate seat at this station, and the login form asks for it
+    // (decision 32). Until the post office is built again the request is refused outright:
+    // half-granting it would show a screen that cannot work.
+    if (body.postOffice === true) {
+      throw new HttpError(
+        409,
+        'the post office is not available yet: this station is a Winlink client',
+        { postOffice: 'unavailable' },
+      );
+    }
     const { token, payload } = sessions.issue(user.id);
     ctx.res.setHeader('Set-Cookie', sessions.cookieHeader(token, services.secureCookies));
     logger.info('login', { callsign: user.callsign ?? user.login, remote: ctx.remote });
-    sendJson(ctx.res, 200, await meResponse(user.id, payload.csrf));
+    sendJson(ctx.res, 200, await meResponse(user.id, payload.csrf, payload.postOffice === true));
   });
 
   router.add('POST', '/api/logout', async (ctx) => {
@@ -507,6 +732,9 @@ export function createApi(services: ApiServices): {
       host: record.host,
       port: record.port,
       pttInput: record.pttInput,
+      serialPort: record.serialPort,
+      serialSpeed: record.serialSpeed,
+      lastUsedAt: new Date(record.lastUsedAt).toISOString(),
       launchCommand: record.launchCommand,
       launchArgs: record.launchArgs,
       idleMode: record.idleMode,
@@ -522,6 +750,7 @@ export function createApi(services: ApiServices): {
         ptt: link.ptt,
         pttValue: link.pttValue,
         fellBackToFront: link.fellBackToFront,
+        rig: link.rig,
         changedAt: new Date(link.changedAt).toISOString(),
       },
     };
@@ -611,18 +840,8 @@ export function createApi(services: ApiServices): {
     return input;
   };
 
-  const transceiverConfig = (record: TransceiverRecord): TransceiverConfig => ({
-    id: record.id,
-    name: record.name,
-    host: record.host,
-    port: record.port,
-    pttInput: record.pttInput,
-    launchCommand: record.launchCommand,
-    launchArgs: record.launchArgs,
-    idleMode: record.idleMode,
-    idlePassbandHz: record.idlePassbandHz,
-    timeoutMs: record.timeoutMs,
-  });
+  /** A stored transceiver as the rig client wants it. Shared with the start-up radio loop. */
+  const transceiverConfig = transceiverConfigOf;
 
   /** Validates the fields a create or update carries; unknown keys are ignored. */
   /**
@@ -644,6 +863,9 @@ export function createApi(services: ApiServices): {
     if (body.host !== undefined || creating) {
       const host = typeof body.host === 'string' ? body.host.trim() : '';
       if (!host) throw new HttpError(400, 'a host is required', { host: 'required' });
+      if (host.length > 253 || /\s/.test(host)) {
+        throw new HttpError(400, 'that is not an address or a host name', { host: 'invalid' });
+      }
       input.host = host;
     }
     if (body.port !== undefined) {
@@ -660,6 +882,28 @@ export function createApi(services: ApiServices): {
         });
       }
       input.pttInput = body.pttInput;
+    }
+    if (body.serialPort !== undefined) {
+      const device = typeof body.serialPort === 'string' ? body.serialPort.trim() : '';
+      if (device.length > 64 || /\s/.test(device)) {
+        throw new HttpError(400, 'a serial device is a path or a COM name, with no spaces', {
+          serialPort: 'invalid',
+        });
+      }
+      input.serialPort = device || null;
+    }
+    if (body.serialSpeed !== undefined) {
+      if (body.serialSpeed === null) {
+        input.serialSpeed = null;
+      } else {
+        const speed = Number(body.serialSpeed);
+        if (!Number.isInteger(speed) || speed < 300 || speed > 1_000_000) {
+          throw new HttpError(400, 'the speed is a baud rate, from 300 to 1000000', {
+            serialSpeed: 'invalid',
+          });
+        }
+        input.serialSpeed = speed;
+      }
     }
     if (body.launchCommand !== undefined) {
       input.launchCommand = typeof body.launchCommand === 'string' ? body.launchCommand.trim() || null : null;
@@ -710,16 +954,29 @@ export function createApi(services: ApiServices): {
         // Ask who is listening, not merely whether something is: the same ports carry
         // VARA, XARA, Data2G and Mercury, and which one answers decides the digital mode.
         const probe = await identifyModem(record.host, record.commandPort);
+        // Direwolf's AGWPE port does not answer VERSION at all: it speaks a different command
+        // set, so for a packet modem the question is only whether the port is there.
+        const reachable =
+          record.kind === 'direwolf'
+            ? await probeModem(record.host, record.commandPort)
+            : probe;
+        // A port that answers is not the same as this modem being there. A VARA record served
+        // by Data2G is an unavailable VARA however cheerfully the socket connected, so the
+        // program that named itself — not the connection — decides (decision 38).
+        const mismatch = probe.identity?.kind != null && probe.identity.kind !== record.kind;
+        const answered = probe.identity?.kind != null ? MODEM_LABELS[probe.identity.kind] : null;
         return {
           id: record.id,
-          running: probe.running,
-          error: probe.error,
+          running: reachable.running && !mismatch,
+          error: mismatch
+            ? `${answered} is answering on this port, not ${MODEM_LABELS[record.kind]}`
+            : reachable.error,
           listening: listenStates.get(record.id) ?? null,
           // The program that answered, or null when it did not say.
           reportedKind: probe.identity?.kind ?? null,
           reportedVersion: probe.identity?.version ?? null,
           // The record's kind and the program that answered disagree.
-          mismatch: probe.identity?.kind != null && probe.identity.kind !== record.kind,
+          mismatch,
         };
       }),
     );
@@ -760,7 +1017,17 @@ export function createApi(services: ApiServices): {
       kind: ModemKind;
       host: string;
     };
-    const created = await store.createModem({ ...input, name: input.name, kind: input.kind, host: input.host });
+    const created = await store.createModem({
+      ...input,
+      name: input.name,
+      kind: input.kind,
+      host: input.host,
+      // The vendor's own port numbers when the request does not name them, so an API client
+      // and the form produce the same record (decision 41). An explicit null means "none".
+      commandPort: input.commandPort ?? MODEM_KINDS.find((entry) => entry.kind === input.kind)?.commandPort ?? null,
+      dataPort: input.dataPort ?? MODEM_KINDS.find((entry) => entry.kind === input.kind)?.dataPort ?? null,
+      kissPort: input.kissPort ?? MODEM_KINDS.find((entry) => entry.kind === input.kind)?.kissPort ?? null,
+    });
     logger.info('modem created', { name: created.name, kind: created.kind, by: authed.user.callsign });
     sendJson(ctx.res, 201, toModem(created));
   });
@@ -802,7 +1069,7 @@ export function createApi(services: ApiServices): {
     if (await store.listTransceivers().then((rows) => rows.some((row) => row.name.toLowerCase() === input.name?.toLowerCase()))) {
       throw new HttpError(409, 'a transceiver with that name exists', { name: 'duplicate' });
     }
-    const created = await store.createTransceiver({ ...input, name: input.name, host: input.host });
+    const created = await store.createTransceiver({ ...input, name: input.name, host: input.host, lastUsedAt: Date.now() });
     logger.info('transceiver created', {
       name: created.name,
       host: created.host,
@@ -820,13 +1087,54 @@ export function createApi(services: ApiServices): {
     if (!record) throw new HttpError(404, 'transceiver not found');
     const body = await readJson<UpdateTransceiverRequest>(ctx.req);
     const input = readTransceiverInput(body);
-    const updated = await store.updateTransceiver(id, input);
+    // Editing an interface is using it: it becomes the current one (decision 40).
+    const updated = await store.updateTransceiver(id, { ...input, lastUsedAt: Date.now() });
     if (!updated) throw new HttpError(404, 'transceiver not found');
-    // A changed address or timeout cannot apply to an open link.
-    if (['host', 'port', 'timeoutMs', 'pttInput'].some((key) => key in body)) {
+    // The transmit connector applies to the live link without reopening it; a changed
+    // address or timeout cannot.
+    if (body.pttInput !== undefined) links.setPttInput(id, updated.pttInput);
+    if (['host', 'port', 'timeoutMs'].some((key) => key in body)) {
       links.disconnect(id);
     }
     sendJson(ctx.res, 200, toTransceiver(updated));
+  });
+
+  /** The interface the operator is using now; the header chip follows it. */
+  router.add('POST', '/api/transceivers/:id/select', async (ctx) => {
+    requireLogin(ctx);
+    requireCsrf(ctx);
+    const id = Number(ctx.params['id']);
+    const record = await store.getTransceiver(id);
+    if (!record) throw new HttpError(404, 'transceiver not found');
+    const updated = (await store.updateTransceiver(id, { lastUsedAt: Date.now() })) ?? record;
+    sendJson(ctx.res, 200, toTransceiver(updated));
+  });
+
+  /** The transmitter power for one interface: written to that rig and read straight back. */
+  router.add('POST', '/api/transceivers/:id/power', async (ctx) => {
+    const authed = requireLogin(ctx);
+    requireCsrf(ctx);
+    const id = Number(ctx.params['id']);
+    const record = await store.getTransceiver(id);
+    if (!record) throw new HttpError(404, 'transceiver not found');
+    const body = await readJson<{ rfPower?: number }>(ctx.req);
+    const fraction = Number(body.rfPower);
+    if (!Number.isFinite(fraction) || fraction < 0 || fraction > 1) {
+      throw new HttpError(400, 'the power is a fraction of the maximum, from 0 to 1', {
+        rfPower: 'invalid',
+      });
+    }
+    try {
+      await links.setPower(id, fraction);
+    } catch (error) {
+      throw new HttpError(
+        409,
+        `the radio did not take the power setting: ${error instanceof Error ? error.message : String(error)}`,
+        { rfPower: 'refused' },
+      );
+    }
+    logger.info('transmit power', { transceiver: id, fraction, by: authed.user.callsign });
+    sendJson(ctx.res, 200, toTransceiver(record));
   });
 
   router.add('DELETE', '/api/transceivers/:id', async (ctx) => {
@@ -862,6 +1170,105 @@ export function createApi(services: ApiServices): {
     if (!record) throw new HttpError(404, 'transceiver not found');
     links.disconnect(id);
     sendJson(ctx.res, 200, { transceiver: toTransceiver(record) });
+  });
+
+  // -- the radio interface (R2.2) -------------------------------------------
+  //
+  // A station has one radio interface, and the operator sets only where rigctld answers:
+  // an address (empty means localhost) and a port (empty means 4532). Everything else on
+  // the screen is what rigctld says about the radio — its model, how it is attached, the
+  // frequency, mode, filter and power — or the state of the two links, the station to
+  // rigctld and rigctld to the rig. The station dials by itself and stays dialled; the
+  // screen is a reader, not a switch.
+
+  const firstRadio = async (): Promise<TransceiverRecord | null> => {
+    // The interface the operator used last, whatever order the registry is listed in
+    // (decision 40): the header shows that one.
+    const rows = await store.listTransceivers();
+    return rows.reduce<TransceiverRecord | null>(
+      (best, row) =>
+        best === null || row.lastUsedAt > best.lastUsedAt || (row.lastUsedAt === best.lastUsedAt && row.id > best.id)
+          ? row
+          : best,
+      null,
+    );
+  };
+
+  /**
+   * The radio a modem puts on the air. A modem may name one; since the station usually has a
+   * single interface and the modem form no longer asks (decision 43), a modem that names none
+   * takes the current interface — the same "current" the header shows.
+   */
+  const radioForModem = async (modem: ModemRecord): Promise<TransceiverRecord> => {
+    if (modem.transceiverId !== null) {
+      const named = await store.getTransceiver(modem.transceiverId);
+      if (!named) {
+        throw new HttpError(400, 'the modem names a transceiver that no longer exists', {
+          modemId: 'stale',
+        });
+      }
+      return named;
+    }
+    const current = await firstRadio();
+    if (!current) {
+      throw new HttpError(409, 'the station has no radio interface, so the dial cannot be set', {
+        transceiverId: 'missing',
+      });
+    }
+    return current;
+  };
+
+  const radioStatus = (record: TransceiverRecord | null): RadioStatus => {
+    if (!record) {
+      return { interface: null, pttInput: null, serial: null, connected: false, error: null, rig: null };
+    }
+    const link = links.status(record.id);
+    return {
+      interface: { host: record.host, port: record.port },
+      pttInput: record.pttInput,
+      // The daemon cannot be asked which device it serves, so this is what the operator
+      // recorded about it — null when nobody has said (decision 39).
+      serial:
+        record.serialPort === null && record.serialSpeed === null
+          ? null
+          : { device: record.serialPort, speed: record.serialSpeed },
+      connected: link.state === 'connected',
+      error: link.error,
+      rig: link.rig,
+    };
+  };
+
+  /**
+   * What to call the radio in a sentence. The model is rigctld's answer, decided when the
+   * daemon was started; the name it replaced was typed by an operator and could only ever
+   * agree with the rig by luck. Until the daemon has said, the address it answers at is the
+   * honest name.
+   */
+  const radioLabel = (record: TransceiverRecord): string =>
+    links.status(record.id).rig?.model ?? `${record.host}:${record.port}`;
+
+  router.add('GET', '/api/radio', async (ctx) => {
+    requireLogin(ctx);
+    sendJson(ctx.res, 200, radioStatus(await firstRadio()));
+  });
+
+  /**
+   * The LAN names of the hosts the station is configured to talk to (decision 42). NetBIOS
+   * first — that is what a Windows PC answers — then an mDNS reverse query for the boxes that
+   * publish `.local`. Cached for minutes, never fatal: a host that answers neither is null,
+   * and the screen simply shows the address.
+   */
+  router.add('GET', '/api/hostnames', async (ctx) => {
+    requireLogin(ctx);
+    const [radios, modems] = await Promise.all([store.listTransceivers(), store.listModems()]);
+    const hosts = [...new Set([...radios.map((row) => row.host), ...modems.map((row) => row.host)])];
+    const names: Record<string, string | null> = {};
+    await Promise.all(
+      hosts.map(async (host) => {
+        names[host] = await lookupHostName(host);
+      }),
+    );
+    sendJson(ctx.res, 200, { names } satisfies HostNamesResponse);
   });
 
   // -- accounts -------------------------------------------------------------
@@ -1059,25 +1466,19 @@ export function createApi(services: ApiServices): {
     // transmitter wherever the dial happened to be left is not acceptable.
     let rig: { frequencyHz: number; mode: string } | null = null;
     let transceiverName: string | null = null;
-    if (modem.transceiverId === null) {
-      throw new HttpError(409, 'the modem has no transceiver assigned, so the dial cannot be set', {
-        transceiverId: 'missing',
-      });
-    }
-    const radio = await store.getTransceiver(modem.transceiverId);
-    transceiverName = radio?.name ?? null;
-    if (!radio) {
-      throw new HttpError(400, 'the modem names a transceiver that no longer exists', {
-        modemId: 'stale',
-      });
-    }
+    const radio = await radioForModem(modem);
+    transceiverName = radioLabel(radio);
     try {
+      // Only the dial and the mode reach the radio. The session's bandwidth is the modem's
+      // (it travels in `BW2300`/`ARQBW` to the modem, see modem-dial.ts): a passband is not a
+      // thing this station can ask a rig for, and 2300 Hz is not a TS-590 filter anyway
+      // (decision 45).
       const tuned = await links.tune(radio.id, frequencyHz, modem.rigMode);
       rig = { frequencyHz: tuned.frequencyHz, mode: tuned.mode };
     } catch (error) {
       throw new HttpError(
         409,
-        `the transceiver ${radio.name} is not connected: ${error instanceof Error ? error.message : String(error)}`,
+        `the radio ${transceiverName} is not connected: ${error instanceof Error ? error.message : String(error)}`,
         { transceiverId: 'offline' },
       );
     }
@@ -1176,7 +1577,11 @@ export function createApi(services: ApiServices): {
       mode,
       bandwidthHz,
       password: secret,
-      fakeClient: typeof body.fakeClient === 'string' && body.fakeClient.trim() !== '' ? body.fakeClient : null,
+      // The client identity is not the operator's choice (decision 36): a Winlink session
+      // presents the type a CMS accepts — production servers refuse one they do not know,
+      // measured against HB9AK on 25 Nov 2026 — and every other session sends this station's
+      // own SID, which is what `localSid` defaults to.
+      fakeClient: mode === 'cms' ? WINLINK_CLIENT_IDENTITY : null,
       logger,
     });
 
@@ -1184,7 +1589,6 @@ export function createApi(services: ApiServices): {
       modem: modem.name,
       target,
       mode,
-      fakeClient: body.fakeClient ?? null,
       result: report.result,
       sent: report.sent.length,
       received: report.received.length,
@@ -1192,6 +1596,13 @@ export function createApi(services: ApiServices): {
       reason: report.result === 'complete' ? null : report.message,
       dialResult: report.dial?.result ?? null,
     });
+
+    // A gateway that answered is remembered with the dial it was called on, so the choice is
+    // not limited to what the RMS catalogue lists (decision 44). A dial that never connected
+    // proves nothing about the gateway and is not recorded.
+    if (report.dial?.result === 'connected') {
+      await store.recordSessionTarget({ callsign: target.toUpperCase(), frequencyHz });
+    }
 
     sendJson(ctx.res, 200, {
       result: report.result,
@@ -1210,6 +1621,24 @@ export function createApi(services: ApiServices): {
       bandwidthHz: report.dial?.connectedBandwidthHz ?? bandwidthHz,
       rig,
     });
+  });
+
+  /**
+   * The gateways this station has called, most used first (decision 44). Not a setting: the
+   * list is built from what the station did, so a gateway typed in from a bulletin appears
+   * without anyone having to enter it twice.
+   */
+  router.add('GET', '/api/session/targets', async (ctx) => {
+    requireLogin(ctx);
+    const rows = await store.listSessionTargets(20);
+    sendJson(ctx.res, 200, {
+      targets: rows.map((row) => ({
+        callsign: row.callsign,
+        frequencyHz: row.frequencyHz,
+        uses: row.uses,
+        lastUsedAt: row.lastUsedAt,
+      })),
+    } satisfies SessionTargetsResponse);
   });
 
   /** What the session screen needs to offer a choice before a session exists. */
@@ -1244,7 +1673,7 @@ export function createApi(services: ApiServices): {
   }
 
   router.add('GET', '/api/postoffice/status', async (ctx) => {
-    requireLogin(ctx);
+    requirePostOffice(ctx);
     sendJson(ctx.res, 200, await postOfficeStatus());
   });
 
@@ -1255,7 +1684,7 @@ export function createApi(services: ApiServices): {
    * refuses it (R4.4.05).
    */
   router.add('POST', '/api/postoffice/arm', async (ctx) => {
-    const authed = requireLogin(ctx);
+    const authed = requirePostOffice(ctx);
     requireCsrf(ctx);
     const body = await readJson<ArmPostOfficeRequest>(ctx.req);
 
@@ -1298,23 +1727,13 @@ export function createApi(services: ApiServices): {
         frequencyHz: 'invalid',
       });
     }
-    if (modem.transceiverId === null) {
-      throw new HttpError(409, 'the modem has no transceiver assigned, so the dial cannot be set', {
-        transceiverId: 'missing',
-      });
-    }
-    const radio = await store.getTransceiver(modem.transceiverId);
-    if (!radio) {
-      throw new HttpError(400, 'the modem names a transceiver that no longer exists', {
-        modemId: 'stale',
-      });
-    }
+    const radio = await radioForModem(modem);
     try {
       await links.tune(radio.id, frequencyHz, modem.rigMode);
     } catch (error) {
       throw new HttpError(
         409,
-        `the transceiver ${radio.name} is not connected: ${error instanceof Error ? error.message : String(error)}`,
+        `the radio ${radioLabel(radio)} is not connected: ${error instanceof Error ? error.message : String(error)}`,
         { transceiverId: 'offline' },
       );
     }
@@ -1344,7 +1763,7 @@ export function createApi(services: ApiServices): {
   });
 
   router.add('POST', '/api/postoffice/disarm', async (ctx) => {
-    const authed = requireLogin(ctx);
+    const authed = requirePostOffice(ctx);
     requireCsrf(ctx);
     await postOffice.disarm();
     logger.info('post office disarm', { by: authed.user.callsign });

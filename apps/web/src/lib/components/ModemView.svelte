@@ -10,6 +10,7 @@
 		MODEM_KINDS,
 		RIG_MODES,
 		modemKindInfo,
+		modemPortsOf,
 		type Modem,
 		type ModemKind,
 		type Transceiver
@@ -23,6 +24,8 @@
 	 * Mercury share the same ports — which program answered.
 	 */
 	let statuses = $state<Record<number, ModemStatus>>({});
+	/** LAN names of the modem hosts, when a name service answers (decision 42). */
+	let names = $state<Record<string, string | null>>({});
 	let radios = $state<Transceiver[]>([]);
 	let loading = $state(true);
 	let error = $state('');
@@ -30,24 +33,39 @@
 	let busy = $state(false);
 
 	let editingId = $state<number | null>(null);
+	/** Which tile is open; one at a time, because the details are read, not compared. */
+	let openId = $state<number | null>(null);
 	let name = $state('');
 	let kind = $state<ModemKind>('ardop');
 	let host = $state('127.0.0.1');
-	let commandPort = $state('');
-	let dataPort = $state('');
-	let kissPort = $state('');
+	/** The port fields as typed; which of them exist is the kind's business. */
+	let ports = $state<Record<'commandPort' | 'dataPort' | 'kissPort', string>>({
+		commandPort: String(modemKindInfo('ardop').commandPort ?? ''),
+		dataPort: String(modemKindInfo('ardop').dataPort ?? ''),
+		kissPort: String(modemKindInfo('ardop').kissPort ?? '')
+	});
 	let rigMode = $state('PKTUSB');
-	let transceiverId = $state<string>('');
 	let fields = $state<Record<string, string>>({});
 
 	onMount(() => {
 		void load();
 		void checkRunning();
+		void loadNames();
 		// A modem can be started or stopped while this page is open; a plain TCP probe
 		// costs nothing and keeps the state honest.
 		const timer = setInterval(() => void checkRunning(), 10_000);
 		return () => clearInterval(timer);
 	});
+
+	/** Names arrive on their own: the tile draws the address first and fills the name in. */
+	async function loadNames(): Promise<void> {
+		try {
+			const answer = await api.hostNames();
+			names = answer.names;
+		} catch {
+			/* a name is decoration; the address is the truth */
+		}
+	}
 
 	async function checkRunning(): Promise<void> {
 		try {
@@ -58,21 +76,19 @@
 		}
 	}
 
-	/** `running`, `not running`, or `?` while the answer is unknown. */
+	/** `active`, `unavailable`, or `?` while the answer is unknown. */
 	function stateWord(id: number): string {
 		const state = statuses[id];
 		if (!state) return '?';
-		return state.running ? 'running' : 'not running';
+		return state.running ? 'active' : 'unavailable';
 	}
 
 	/** What the port named itself, in the operator's words. */
-	function answerLine(id: number): string {
-		const state = statuses[id];
-		if (!state || !state.reportedKind) return '';
-		return `answers as ${modemKindInfo(state.reportedKind).label}${state.reportedVersion ? ` · ${state.reportedVersion}` : ''}`;
-	}
 
 	const kindInfo = $derived(modemKindInfo(kind));
+
+	/** The ports this kind has, in the order the form shows them. */
+	const kindPorts = $derived(modemPortsOf(kind));
 
 	async function load(): Promise<void> {
 		loading = true;
@@ -91,9 +107,11 @@
 	/** A new modem arrives with the vendor's own port numbers filled in. */
 	function applyKindDefaults(next: ModemKind): void {
 		const info = modemKindInfo(next);
-		commandPort = info.commandPort === null ? '' : String(info.commandPort);
-		dataPort = info.dataPort === null ? '' : String(info.dataPort);
-		kissPort = info.kissPort === null ? '' : String(info.kissPort);
+		ports = {
+			commandPort: info.commandPort === null ? '' : String(info.commandPort),
+			dataPort: info.dataPort === null ? '' : String(info.dataPort),
+			kissPort: info.kissPort === null ? '' : String(info.kissPort)
+		};
 		rigMode = info.rigMode;
 	}
 
@@ -103,7 +121,6 @@
 		kind = 'ardop';
 		host = '127.0.0.1';
 		applyKindDefaults('ardop');
-		transceiverId = '';
 		fields = {};
 	}
 
@@ -112,12 +129,24 @@
 		name = modem.name;
 		kind = modem.kind;
 		host = modem.host;
-		commandPort = modem.commandPort === null ? '' : String(modem.commandPort);
-		dataPort = modem.dataPort === null ? '' : String(modem.dataPort);
-		kissPort = modem.kissPort === null ? '' : String(modem.kissPort);
+		ports = {
+			commandPort: modem.commandPort === null ? '' : String(modem.commandPort),
+			dataPort: modem.dataPort === null ? '' : String(modem.dataPort),
+			kissPort: modem.kissPort === null ? '' : String(modem.kissPort)
+		};
 		rigMode = modem.rigMode;
-		transceiverId = modem.transceiverId === null ? '' : String(modem.transceiverId);
 		fields = {};
+	}
+
+	/**
+	 * What a modem is called when the form does not ask: the protocol, then where it listens.
+	 * The name is still what sessions and the record list use, so it is built from the facts
+	 * the form does collect — protocol, host, first port — and cannot silently repeat.
+	 */
+	function composedName(): string {
+		const first = ports.commandPort.trim() || ports.dataPort.trim() || ports.kissPort.trim();
+		const where = host.trim();
+		return first ? `${kindInfo.label} ${where}:${first}` : `${kindInfo.label} ${where}`;
 	}
 
 	function portValue(text: string): number | null {
@@ -133,14 +162,13 @@
 		notice = '';
 		fields = {};
 		const body = {
-			name: name.trim(),
+			name: editingId === null ? composedName() : name.trim(),
 			kind,
 			host: host.trim(),
-			commandPort: portValue(commandPort),
-			dataPort: portValue(dataPort),
-			kissPort: portValue(kissPort),
-			rigMode,
-			transceiverId: transceiverId ? Number(transceiverId) : null
+			commandPort: portValue(ports.commandPort),
+			dataPort: portValue(ports.dataPort),
+			kissPort: portValue(ports.kissPort),
+			rigMode
 		};
 		// A port that is neither a number nor empty is caught here, before the server
 		// has to explain it.
@@ -179,9 +207,26 @@
 		}
 	}
 
+	/** The interface the station currently uses: the one the header shows (decision 40). */
+	function currentRadio(): Transceiver | null {
+		return radios.reduce<Transceiver | null>(
+			(best, row) =>
+				best === null || row.lastUsedAt > best.lastUsedAt || (row.lastUsedAt === best.lastUsedAt && row.id > best.id)
+					? row
+					: best,
+			null
+		);
+	}
+
+	/**
+	 * The radio as the modem sees it: the model rigctld named, or the address it answers at.
+	 * A modem that names none takes the current interface, so the tile shows the radio that
+	 * will actually be tuned (decision 43).
+	 */
 	function radioName(id: number | null): string {
-		if (id === null) return '—';
-		return radios.find((radio) => radio.id === id)?.name ?? `#${id}`;
+		const radio = id === null ? currentRadio() : (radios.find((entry) => entry.id === id) ?? null);
+		if (!radio) return id === null ? 'current interface' : `#${id}`;
+		return radio.link.rig?.model ?? `${radio.host}:${radio.port}`;
 	}
 </script>
 
@@ -199,71 +244,82 @@
 	{#if notice}<p class="notice" role="status">{notice}</p>{/if}
 	{#if error}<p class="alert" role="alert">{error}</p>{/if}
 
-	<table class="table">
-		<thead>
-			<tr>
-				<th>State</th>
-				<th>Name</th>
-				<th>Type</th>
-				<th>Address</th>
-				<th>Ports</th>
-				<th>Transceiver</th>
-				<th>Rig mode</th>
-				<th></th>
-			</tr>
-		</thead>
-		<tbody>
-			{#each modems as modem (modem.id)}
-				<tr>
-					<td>
-						<span
-							class="led"
-							class:on={statuses[modem.id]?.running === true}
-							class:off={statuses[modem.id]?.running === false}
-							title={statuses[modem.id]?.running
-								? 'the command port answers'
-								: 'nothing is listening on the command port'}
-						></span>
-						<span class="state-word">{stateWord(modem.id)}</span>
-						{#if answerLine(modem.id)}
-							<span class="answers" class:mismatch={statuses[modem.id]?.mismatch}>{answerLine(modem.id)}</span>
+	<!-- One tile per modem: what it is, where it runs, whether it is there. The rest of the
+	     record — the other ports, the radio, the mode — is in the detail below the tile. -->
+	<div class="tiles">
+		{#each modems as modem (modem.id)}
+			{@const state = statuses[modem.id]}
+			<button
+				class="tile"
+				class:down={state?.running === false}
+				type="button"
+				aria-label={modem.name}
+				aria-expanded={openId === modem.id}
+				onclick={() => (openId = openId === modem.id ? null : modem.id)}
+			>
+				<span class="line">
+					<span
+						class="led"
+						class:on={state?.running === true}
+						class:off={state?.running === false}
+						title={state?.running ? 'the modem answers as its kind' : (state?.error ?? 'nothing is listening on the command port')}
+					></span>
+					<span class="proto">{modemKindInfo(modem.kind).label}</span>
+					<span class="state">{stateWord(modem.id)}</span>
+				</span>
+				<span class="line2 mono">
+					{#if names[modem.host]}<strong class="lan">{names[modem.host]}</strong> · {/if}{modem.host}
+				</span>
+				<span class="line3">
+					{#each modemPortsOf(modem.kind).filter((port) => modem[port.field] !== null) as port (port.field)}
+						<span class="port">
+							<span class="pname">{port.label}</span>
+							{modem[port.field]}
+							<span class="wire" title={port.transport === 'TCP' ? 'TCP' : 'UDP'}>
+								{port.transport === 'TCP' ? 't' : 'u'}
+							</span>
+						</span>
+					{/each}
+				</span>
+			</button>
+
+			{#if openId === modem.id}
+				<div class="details">
+					<dl>
+						{#each modemPortsOf(modem.kind) as port (port.field)}
+							{#if modem[port.field] !== null}
+								<dt>{port.label} port ({port.transport})</dt>
+								<dd class="mono">{modem[port.field]}</dd>
+							{/if}
+						{/each}
+						<dt>Radio</dt>
+						<dd>{radioName(modem.transceiverId)}</dd>
+						<dt>Rig mode</dt>
+						<dd class="mono">{modem.rigMode}</dd>
+						{#if state?.error}
+							<dt>Last answer</dt>
+							<dd class="failure">{state.error}</dd>
 						{/if}
-					</td>
-					<td>{modem.name}</td>
-					<td>{modemKindInfo(modem.kind).label}</td>
-					<td class="mono">{modem.host}</td>
-					<td class="mono ports">
-						{#if modem.commandPort !== null}<span>cmd {modem.commandPort}</span>{/if}
-						{#if modem.dataPort !== null}<span>data {modem.dataPort}</span>{/if}
-						{#if modem.kissPort !== null}<span>kiss {modem.kissPort}</span>{/if}
-					</td>
-					<td>{radioName(modem.transceiverId)}</td>
-					<td class="mono">{modem.rigMode}</td>
-					<td class="actions">
+					</dl>
+					<div class="actions">
 						<button class="btn ghost small-btn" type="button" onclick={() => edit(modem)}>Edit</button>
-						<button class="btn ghost small-btn" type="button" disabled={busy} onclick={() => void remove(modem)}>
+						<button class="btn ghost small-btn danger" type="button" disabled={busy} onclick={() => void remove(modem)}>
 							Delete
 						</button>
-					</td>
-				</tr>
-			{:else}
-				<tr><td colspan="8" class="empty">{loading ? 'Loading…' : 'No modem configured yet.'}</td></tr>
-			{/each}
-		</tbody>
-	</table>
+					</div>
+				</div>
+			{/if}
+		{:else}
+			<p class="empty">{loading ? 'Loading…' : 'No modem configured yet.'}</p>
+		{/each}
+	</div>
 
 	<section class="form-section">
 		<h3>{editingId === null ? 'Add a modem' : `Edit ${name || 'modem'}`}</h3>
 		<form onsubmit={save}>
 			<div class="fields">
 				<label class="field">
-					<span>Name</span>
-					<input type="text" name="name" bind:value={name} placeholder="VARA 40 m" required />
-					{#if fields['name']}<em class="error">{fields['name']}</em>{/if}
-				</label>
-
-				<label class="field">
-					<span>Type</span>
+					<span>Protocol</span>
 					<select
 						name="kind"
 						bind:value={kind}
@@ -284,36 +340,24 @@
 					{#if fields['host']}<em class="error">{fields['host']}</em>{/if}
 				</label>
 
-				<label class="field narrow">
-					<span>Command port</span>
-					<input type="text" name="commandPort" bind:value={commandPort} placeholder="8515" inputmode="numeric" />
-					{#if fields['commandPort']}<em class="error">{fields['commandPort']}</em>{/if}
-				</label>
-
-				<label class="field narrow">
-					<span>Data port</span>
-					<input type="text" name="dataPort" bind:value={dataPort} placeholder="—" inputmode="numeric" />
-					{#if fields['dataPort']}<em class="error">{fields['dataPort']}</em>{/if}
-				</label>
-
-				<label class="field narrow">
-					<span>KISS port</span>
-					<input type="text" name="kissPort" bind:value={kissPort} placeholder="—" inputmode="numeric" />
-					{#if fields['kissPort']}<em class="error">{fields['kissPort']}</em>{/if}
-				</label>
+				<fieldset class="ports">
+					<legend>Ports</legend>
+					{#each kindPorts as port (port.field)}
+						<label class="port-row">
+							<span>{port.title}{port.transport === 'UDP' ? ' (UDP)' : ''}</span>
+							<input
+								type="text"
+								name={port.field}
+								bind:value={ports[port.field]}
+								placeholder="—"
+								inputmode="numeric"
+							/>
+						</label>
+						{#if fields[port.field]}<em class="error port-error">{fields[port.field]}</em>{/if}
+					{/each}
+				</fieldset>
 
 				<label class="field">
-					<span>Transceiver</span>
-					<select name="transceiverId" bind:value={transceiverId}>
-						<option value="">— none —</option>
-						{#each radios as radio (radio.id)}
-							<option value={String(radio.id)}>{radio.name}</option>
-						{/each}
-					</select>
-					{#if fields['transceiverId']}<em class="error">{fields['transceiverId']}</em>{/if}
-				</label>
-
-				<label class="field narrow">
 					<span>Transceiver mode</span>
 					<select name="rigMode" bind:value={rigMode}>
 						{#each RIG_MODES as mode (mode)}
@@ -364,37 +408,90 @@
 		max-width: 68ch;
 	}
 
-	.table {
+	.tiles {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr));
+		gap: 0.5rem;
 		margin-top: 1rem;
-		border-collapse: collapse;
-		font-size: 0.9rem;
+		max-width: 62rem;
 	}
 
-	.table th {
+	/* Three lines: protocol and LED, the address, then the three ports in their own columns. */
+	.tile {
+		display: flex;
+		flex-direction: column;
+		gap: 0.1rem;
+		padding: 0.45rem 0.7rem;
+		border: 1px solid var(--line);
+		border-radius: 10px;
+		background: var(--bg-panel);
+		color: var(--fg);
+		font: inherit;
 		text-align: left;
-		font-weight: 500;
+		cursor: pointer;
+	}
+
+	.tile:hover {
+		border-color: color-mix(in oklab, var(--accent) 40%, var(--line));
+	}
+
+	.tile.down {
+		border-color: color-mix(in oklab, var(--danger) 35%, var(--line));
+	}
+
+	.line {
+		display: flex;
+		align-items: center;
+		gap: 0.4rem;
+	}
+
+	.proto {
+		font-weight: 600;
+		font-size: 0.88rem;
+	}
+
+	.line2 {
+		font-size: 0.78rem;
 		color: var(--muted);
-		font-size: 0.72rem;
-		text-transform: uppercase;
-		letter-spacing: 0.03em;
-		padding: 0.3rem 0.6rem;
-		border-bottom: 1px solid var(--line);
+	}
+
+	/* The machine's name, when a name service answered; the address stays beside it. */
+	.lan {
+		font-weight: 600;
+		color: var(--text);
+	}
+
+	.line3 {
+		display: flex;
+		justify-content: space-between;
+		gap: 0.6rem;
+		font-size: 0.74rem;
+		color: var(--muted);
+		font-variant-numeric: tabular-nums;
+	}
+
+	.port {
+		display: flex;
+		align-items: baseline;
+		gap: 0.22rem;
 		white-space: nowrap;
 	}
 
-	.table td {
-		padding: 0.35rem 0.6rem;
-		border-bottom: 1px solid color-mix(in oklab, var(--line) 45%, transparent);
-		white-space: nowrap;
+	.pname {
+		font-size: 0.64rem;
+		letter-spacing: 0.04em;
+		color: var(--faint);
 	}
 
-	.table th:first-child,
-	.table td:first-child {
-		padding-left: 0;
+	.wire {
+		font-size: 0.62rem;
+		letter-spacing: 0.02em;
+		color: var(--faint);
 	}
 
-	.ports span + span::before {
-		content: '· ';
+	.state {
+		margin-left: auto;
+		font-size: 0.7rem;
 		color: var(--muted);
 	}
 
@@ -403,7 +500,7 @@
 		width: 8px;
 		height: 8px;
 		border-radius: 50%;
-		margin-right: 0.35rem;
+		flex: 0 0 auto;
 		background: var(--muted);
 	}
 
@@ -415,25 +512,36 @@
 		background: var(--danger);
 	}
 
-	.state-word {
-		font-size: 0.78rem;
+	.details {
+		margin: -0.2rem 0 0.3rem 1.4rem;
+		padding: 0.6rem 0.9rem;
+		border-left: 2px solid var(--line);
+	}
+
+	.details dl {
+		display: grid;
+		grid-template-columns: 8rem 1fr;
+		row-gap: 0.25rem;
+		margin: 0;
+		font-size: 0.84rem;
+	}
+
+	.details dt {
 		color: var(--muted);
 	}
 
-	/* What the port said it is; red when it is not what this record claims. */
-	.answers {
-		display: block;
-		font-size: 0.72rem;
-		color: var(--faint);
+	.details dd {
+		margin: 0;
 	}
 
-	.answers.mismatch {
+	.failure {
 		color: var(--danger);
 	}
 
 	.actions {
 		display: flex;
-		gap: 0.3rem;
+		gap: 0.35rem;
+		margin-top: 0.6rem;
 	}
 
 	.form-section {
@@ -447,9 +555,10 @@
 	}
 
 	.fields {
-		display: grid;
-		grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
-		gap: 0.75rem;
+		display: flex;
+		flex-direction: column;
+		gap: 0.7rem;
+		max-width: 24rem;
 	}
 
 	.field {
@@ -459,8 +568,42 @@
 		color: var(--muted);
 	}
 
-	.field.narrow {
-		max-width: 9rem;
+	/* The port table: the function on the left, the value on the right, one row per port. */
+	.ports {
+		display: grid;
+		gap: 0.4rem;
+		margin: 0;
+		padding: 0.5rem 0.7rem 0.7rem;
+		border: 1px solid var(--line);
+		border-radius: 8px;
+	}
+
+	.ports legend {
+		padding: 0 0.3rem;
+		font-size: 0.7rem;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		color: var(--faint);
+	}
+
+	.port-row {
+		display: grid;
+		grid-template-columns: 1fr 7rem;
+		align-items: center;
+		gap: 0.6rem;
+		font-size: 0.8rem;
+		color: var(--muted);
+	}
+
+	.port-row input {
+		font: inherit;
+		font-size: 0.9rem;
+		color: var(--fg);
+		background: var(--bg);
+		border: 1px solid var(--line);
+		border-radius: 7px;
+		padding: 0.35rem 0.5rem;
+		font-variant-numeric: tabular-nums;
 	}
 
 	.field input,

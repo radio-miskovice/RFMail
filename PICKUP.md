@@ -24,8 +24,13 @@ stripped on receipt, `winlink.org` only. The callsign *is* the account and the l
 with AES-256-GCM under a `store_key` separate from the session secret. Any account
 may configure the station's radios, modems and sessions (decision 14).
 
-**Radio.** Transceivers in the store, rigctld links with the grey/amber/green/red
-LED, the rear-versus-front PTT choice a TS-590 needs for a modem, explicit reset.
+**Radio.** Interfaces, one per rigctld: each is a small tile with `host:port` and its LED on
+the first line and the transceiver it serves on the second, and everything else — the
+serial line, the dial, the filter, the transmit connector, the power, and the switch that
+turns the interface off — opens under the click. The station dials every enabled interface
+and keeps it dialled; the one used last is remembered in the database (`last_used_at`) and is
+the one the header follows. The serial device and speed are noted by the operator, because
+the daemon cannot be asked for them.
 
 **Sessions.** The Winlink catalogue (`api.winlink.org/gateway/status.json`) is
 fetched with the public client key, cached beside the database with the set of
@@ -34,7 +39,9 @@ distance and bearing from the locator, plus two estimates. Ordering by distance 
 by the estimate; VHF and up carry no estimate at all.
 
 **Modems.** A registry (type, host, command/data/KISS ports, transceiver, rig mode)
-and a live check that shows whether each one is actually listening.
+and a live check that shows whether each one is actually there: one small tile per modem —
+protocol and LED, the address, then command, data and KISS port in three columns — with
+the labelled ports, the radio, the mode and the reason it is unavailable under the click.
 
 **Post office — new.** A station can now answer calls instead of only making them:
 `packages/server/src/postoffice.ts` arms one modem (`MYCALL`, `LISTEN ON`, the command
@@ -92,8 +99,9 @@ HOME="$T/home" node apps/backend/src/main.ts --config "$T/rfmail.toml" --log inf
 ```
 
 * UI <http://192.168.133.207:8082>
-* POP3 1110, SMTP 1025, IMAP 1143, all on `0.0.0.0`, access `strict` with
-  `192.168.132.0/23`
+* POP3 1110, SMTP 1025, IMAP 1143 are configured on `0.0.0.0` but **not listening**:
+  the station is a Winlink client and has no post office owner, so the mail interfaces
+  stay down (decision 31). Access is `strict` with `192.168.132.0/23`.
 * config `$T/rfmail.toml`; database `$T/home/.local/share/rfmail/rfmail.db`, schema
   v7 (migration 007 copied each callsign into its login)
 * accounts OK1ABC (admin, **no mail password**), OK4RM, OK2XYZ (has a password set
@@ -224,7 +232,7 @@ Not proven, in order of how much it matters:
 * **19** An accepted message, and one the peer already holds, both move OUTBOX →
   SENT: from the station's point of view both are delivered. A deferred one stays in
   OUTBOX — "ask me again" is not "sent".
-* **20** The SID this station sends is `[rfmail-0.1-B2FHM$]`, with `G` before the `$`
+* **20** The SID this station sends is `[RF Mail-0.1-B2FHM$]`, with `G` before the `$`
   when gzip is offered (`B2FHMG$`). `$` is last by the protocol; the earlier helper
   had it wrong.
 * **21** A secure-login challenge with no Winlink password set fails the session
@@ -318,3 +326,205 @@ Not proven, in order of how much it matters:
 * **28** The post office's duplicate check is the station's and matches only mail that
   arrived: a MID in somebody's OUTBOX is a message this station is sending, and
   answering `-` for it would lose the peer's message. (R4.4.3)
+* **29** POP3, SMTP and IMAP are one door: one lamp in the header — green when all three
+  listen, orange when some do, dark red when none does — and one popup holding the
+  addresses, the states and a switch on each. The switches are runtime, not configuration:
+  the file decides which protocols exist, a restart returns to it, and a protocol the file
+  does not offer has a disabled switch rather than no row. A bind that fails is reported on
+  its row and never stops the station. The door is the post office's (decision 31).
+  (R7.3, R7.8)
+* **30** The access mode — who may reach the station at all — is `strict` (loopback and the
+  configured CIDRs) or `very strict` (loopback alone), and it is enforced on every accepted
+  connection: the HTTP API and web UI included, not only the mail doors. The policy object
+  is mutable but validates a change as a whole (`set()`), so a bad form cannot leave the
+  station half-open. The change applies to the next connection and is runtime: the file
+  decides again at the next start. The validation is start-up's (a CIDR must parse,
+  `strict` needs one), and a rejected change leaves the running policy untouched. The client
+  UI shows none of it (decision 33); the API and the file are where it lives now. (R7.3, R7.8)
+* **31** The station is either a Winlink client or a post office, and the mail-access
+  interfaces are the post office's: they serve mail programs, which only a post office has.
+  At start-up they open only when the station has a post office owner; with no owner the
+  station is a client, nothing listens on POP3, SMTP or IMAP, and the switches refuse to
+  start one — stopping is always allowed, so an interface left listening can be closed even
+  after the owner is unseated. Until post office work resumes no account is the owner, so
+  nothing starts them. (R7.3, R4.4.3)
+* **32** The seat is chosen at the door, not by the account: when the post office returns,
+  the sign-in form will carry a "post office owner" box, and only a session opened with it
+  renders the post office screen or reaches its API. There is no per-user switch and no
+  route that appears because of what the account happens to be. At this stage the form
+  offers no such option at all — a box that cannot be ticked is worse than no box — and the
+  server answers `409` if the seat is asked for anyway, so today every login is an RF Mail
+  client login. A client session carries `postOffice: false`, and the client UI says nothing
+  at all about POP3, SMTP or IMAP, or about the access policy: no lamp, no addresses, no
+  switches. A client has its mailboxes and its radio sessions, and that is the whole
+  application. (R7.2, R7.8)
+* **33** The client UI shows no access policy either: no lamp, no mode, no CIDRs, not even
+  on the sign-in page. The policy is a station-role fact — it decides who may reach the
+  server's doors, and the mail doors are the post office's — so it belongs to the post office
+  screen when that returns. Until then it is set in the configuration file and enforced on
+  every connection, the web UI included; the API keeps `GET`/`POST /api/network/access`
+  because enforcement needs the policy and the tests pin the behaviour.
+* **34** In client mode an account is made by its owner at the sign-in page: the callsign
+  and the Winlink password, nothing else. The Winlink password is required because it is
+  the one credential the station cannot invent — it answers a peer's `;PQ` challenge — and
+  it is sealed with the store key, never hashed and never returned. The callsign is the
+  login and no local password is set here, so the callsign alone signs in until its owner
+  sets one on the account page. One callsign, one mailbox: a second attempt is refused
+  (`409`), a created account is never the post office, and creations from one address are
+  rate-limited (five per ten minutes). The account is signed in as soon as it is made.
+  (R7.2)
+* **35** An account with no Winlink password is **non-WL**, and the session screen offers it
+  only what it can use: no RMS gateway list, no "Winlink RMS gateway" or "Post office"
+  session type, and a peer-to-peer call to a station it names as the one way out. The reason
+  stands where the list would be, and the screen's own lede changes to match. The flag is
+  shown where the fact lives — beside the Winlink password on the account page, and beside
+  the callsign in the accounts list — and nothing is withheld from an account that has the
+  password. (R8.5)
+* **36** A Winlink session always presents `RMS Express-1.8.6.0` in its SID. A production
+  CMS refuses a client type it does not know — measured against HB9AK on 25 Nov 2026, where
+  our own SID was answered "Unknown client types are not allowed on production servers" —
+  so the server sets the identity for every `cms` session. Both identities are kept: `RF Mail`
+  is the station's own name, sent to every peer and to a post office, and the one to use
+  again when Winlink knows it; `RMS Express` is what the real RMS infrastructure demands.
+  The operator chooses neither — there is no checkbox and no text field for it, because the
+  identity is a property of the mode, and the debug switch that offered a choice is gone.
+  The claim is the SID's client field alone: the callsign, the greeting and the exchange are
+  the station's own. (R4.3.1)
+* **37** The station has one radio interface, and the operator sets nothing about the rig
+  itself: `rigctld`, an address (empty means `localhost`) and a port (empty means 4532).
+  Everything else on the Radio screen is read from the daemon — `\get_rig_info` for the
+  model, the current VFO's frequency, mode and filter width, `\dump_caps` for the control
+  interface and the speeds it accepts, `\get_level RFPOWER` for the power setting — because a
+  second copy of facts the rig already knows is a second copy to get wrong. The station dials
+  at start-up, polls every five seconds and keeps the link open; a link that fails is retried
+  every fifteen seconds, not in a tight loop, and comes back by itself when the daemon does.
+  The LED is the radio-to-rigctld side: rigctld can be reachable while the rig is silent, so
+  a TCP connection alone is not shown as green. The exact device and speed are rigctld's own
+  `-r` and `-s` and are not reported by the protocol at all: `\dump_caps` gives the interface
+  the model offers and the range of speeds it takes, never the configured pair, so the screen
+  stopped printing that range and records the real one instead (decision 39).
+  The transmit-connector choice (R2.2.1) left the old form and came back as a control on
+  this card: it is stored with the interface, applied to the live link without reopening the
+  socket, and a new interface is created with `auto` — rear input where the rig can select
+  it, plain PTT where it cannot. The transmitter power is a control too (`\set_level
+  RFPOWER`), written straight to the rig and read back, so what the slider shows is the level
+  the radio reports rather than the level that was asked for; a link that is down refuses to
+  pretend. `PATCH /api/radio` carries both. The model is not a field anywhere: rigctld
+  decides it when it is started, so a typed name could only ever agree with the rig by luck,
+  and the stored `name` is now an internal row label that no screen shows. Sentences that
+  named the radio call it by the model, or by the address until the daemon has answered.
+  (R2.2)
+* **38** A modem is **active** only when the program on its port is the kind it is configured
+  as, and **unavailable** otherwise — whatever the socket did. VARA, XARA, Data2G and Mercury
+  share ports, and a VARA record served by Data2G answers TCP cheerfully while having no VARA
+  in it; calling that "running" told the operator a session could start when it could not.
+  The `VERSION` reply decides, and the reason names the program that answered; the screen keeps
+  one word — active or unavailable — because a name-and-version line beside the record's own
+  type told the operator nothing they could act on. The same rule covers every kind, not
+  only VARA: the kind that answers is not the kind that was configured. (R3.11.1)
+* **39** The serial line is recorded, not read. `\dump_caps` answers with the rig model's port
+  type and the range of speeds it accepts, never the device rigctld was started with or the
+  speed it actually uses — measured against Hamlib 4.6.3, whose `\get_rig_info`, `\dump_caps`
+  and `\dump_state` carry neither. A range printed as if it were the setting is worse than no
+  line at all, so the interface form takes the device and speed as two optional notes
+  (`serial_port`, `serial_speed`), the tile shows them when they are there, and nothing is
+  invented when they are not. The same discipline gives the screens their shape: one tile per
+  radio (model, host, state) and one per modem (protocol, `host:port`, state), with the detail
+  — dial, filter, serial line, ports, radio, mode, the two rig settings — opening under the
+  click, because a table of everything is a table nobody reads. (R2.2, R3.11)
+* **40** A station may have several rigctld interfaces, one tile each: `host:port` and LED on
+  the first line, the transceiver it serves on the second, and the rest under the click. Each
+  is switched on or off on its own, and every enabled interface is dialled and kept dialled.
+  Which one the station treats as *current* — the header chip, the screen's default — is a
+  fact, not a setting: `last_used_at` on the interface row, bumped when it is created, edited,
+  opened or selected, ties broken by the newer row. That is what "the previously used
+  interface is remembered in the database" means here, and it needs no setting table. The
+  older name-based registry ordering went with it: the list keeps a stable order so tiles do
+  not jump when they are clicked, and the current one is chosen by time. (R2.2)
+* **41** A modem's three ports are named by the modem, not by the station. VARA, ARDOP, XARA,
+  Data2G and Mercury use **CMD**, **DATA** and **KISS**, all TCP; the tile prints each prefix
+  with the number and one letter for the transport (`t`, `u`), so a KISS port on TCP is never
+  confused with Direwolf's sound port. Direwolf is a different animal behind similar names:
+  **KISS** (TCP) and **AGW** (the AGWPE interface, TCP with a different command set) are
+  command interfaces, and **SND** (also called AUX) carries the channel audio over **UDP**. It
+  is registered as a kind with those three ports and the vendor defaults 8001 (KISS), 8000
+  (AGW) and 7355 (SND, UDP); it is judged "active" by its AGW port answering TCP, because no
+  Direwolf interface answers `VERSION` and the kind-mismatch rule of decision 38 has nothing to
+  compare. A session driver for packet radio is not built, so a Direwolf modem runs no session
+  yet. A record created without ports takes the kind's own numbers on the server as well, so
+  the form and an API client agree. (R3.11)
+* **42** The interface tile shows the machine's LAN name beside the address, and the station
+  asks two services to get it. NetBIOS first — a NBSTAT query to UDP 137, which is what a
+  Windows PC answers with its computer name (measured on this LAN: 192.168.133.222 answers
+  QUANTUM-Q1, workgroup MISKOVICE, MAC 4C-52-62-25-7D-A5) — then an mDNS PTR for
+  `<reversed>.in-addr.arpa` with the unicast-response bit set, which covers a Mac or a Linux
+  box publishing `.local`. Plain reverse DNS is not asked: the router does not register DHCP
+  names, so `getent hosts 192.168.133.222` returns nothing while the two LAN services both
+  answer. Neither query may hold a page: the registry is drawn first and `/api/hostnames`
+  fills the names in afterwards, a hit is cached for ten minutes and a miss for one, and a
+  host that answers neither simply keeps its address. Nothing is written to the interface
+  record, because the name belongs to the network, not to the configuration. The tile puts the
+  name first — bold, with `:port` in normal weight after it — then the address, then the
+  transceiver; a modem tile carries the same pair above its ports, and `/api/hostnames` covers
+  every host in the registry, radios and modems alike. (R2.2.2)
+* **43** The modem form asks four things downwards and nothing else: the protocol, the address,
+  the ports that protocol has, and the transceiver mode. The ports are a two-column table —
+  function on the left, number on the right — and it is rebuilt when the protocol changes, so
+  the form never offers a KISS port to a VARA, whose kind has none, and never leaves the
+  vendor's numbers for the operator to look up: VARA/VARA FM/XARA 8300 and 8301, ARDOP 8515 and
+  8516, Direwolf AGWPE 8000, KISS 8001 and the sound port 7355 over UDP. The name left the
+  form: the station composes it from the facts (`VARA HF 192.168.133.222:8300`), which is the
+  same tuple that makes two modems different. The transceiver left the form too, because the
+  station has one interface (decision 37) and a second field asking to name it invited a
+  question the operator cannot answer; a modem now names no radio, and a session tunes
+  whatever interface is current (decision 40), so the details panel shows the radio that will
+  actually be keyed. A modem created before this keeps the transceiver it named. (R3.11.2)
+* **44** The session screen keeps the gateways the station has called, as chips above the client
+  identity, and builds the list from what happened rather than from a setting. The key is the
+  pair — callsign on one dial — because the same gateway may be reachable on two bands and only
+  one of them works from here; case is not part of it. An entry is recorded when the dial
+  connects, not when it is attempted: a call that got no answer says nothing about the gateway,
+  and counting it would push a dead frequency up the list. Each use increments a counter, and
+  the chips are ordered by that counter, then by recency, so the gateway called every evening
+  sits first and a callsign tried once from a bulletin does not. This is the answer to the RMS
+  catalogue being the only way in: a pair typed by hand becomes a button on its first successful
+  session, and a non-WL account, which is offered no catalogue at all, still has a list. The chip
+  fills all four fields the way `pick()` does — target, dial, unit, band — so a favourite and a
+  listed channel are the same act. (R3.13)
+* **45** A session sets the dial and the mode, and nothing else. The station used to send
+  `\set_mode PKTUSB 0`, believing 0 meant "leave the passband alone"; in Hamlib 0 is
+  `RIG_PASSBAND_NORMAL`, so the daemon recomputed the rig's filter — on a TS-590S it moved the
+  width from 2000 Hz to 1000 Hz, measured — and re-centred the IF shift, which the operator had
+  set to 1500. With the IF shifted to 1100 the 2.5 kHz filter delivers 2.1 kHz, which is why a
+  2300 Hz mode stopped decoding. The station now sends `-1`, Hamlib's `RIG_PASSBAND_NOCHANGE`,
+  and skips the mode write entirely when the link's last read says the radio is already in that
+  mode, so a session that begins with the rig where the operator left it writes no filter, no
+  shift and no power. What a station may set is the dial and the mode; the filter width, the IF
+  shift and the power are the operator's, and the protocol has no way to ask him. The passband
+  is gone from the client's signature altogether — `setMode(mode)` cannot name one — because
+  2300 Hz is a modem's bandwidth (`BW2300`, `ARQBW`, on the modem's own port), never a rig
+  filter: a TS-590 has 500/1000/2000/2400, and a width it does not have makes Hamlib shift the
+  IF to fake it, which is exactly the meddling this removes. (R2.2.3)
+* **46** The station never asks rigctld for its capability dump. `\dump_caps` was the only
+  heavyweight request it made, and on this daemon it runs `rigctl_dump_state` — the block of
+  `unknown RIG_FUNC=` lines the operator saw twice at start-up — which is the path where a
+  Kenwood's settings get re-applied: the 5 W that appears at the first session after a connect
+  and the IF shift that lands at 1100 instead of 1500 are that path, not a `\set_*` of ours. The
+  screen needed nothing from it: the model comes from `\get_rig_info`'s `Rig=`, the Hamlib
+  version from its `App=` and `Version=`, and the port type and speed it listed were the model's
+  generic range, not the configured line — the line the operator records himself (decision 39).
+  What the station sends to the daemon is now a closed list: three reads per poll
+  (`\get_rig_info`, `\get_ptt`, `\get_level RFPOWER`) and, only when asked, `\set_freq`,
+  `\set_mode <mode> -1`, `\set_ptt` and `\set_level RFPOWER`. (R2.2.4)
+* **47** The screen shows the rig's own filter and IF shift, read with two fixed raw queries.
+  `w SH;` answers `SHnn;` — `SH05;` is the centred 1500 Hz — and `w SL;` answers `SLnn;`, the
+  filter in use. The ladder is the TS-590S's own for SSB and SSB-DATA: 00=50, 01=80, 02=100,
+  03=150, 04=200, 05=250, 06=300, 07=400, 08=500, 09=600, 10=1000, 11=1500, 12=2000, 13=2500 Hz;
+  a code outside it is unknown, never guessed from another mode's table. Hamlib's `Width=` is its
+  own idea of the passband and need not be the rig's filter (measured: `Width=2000` against
+  `SL13;`), which is why the old readout was wrong. The raw channel is the only one that can read these on a Kenwood,
+  and `w` writes as easily as it reads — so it appears exactly twice, with nothing after the
+  command letters and no parameter anywhere, and a test asserts that the whole wire traffic of
+  those two calls is `['w SH;', 'w SL;']`. The shift is reported as centred or, when it is not,
+  with the width it costs: 2500 Hz at `SH01;` passes 2100 Hz, which is the 2300 Hz mode's
+  passband gone. (R2.2.5)

@@ -2,7 +2,7 @@
 // stored procedures, no native ENUM, timestamps as epoch milliseconds in
 // INTEGER columns. Later dialect adapters reproduce this shape exactly.
 
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 11;
 
 export const MIGRATION_001 = `
 CREATE TABLE users (
@@ -189,4 +189,39 @@ export const MIGRATION_008 = `
 ALTER TABLE users ADD COLUMN post_office_secret TEXT;
 ALTER TABLE users ADD COLUMN is_post_office INTEGER NOT NULL DEFAULT 0;
 CREATE UNIQUE INDEX users_post_office_owner ON users (is_post_office) WHERE is_post_office = 1;
+`;
+
+// The serial line the daemon serves (decision 39). rigctld does not report the device it
+// was started with or the speed it uses — the capability dump gives the rig model's supported
+// range, never the configured value — so a station that wants to show the real line has to
+// be told it. Both columns are display facts: the station never opens a serial port.
+export const MIGRATION_009 = `
+ALTER TABLE transceivers ADD COLUMN serial_port TEXT;
+ALTER TABLE transceivers ADD COLUMN serial_speed INTEGER;
+`;
+
+// Which interface was used last (decision 40). A station may have several rigctld instances —
+// one per rig, or one per serial line — and the header has to show one of them. "Last used"
+// is a fact the station can keep without a setting table: it is bumped whenever an interface
+// is created, edited or switched on, and the most recent one is the current interface.
+export const MIGRATION_010 = `
+ALTER TABLE transceivers ADD COLUMN last_used_at INTEGER NOT NULL DEFAULT 0;
+`;
+
+// Which gateways this station has called, and how often (decision 44). The RMS catalogue is
+// not the whole of Winlink: an operator who types a callsign and a dial from a bulletin or a
+// sked has found a gateway the catalogue may not list, and the station should not make him
+// remember the number. The pair is the key — one gateway on two dials is two entries — and
+// `uses` is the rank: a gateway called every night outranks one tried once.
+export const MIGRATION_011 = `
+CREATE TABLE session_targets (
+  id           INTEGER PRIMARY KEY,
+  callsign     TEXT    NOT NULL,
+  frequency_hz INTEGER NOT NULL,
+  uses         INTEGER NOT NULL DEFAULT 1,
+  last_used_at INTEGER NOT NULL,
+  created_at   INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX session_targets_pair ON session_targets (callsign COLLATE NOCASE, frequency_hz);
+CREATE INDEX session_targets_rank ON session_targets (uses DESC, last_used_at DESC);
 `;

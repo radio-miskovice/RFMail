@@ -502,7 +502,7 @@ export class Session {
   private async sendHandshake(challenge: string): Promise<void> {
     await this.writeLine(forwarderLine(this.options.myCallsign, this.forwardersToAskFor().slice(1)));
     await this.writeLine(
-      localSid(this.options.application ?? 'rfmail', this.options.version ?? '0.1', this.sidFlags()),
+      localSid(this.options.application ?? 'RF Mail', this.options.version ?? '0.1', this.sidFlags()),
     );
     if (this.options.master === true && this.options.masterAuth) {
       // Sent before the greeting, as a CMS does: the client answers with `;PR:`

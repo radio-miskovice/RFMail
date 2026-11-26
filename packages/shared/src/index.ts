@@ -113,33 +113,198 @@ export interface MessageDetail extends MessageSummary {
   direction: 'in' | 'out';
 }
 
+/**
+ * The client type a Winlink session presents. Measured against a production CMS (HB9AK,
+ * 25 Nov 2026): it refuses a client type it does not know — "Unknown client types are not
+ * allowed on production servers" — and accepts RMS Express. The exchange is ours; the SID's
+ * client field is the only place the claim appears, and it costs nothing a peer can use
+ * against the station.
+ */
+export const WINLINK_CLIENT_IDENTITY = 'RMS Express-1.8.6.0';
+
+/** What rigctld reports about the radio behind it: its identity, its interface, its live readout. */
+export interface RadioRig {
+  model: string | null;
+  /** The Hamlib build answering, and its backend version. */
+  hamlib: string | null;
+  frequencyHz: number | null;
+  mode: string | null;
+  /** Filter width in hertz, when the rig reports one. */
+  filterHz: number | null;
+  /** The IF shift the rig reports in the data mode; 1500 Hz is centred. */
+  shiftHz: number | null;
+  /** `filterHz` minus how far the shift has moved off centre — what a centred signal can use. */
+  usableHz: number | null;
+  /** The RFPOWER setting as a fraction of the rig's maximum, 0…1. */
+  rfPower: number | null;
+  /** True when rigctld answered a query about the rig just now. */
+  active: boolean;
+}
+
+/**
+ * The station's radio interface, as the Radio screen shows it: the address it talks to, the
+ * state of that link, and what the radio behind it says about itself. `active` is the
+ * radio-to-rigctld side: rigctld may be reachable while the rig is not answering.
+ */
+export interface RadioStatus {
+  interface: { host: string; port: number } | null;
+  /** Which connector transmits: the rear input a modem feeds, the front mic, or automatic. */
+  pttInput: PttInput | null;
+  /**
+   * The serial line rigctld serves, as recorded by the operator — device and speed. The
+   * protocol never reports either, so this is a note about the daemon, not a reading of it.
+   */
+  serial: { device: string | null; speed: number | null } | null;
+  /** True while the station's own TCP link to rigctld is open. */
+  connected: boolean;
+  error: string | null;
+  rig: RadioRig | null;
+}
+
+export interface RadioRequest {
+  /** Address or host name; empty means `localhost`. */
+  host?: string;
+  /** 1…65535; empty means 4532. */
+  port?: number;
+  /** The serial device rigctld serves, recorded for display; empty means "not recorded". */
+  serialPort?: string | null;
+  /** Its speed in baud; null or absent means "not recorded". */
+  serialSpeed?: number | null;
+}
+
+/**
+ * What the operator sets on the radio itself, as opposed to where it answers: the power it
+ * transmits with, and which connector the audio comes from. Both apply while the link lives;
+ * the connector is also stored with the interface, because it is the station's wiring.
+ */
+export interface RadioPatchRequest {
+  /** 0…1 of the rig's maximum. */
+  rfPower?: number;
+  pttInput?: PttInput;
+}
+
+/** The LAN names the station could find for the addresses it talks to, by address. */
+export interface HostNamesResponse {
+  names: Record<string, string | null>;
+}
+
+/** The mail-access protocols a mail program can reach this station through. */
+export type MailInterfaceName = 'pop3' | 'smtp' | 'imap';
+
+export const MAIL_INTERFACE_NAMES: readonly MailInterfaceName[] = ['pop3', 'smtp', 'imap'];
+
+/**
+ * One mail-access interface, as the operator sees it: whether the configuration offers
+ * an address for it at all, whether it is listening now, and why it is not.
+ */
+export interface MailInterface {
+  name: MailInterfaceName;
+  /** The configuration names an address: only such an interface can be switched on. */
+  configured: boolean;
+  /** The bound address while running, the configured one while stopped, null when absent. */
+  address: string | null;
+  running: boolean;
+  /** Why the last attempt to start it failed; null when there was none. */
+  error: string | null;
+}
+
+/** The three interfaces together, the shape both mail-interface routes answer with. */
+export interface MailInterfacesResponse {
+  interfaces: MailInterface[];
+  /**
+   * True when this station has a post office owner. The interfaces belong to the post
+   * office: with no owner the station is a Winlink client, they are not started, and only
+   * stopping one is allowed.
+   */
+  postOffice: boolean;
+}
+
+export interface MailInterfaceRequest {
+  name: MailInterfaceName;
+  /** True to start listening, false to stop and close every connection. */
+  on: boolean;
+}
+
+/**
+ * Who may reach the station's doors — the HTTP API and POP3, SMTP and IMAP. `strict`
+ * admits loopback and the configured CIDRs; `very strict` admits loopback alone.
+ */
+export type AccessMode = 'strict' | 'very strict';
+
+/**
+ * The access posture as the header needs it. `exposed` is the awkward state: a listener
+ * bound beyond loopback while the policy admits only loopback, so the station answers the
+ * wire with a refusal — open ports that nobody may use. `listeners` counts the mail doors
+ * that are actually listening, because a policy guards nothing while they are all shut.
+ */
+export interface NetworkAccessSummary {
+  mode: AccessMode;
+  exposed: boolean;
+  /** Mail interfaces listening right now: 0 leaves only the web UI to guard. */
+  listeners: number;
+  summary: string;
+}
+
+/** The full posture, with the CIDRs the operator set and the HTTP listener it applies to. */
+export interface NetworkAccess extends NetworkAccessSummary {
+  cidrs: string[];
+  listen: string;
+}
+
+export interface NetworkAccessRequest {
+  mode: AccessMode;
+  /** Read only for `strict`; blank entries are dropped. */
+  cidrs: string[];
+}
+
 export interface StatusResponse {
   app: 'rfmail';
   version: string;
   /** 'setup' before the first user exists, 'ready' afterwards. */
   state: 'setup' | 'ready';
   database: string;
-  accessMode: string;
-  pop3: { enabled: boolean; address: string } | null;
-  smtp: { enabled: boolean; address: string } | null;
-  imap: { enabled: boolean; address: string } | null;
+  /** Who may reach the station at all; details behind /api/network/access. */
+  network: NetworkAccessSummary;
+  /** POP3, SMTP and IMAP: one door, three protocols (see MailInterface). */
+  mailInterfaces: MailInterface[];
 }
 
 export interface Me {
   user: User;
   folders: FolderWithCounts[];
   csrf: string;
+  /**
+   * True when this session was opened as the post office owner. It is a property of the
+   * session, not of the account: the login form asks, and only such a session sees the
+   * post office at all. Always false until the post office is built again.
+   */
+  postOffice: boolean;
 }
 
 export interface LoginRequest {
   /** The callsign, in any case: it is the account's one name (decision 25). */
   callsign: string;
   password?: string;
+  /**
+   * Open the session as the post office owner. The account must hold that role, and the
+   * post office must exist: today the request is refused rather than half-granted.
+   */
+  postOffice?: boolean;
 }
 
 export interface SetupRequest {
-  /** The station's callsign, which becomes the account's login. */
+  /** The station's first account: the callsign, which becomes the login. */
   callsign: string;
+}
+
+/**
+ * An account a user makes for themselves from the sign-in page, in client mode. The
+ * Winlink password is the one thing the station cannot invent: it is what this callsign
+ * answers a peer's `;PQ` challenge with, and it is sealed at rest, never hashed or shown.
+ */
+export interface RegisterRequest {
+  callsign: string;
+  winlinkPassword: string;
 }
 
 export interface CreateUserRequest {
@@ -221,6 +386,8 @@ export interface TransceiverLink {
   ptt: boolean | null;
   pttValue: number | null;
   fellBackToFront: boolean;
+  /** What rigctld says about the radio: its model, its interface, its live readout. */
+  rig: RadioRig | null;
   changedAt: string;
 }
 
@@ -230,6 +397,12 @@ export interface Transceiver {
   host: string;
   port: number;
   pttInput: PttInput;
+  /** The serial device rigctld serves, as recorded; null when not recorded. */
+  serialPort: string | null;
+  /** Its speed in baud, as recorded; null when not recorded. */
+  serialSpeed: number | null;
+  /** When this interface was last used; the newest one is the station's current interface. */
+  lastUsedAt: string;
   launchCommand: string | null;
   launchArgs: string[];
   idleMode: string;
@@ -244,6 +417,8 @@ export interface CreateTransceiverRequest {
   host: string;
   port?: number;
   pttInput?: PttInput;
+  serialPort?: string | null;
+  serialSpeed?: number | null;
   launchCommand?: string | null;
   launchArgs?: string[];
   idleMode?: string;
@@ -289,7 +464,7 @@ export function bandOf(frequencyHz: number): string {
 
 /**
  * A client identity in the shape a B2F SID carries: `NAME-VERSION`, as in
- * `[RMS Express-1.8.6.0-B2FHM$]`. The station's own identity is `rfmail-0.1`; an operator
+ * `[RMS Express-1.8.6.0-B2FHM$]`. The station's own identity is `RF Mail-0.1`; an operator
  * may present another program's instead, and this is the rule that decides whether the
  * string can go into a SID line at all.
  */
@@ -433,12 +608,12 @@ export const MODEM_KINDS: readonly ModemKindInfo[] = [
     families: ['ardop'],
     bandwidths: [200, 500, 1000, 2000],
     commandPort: 8515,
-    dataPort: null,
+    dataPort: 8516,
     kissPort: null,
     rigMode: 'PKTUSB',
     serviceCode: null,
     serviceCodes: [],
-    note: 'ardopcf or ARDOP_Win: one TCP host interface carries commands and data.'
+    note: 'ardopcf or ARDOP_Win: commands on 8515, data on 8516.'
   },
   {
     kind: 'vara',
@@ -505,6 +680,20 @@ export const MODEM_KINDS: readonly ModemKindInfo[] = [
     serviceCode: 'MERCURY',
     serviceCodes: ['MERCURY'],
     note: 'Mercury works the channels a gateway lists under service code MERCURY; enter the ports your build listens on.'
+  },
+  {
+    kind: 'direwolf',
+    label: 'Direwolf',
+    families: [],
+    bandwidths: null,
+    // AGWPE on 8000, KISS on 8001, and the sound data port on UDP 7355 by default.
+    commandPort: 8000,
+    dataPort: 7355,
+    kissPort: 8001,
+    rigMode: 'PKTUSB',
+    serviceCode: null,
+    serviceCodes: [],
+    note: 'Direwolf, the software packet modem: KISS and AGWPE are TCP interfaces with different command sets, and SND carries the channel audio over UDP. Registered here; a session driver for packet radio is not built yet.'
   }
 ];
 
@@ -562,7 +751,9 @@ const SESSIONS_BY_MODEM: Record<ModemKind, ModemKind[]> = {
   'vara-fm': ['vara-fm'],
   xara: ['vara', 'xara'],
   data2g: ['data2g'],
-  mercury: ['mercury']
+  mercury: ['mercury'],
+  // Packet radio has no session driver yet, so a Direwolf modem runs nothing for now.
+  direwolf: []
 };
 
 export function modemsForMode(mode: ModemKind): ModemKind[] {
@@ -592,8 +783,44 @@ export function modemDrivesMode(modem: ModemKind, mode: ModemKind): boolean {
   return modemsForMode(mode).includes(modem);
 }
 
+/** One port a modem may expose, with the name and the transport that modem gives it. */
+export interface ModemPortSpec {
+  field: 'commandPort' | 'dataPort' | 'kissPort';
+  /** `CMD`, `DATA`, `KISS`, `AGW`, `SND` — the short form a tile has room for. */
+  label: string;
+  /** The same port in the form's words: `Command`, `AGWPE`, `Sound (UDP)`. */
+  title: string;
+  transport: 'TCP' | 'UDP';
+}
+
+const COMMAND: ModemPortSpec = { field: 'commandPort', label: 'CMD', title: 'Command', transport: 'TCP' };
+const DATA: ModemPortSpec = { field: 'dataPort', label: 'DATA', title: 'Data', transport: 'TCP' };
+const KISS: ModemPortSpec = { field: 'kissPort', label: 'KISS', title: 'KISS', transport: 'TCP' };
+const AGW: ModemPortSpec = { field: 'commandPort', label: 'AGWPE', title: 'AGWPE', transport: 'TCP' };
+const SND: ModemPortSpec = { field: 'dataPort', label: 'SND', title: 'Sound', transport: 'UDP' };
+
+/**
+ * The ports one modem has, in the order they are shown. A modem only lists the ports it
+ * actually uses: VARA, XARA and ARDOP have a command and a data port and no KISS; Data2G has
+ * all three; Direwolf's three are AGWPE and KISS over TCP plus the sound data port over UDP.
+ */
+export function modemPortsOf(kind: ModemKind): readonly ModemPortSpec[] {
+  switch (kind) {
+    case 'vara':
+    case 'vara-fm':
+    case 'xara':
+    case 'ardop':
+      return [COMMAND, DATA];
+    case 'direwolf':
+      return [AGW, KISS, SND];
+    default:
+      // Data2G, Mercury: a build of either can expose all three, so all three are offered.
+      return [COMMAND, DATA, KISS];
+  }
+}
+
 /** The digital modes the station can drive (R3.1). */
-export type ModemKind = 'ardop' | 'vara' | 'vara-fm' | 'xara' | 'data2g' | 'mercury';
+export type ModemKind = 'ardop' | 'vara' | 'vara-fm' | 'xara' | 'data2g' | 'mercury' | 'direwolf';
 
 export interface SessionOptions {
   modems: Array<{ kind: ModemKind; label: string; families: string[] }>;
@@ -639,6 +866,21 @@ export interface GatewayList {
   origin: string | null;
   /** Whether emergency-only stations were included in this answer. */
   includeEmcomm: boolean;
+}
+
+/**
+ * A gateway this station has called, on the dial it used, and how often (R3.13). The pair is
+ * the identity: one gateway reached on two dials is two ways to call it, ranked separately.
+ */
+export interface SessionTarget {
+  callsign: string;
+  frequencyHz: number;
+  uses: number;
+  lastUsedAt: number;
+}
+
+export interface SessionTargetsResponse {
+  targets: SessionTarget[];
 }
 
 /** Whether a configured modem is actually listening, as of the last check. */
@@ -717,11 +959,6 @@ export type SessionMode = 'cms' | 'p2p' | 'postoffice';
 export interface SessionRunRequest extends SessionTestRequest {
   /** Defaults to `cms`: a Winlink RMS gateway or the CMS. */
   mode?: SessionMode;
-  /**
-   * Present this client identity in the SID instead of `rfmail-<version>`, e.g.
-   * `RMS Express-1.8.6.0`. Ignored when it does not fit the SID's format.
-   */
-  fakeClient?: string;
 }
 
 /** One protocol line of a session, in the direction it travelled. */

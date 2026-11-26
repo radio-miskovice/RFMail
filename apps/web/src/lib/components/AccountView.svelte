@@ -116,7 +116,16 @@
 	{/if}
 
 	<section>
-		<h2>Callsign and Winlink password</h2>
+		<h2>
+			Callsign and Winlink password
+			{#if !hasWinlinkPassword}
+				<span
+					class="nonwl"
+					title="No Winlink password is stored for this callsign: the account is non-WL and cannot collect mail from an RMS gateway"
+					>non-WL</span
+				>
+			{/if}
+		</h2>
 		<p class="muted small">
 			The callsign is this account: it is the name you sign in with here and from a mail program, the
 			originator of everything the account sends, and the mailbox that incoming mail is addressed to, so
@@ -219,8 +228,8 @@
 		</h2>
 		<p class="muted small">
 			{hasPassword
-				? 'The web client and POP3/SMTP/IMAP ask for this password. It is not the Winlink password above.'
-				: 'No login password: signing in and the mail protocols accept an empty password from allowed addresses. Set one before the station is reachable from the LAN.'}
+				? 'The web client asks for this password. It is not the Winlink password above.'
+				: 'No login password: signing in accepts an empty password from allowed addresses. Set one before the station is reachable from the LAN.'}
 		</p>
 		{#if passwordOpen}
 		<form onsubmit={savePassword}>
@@ -378,6 +387,19 @@
 		border: 1px solid color-mix(in oklab, var(--ok) 40%, var(--line));
 		border-radius: 999px;
 		padding: 0 0.35rem;
+	}
+
+	/* Non-WL: no Winlink password, so no mail collection from a gateway. */
+	.nonwl {
+		margin-left: 0.5rem;
+		padding: 0.05rem 0.4rem;
+		border-radius: 999px;
+		border: 1px dashed color-mix(in oklab, var(--danger) 45%, var(--line));
+		color: var(--danger);
+		font-size: 0.66rem;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		vertical-align: middle;
 	}
 
 	.check {

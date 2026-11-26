@@ -16,6 +16,9 @@ import {
   MIGRATION_006,
   MIGRATION_007,
   MIGRATION_008,
+  MIGRATION_009,
+  MIGRATION_010,
+  MIGRATION_011,
   SCHEMA_VERSION,
 } from './schema.ts';
 import type {
@@ -24,6 +27,8 @@ import type {
   TransceiverRecord,
   CreateModemInput,
   ModemRecord,
+  CreateSessionTargetInput,
+  SessionTargetRecord,
   CreateUserInput,
   FolderCounts,
   FolderRecord,
@@ -58,6 +63,9 @@ interface TransceiverRow {
   host: string;
   port: number;
   ptt_input: string;
+  serial_port: string | null;
+  serial_speed: number | null;
+  last_used_at: number;
   launch_command: string | null;
   launch_args: string;
   idle_mode: string;
@@ -78,6 +86,15 @@ interface ModemRow {
   rig_mode: string;
   transceiver_id: number | null;
   enabled: number;
+  created_at: number;
+}
+
+interface SessionTargetRow {
+  id: number;
+  callsign: string;
+  frequency_hz: number;
+  uses: number;
+  last_used_at: number;
   created_at: number;
 }
 
@@ -206,6 +223,9 @@ export class SqliteStore implements Store {
       [6, MIGRATION_006],
       [7, MIGRATION_007],
       [8, MIGRATION_008],
+      [9, MIGRATION_009],
+      [10, MIGRATION_010],
+      [11, MIGRATION_011],
     ];
     for (const [version, sql] of migrations) {
       if (seen.has(version)) continue;
@@ -453,6 +473,9 @@ export class SqliteStore implements Store {
       host: row.host,
       port: row.port,
       pttInput,
+      serialPort: row.serial_port,
+      serialSpeed: row.serial_speed,
+      lastUsedAt: row.last_used_at,
       launchCommand: row.launch_command,
       launchArgs,
       idleMode: row.idle_mode,
@@ -464,8 +487,8 @@ export class SqliteStore implements Store {
   }
 
   async listTransceivers(): Promise<TransceiverRecord[]> {
-    return this.all<TransceiverRow>('SELECT * FROM transceivers ORDER BY name COLLATE NOCASE').map(
-      (row) => this.transceiverFrom(row),
+    return this.all<TransceiverRow>('SELECT * FROM transceivers ORDER BY id').map((row) =>
+      this.transceiverFrom(row),
     );
   }
 
@@ -478,13 +501,16 @@ export class SqliteStore implements Store {
     const now = Date.now();
     const result = this.run(
       `INSERT INTO transceivers
-         (name, host, port, ptt_input, launch_command, launch_args, idle_mode,
+         (name, host, port, ptt_input, serial_port, serial_speed, last_used_at, launch_command, launch_args, idle_mode,
           idle_passband, timeout_ms, enabled, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       input.name,
       input.host,
       input.port ?? 4532,
       input.pttInput ?? 'rear',
+      input.serialPort ?? null,
+      input.serialSpeed ?? null,
+      input.lastUsedAt ?? 0,
       input.launchCommand ?? null,
       JSON.stringify(input.launchArgs ?? []),
       input.idleMode ?? 'PKTUSB',
@@ -513,6 +539,9 @@ export class SqliteStore implements Store {
     if (patch.host !== undefined) set('host', patch.host);
     if (patch.port !== undefined) set('port', patch.port);
     if (patch.pttInput !== undefined) set('ptt_input', patch.pttInput);
+    if (patch.serialPort !== undefined) set('serial_port', patch.serialPort ?? null);
+    if (patch.serialSpeed !== undefined) set('serial_speed', patch.serialSpeed ?? null);
+    if (patch.lastUsedAt !== undefined) set('last_used_at', patch.lastUsedAt);
     if (patch.launchCommand !== undefined) set('launch_command', patch.launchCommand ?? null);
     if (patch.launchArgs !== undefined) set('launch_args', JSON.stringify(patch.launchArgs));
     if (patch.idleMode !== undefined) set('idle_mode', patch.idleMode);
@@ -587,6 +616,51 @@ export class SqliteStore implements Store {
   async deleteModem(id: number): Promise<boolean> {
     const result = this.run('DELETE FROM modems WHERE id = ?', id);
     return result.changes > 0;
+  }
+
+  // -- session targets -----------------------------------------------------
+
+  private sessionTargetFrom(row: SessionTargetRow): SessionTargetRecord {
+    return {
+      id: row.id,
+      callsign: row.callsign,
+      frequencyHz: row.frequency_hz,
+      uses: row.uses,
+      lastUsedAt: row.last_used_at,
+      createdAt: row.created_at,
+    };
+  }
+
+  async listSessionTargets(limit = 20): Promise<SessionTargetRecord[]> {
+    return this.all<SessionTargetRow>(
+      `SELECT * FROM session_targets
+        ORDER BY uses DESC, last_used_at DESC, callsign COLLATE NOCASE ASC
+        LIMIT ?`,
+      limit,
+    ).map((row) => this.sessionTargetFrom(row));
+  }
+
+  async recordSessionTarget(input: CreateSessionTargetInput): Promise<SessionTargetRecord> {
+    const now = Date.now();
+    // The pair is unique case-insensitively; a second call to the same gateway on the same
+    // dial counts a use rather than making a second entry.
+    this.run(
+      `INSERT INTO session_targets (callsign, frequency_hz, uses, last_used_at, created_at)
+       VALUES (?, ?, 1, ?, ?)
+       ON CONFLICT DO UPDATE SET uses = uses + 1, last_used_at = excluded.last_used_at,
+                                 callsign = excluded.callsign`,
+      input.callsign,
+      input.frequencyHz,
+      now,
+      now,
+    );
+    const row = this.get<SessionTargetRow>(
+      'SELECT * FROM session_targets WHERE callsign = ? COLLATE NOCASE AND frequency_hz = ?',
+      input.callsign,
+      input.frequencyHz,
+    );
+    if (!row) throw new Error('the session target vanished after it was recorded');
+    return this.sessionTargetFrom(row);
   }
 
   private modemFrom(row: ModemRow): ModemRecord {

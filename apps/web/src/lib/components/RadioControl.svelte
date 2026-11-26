@@ -1,168 +1,96 @@
 <script lang="ts">
+	// The header's read-out of the station's radio.
+	//
+	// The station dials rigctld by itself and keeps it dialled, so this chip has nothing to
+	// press except itself: it shows the rig's name, the LED of the radio-to-rigctld link and
+	// the current readout, and a click goes to the Radio screen.
 	import { onMount } from 'svelte';
-	import type { Transceiver } from '@rfmail/shared';
-	import { api, ApiRequestError } from '../api/client';
+	import type { RadioStatus } from '@rfmail/shared';
+	import { api } from '../api/client';
 
 	let { onopenconfig }: { onopenconfig?: () => void } = $props();
 
-	let radios = $state<Transceiver[]>([]);
-	let selectedId = $state<number | null>(null);
-	let busy = $state(false);
-	let failure = $state('');
+	let status = $state<RadioStatus | null>(null);
 
-	const selected = $derived(radios.find((radio) => radio.id === selectedId) ?? null);
-	const linkState = $derived(selected?.link.state ?? 'disconnected');
-
-	/** LED: grey never opened, amber dialling, green up, red last exchange failed. */
+	/** Green: the rig answers. Amber: dialling. Red: something failed. Grey: nothing configured. */
 	const colour = $derived(
-		linkState === 'connected'
-			? 'green'
-			: linkState === 'error'
-				? 'red'
-				: linkState === 'connecting'
+		!status
+			? 'grey'
+			: status.connected && status.rig?.active
+				? 'green'
+				: status.connected
 					? 'amber'
-					: 'grey',
+					: status.interface && status.error
+						? 'red'
+						: status.interface
+							? 'amber'
+							: 'grey',
 	);
 
+	const label = $derived(status?.rig?.model ?? (status?.interface ? 'rigctld' : 'no radio'));
+
 	const summary = $derived.by(() => {
-		if (!selected) return 'no transceiver';
-		const link = selected.link;
-		if (link.state === 'connected' && link.frequencyHz !== null) {
-			const mhz = (link.frequencyHz / 1_000_000).toFixed(4);
-			return `${mhz} MHz ${link.mode ?? ''}`.trim();
+		if (!status?.interface) return '';
+		if (!status.connected) return status.error ? 'no answer' : 'not connected';
+		if (status.rig?.frequencyHz !== null && status.rig?.frequencyHz !== undefined) {
+			const mhz = (status.rig.frequencyHz / 1_000_000).toFixed(4);
+			return `${mhz} MHz ${status.rig.mode ?? ''}`.trim();
 		}
-		if (link.state === 'error') return link.error ?? 'error';
-		if (link.state === 'connecting') return 'connecting…';
-		return 'not connected';
+		return 'rig online';
 	});
 
-	async function load(): Promise<void> {
-		try {
-			radios = await api.transceivers();
-			const remembered = Number(localStorage.getItem('rfmail.transceiver') ?? '');
-			if (radios.some((radio) => radio.id === remembered)) selectedId = remembered;
-			else if (radios.length > 0 && !radios.some((radio) => radio.id === selectedId)) {
-				selectedId = radios[0]?.id ?? null;
-			}
-		} catch {
-			/* the header stays quiet; the Radio page reports problems */
-		}
-	}
-
-	/** Clears a red LED without retrying: the link simply goes back to grey. */
-	async function clearError(): Promise<void> {
-		const radio = selected;
-		if (!radio) return;
-		busy = true;
-		try {
-			const result = await api.disconnectTransceiver(radio.id);
-			radios = radios.map((entry) => (entry.id === radio.id ? result.transceiver : entry));
-			failure = '';
-		} catch {
-			/* the poll will show the state as it is */
-		} finally {
-			busy = false;
-		}
-	}
-
-	async function toggle(): Promise<void> {
-		const radio = selected;
-		if (!radio || busy) return;
-		busy = true;
-		failure = '';
-		try {
-			if (radio.link.state === 'connected' || radio.link.state === 'error') {
-				if (radio.link.state === 'error') {
-					// Reconnect: a red LED is cleared by a successful connect or by disconnecting.
-					const result = await api.connectTransceiver(radio.id);
-					radios = radios.map((entry) => (entry.id === radio.id ? result.transceiver : entry));
-					if (result.error) failure = result.error;
-				} else {
-					const result = await api.disconnectTransceiver(radio.id);
-					radios = radios.map((entry) => (entry.id === radio.id ? result.transceiver : entry));
-				}
-			} else {
-				const result = await api.connectTransceiver(radio.id);
-				radios = radios.map((entry) => (entry.id === radio.id ? result.transceiver : entry));
-				if (result.error) failure = result.error;
-			}
-		} catch (error) {
-			failure = error instanceof ApiRequestError ? (error.fields?.['host'] ?? error.message) : 'the backend did not answer';
-			await load();
-		} finally {
-			busy = false;
-		}
-	}
+	/** The chip has room for a word, not for why: the reason lives in its tooltip. */
+	const detail = $derived(
+		status?.error ??
+			(status?.interface ? `${status.interface.host}:${status.interface.port}` : 'no radio interface configured'),
+	);
 
 	onMount(() => {
+		const load = async (): Promise<void> => {
+			try {
+				status = await api.radio();
+			} catch {
+				/* the header stays quiet; the Radio page reports problems */
+			}
+		};
 		void load();
 		const timer = setInterval(() => void load(), 5000);
 		return () => clearInterval(timer);
 	});
-
-	$effect(() => {
-		if (selectedId !== null) localStorage.setItem('rfmail.transceiver', String(selectedId));
-	});
 </script>
 
-<div class="rig" class:error={linkState === 'error'}>
+<button
+	class="rig"
+	class:error={colour === 'red'}
+	type="button"
+	title={detail}
+	onclick={() => onopenconfig?.()}
+>
 	<span
 		class="led {colour}"
-		class:pulse={linkState === 'connecting' || busy}
+		class:pulse={colour === 'amber'}
 		role="img"
-		aria-label={linkState}
-		title={linkState === 'error' ? (selected?.link.error ?? 'error') : summary}></span>
-
-	{#if radios.length === 0}
-		<span class="muted small">no transceiver</span>
-		{#if onopenconfig}
-			<button class="btn ghost small" type="button" onclick={onopenconfig}>Configure</button>
-		{/if}
-	{:else}
-		<select
-			class="picker"
-			aria-label="Transceiver"
-			value={selectedId ?? ''}
-			onchange={(event) => (selectedId = Number(event.currentTarget.value) || null)}
-		>
-			{#each radios as radio (radio.id)}
-				<option value={radio.id}>{radio.name}</option>
-			{/each}
-		</select>
-		<span class="readout" title={failure || summary}>{summary}</span>
-		<button
-			class="btn ghost small"
-			type="button"
-			disabled={busy || !selected}
-			title={linkState === 'connected' ? 'Close the rig link' : linkState === 'error' ? 'Try again' : 'Open the rig link'}
-			onclick={toggle}
-		>
-			{linkState === 'connected' ? 'Disconnect' : linkState === 'error' ? 'Reconnect' : 'Connect'}
-		</button>
-		{#if linkState === 'error'}
-			<button
-				class="btn ghost small"
-				type="button"
-				disabled={busy}
-				title="Clear the error and go back to not connected"
-				aria-label="Clear the error"
-				onclick={clearError}
-			>
-				✕
-			</button>
-		{/if}
-	{/if}
-</div>
+		aria-label={colour === 'green' ? 'the radio answers' : colour === 'red' ? 'the radio link failed' : colour === 'amber' ? 'dialling rigctld' : 'no radio configured'}></span>
+	<span class="label">{label}</span>
+	{#if summary}<span class="readout">{summary}</span>{/if}
+</button>
 
 <style>
 	.rig {
 		display: flex;
 		align-items: center;
 		gap: 0.45rem;
-		padding: 0.15rem 0.5rem;
+		padding: 0.15rem 0.55rem;
 		border: 1px solid var(--line);
 		border-radius: 999px;
 		background: var(--bg-raised);
+		color: var(--text);
+		font: inherit;
+		cursor: pointer;
+	}
+
+	.rig:hover {
+		border-color: color-mix(in oklab, var(--accent) 40%, var(--line));
 	}
 
 	.rig.error {
@@ -202,13 +130,9 @@
 		}
 	}
 
-	.picker {
-		background: transparent;
-		border: none;
-		color: var(--text);
-		font: inherit;
-		font-size: 0.82rem;
-		max-width: 9rem;
+	.label {
+		font-size: 0.8rem;
+		white-space: nowrap;
 	}
 
 	.readout {
@@ -218,15 +142,6 @@
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
-	}
-
-	.small {
-		font-size: 0.76rem;
-	}
-
-	.btn.small {
-		padding: 0.15rem 0.5rem;
-		font-size: 0.76rem;
 	}
 
 	@media (max-width: 1100px) {

@@ -10,23 +10,31 @@ import type {
 	CreateUserRequest,
 	FolderWithCounts,
 	GatewayList,
+	HostNamesResponse,
 	LoginRequest,
+	MailInterfaceName,
+	MailInterfacesResponse,
 	Me,
 	MessageDetail,
 	MessageListResponse,
 	Modem,
 	ModemListenResponse,
 	ModemStatusResponse,
+	NetworkAccess,
+	NetworkAccessRequest,
 	CreateModemRequest,
 	UpdateModemRequest,
 	ModemKind,
 	PatchMessageRequest,
 	PasswordRequest,
 	PostOfficeStatus,
+	RadioStatus,
+	RegisterRequest,
 	CreateTransceiverRequest,
 	SessionOptions,
 	SessionRunRequest,
 	SessionRunResponse,
+	SessionTargetsResponse,
 	SessionTestRequest,
 	SessionTestResponse,
 	SetupRequest,
@@ -101,6 +109,36 @@ async function request<T>(
 export const api = {
 	status: (): Promise<StatusResponse> => request('GET', '/api/status'),
 
+	/** POP3, SMTP and IMAP as one door: the post office's, read or switched from its screen. */
+	mailInterfaces: (): Promise<MailInterfacesResponse> => request('GET', '/api/mail/interfaces'),
+
+	setMailInterface: (name: MailInterfaceName, on: boolean): Promise<MailInterfacesResponse> =>
+		request('POST', '/api/mail/interfaces', { name, on }),
+
+	/**
+	 * The access policy and the mail interfaces are the post office's controls, not the
+	 * client's: the API keeps them (they enforce at every connection) while the client UI
+	 * shows neither (decision 33).
+	 */
+	networkAccess: (): Promise<NetworkAccess> => request('GET', '/api/network/access'),
+
+	setNetworkAccess: (body: NetworkAccessRequest): Promise<NetworkAccess> =>
+		request('POST', '/api/network/access', body),
+
+	/** The station's one radio interface: where it dials, and what the radio says of itself. */
+	radio: (): Promise<RadioStatus> => request('GET', '/api/radio'),
+
+	/** LAN names for the configured addresses, when a name service answers. */
+	hostNames: (): Promise<HostNamesResponse> => request('GET', '/api/hostnames'),
+
+	/** Makes an interface the current one, which is the one the header shows. */
+	selectTransceiver: (id: number): Promise<Transceiver> =>
+		request('POST', `/api/transceivers/${id}/select`),
+
+	/** The transmitter power for one interface: written to that rig and read back. */
+	setTransceiverPower: (id: number, rfPower: number): Promise<Transceiver> =>
+		request('POST', `/api/transceivers/${id}/power`, { rfPower }),
+
 	setup: async (callsign: string): Promise<Me> => {
 		const me = await request<Me>('POST', '/api/setup', { callsign } satisfies SetupRequest);
 		setCsrf(me.csrf);
@@ -110,6 +148,17 @@ export const api = {
 	login: async (callsign: string, password?: string): Promise<Me> => {
 		const payload: LoginRequest = password === undefined ? { callsign } : { callsign, password };
 		const me = await request<Me>('POST', '/api/login', payload);
+		setCsrf(me.csrf);
+		return me;
+	},
+
+	/**
+	 * An account for a callsign, made by its owner at the sign-in page (client mode).
+	 * The Winlink password is required and becomes the sealed credential the station
+	 * answers a peer's challenge with; the callsign is the login.
+	 */
+	register: async (callsign: string, winlinkPassword: string): Promise<Me> => {
+		const me = await request<Me>('POST', '/api/accounts', { callsign, winlinkPassword } satisfies RegisterRequest);
 		setCsrf(me.csrf);
 		return me;
 	},
@@ -204,6 +253,9 @@ export const api = {
 	// -- sessions (R4) --
 
 	sessionOptions: (): Promise<SessionOptions> => request('GET', '/api/session/options'),
+
+	/** Gateways this station has called, most used first (R3.13). */
+	sessionTargets: (): Promise<SessionTargetsResponse> => request('GET', '/api/session/targets'),
 
 	/** The RMS gateway catalogue, filtered by modem and band, and ordered. */
 	gateways: (params: {

@@ -77,7 +77,7 @@
 		>
 			{#each modems as entry (entry.id)}
 				<option value={entry.id}>
-					{entry.name} · {modemKindInfo(entry.kind).label}{statuses[entry.id]?.running === false ? ' — not running' : ''}
+					{entry.name} · {modemKindInfo(entry.kind).label}{statuses[entry.id]?.running === false ? ' — unavailable' : ''}
 				</option>
 			{/each}
 			{#if modems.length === 0}

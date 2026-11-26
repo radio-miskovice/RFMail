@@ -7,7 +7,7 @@
 	// session itself uses, so there is no second dropdown to keep in step. The
 	// three things a session actually needs are then the gateway callsign, the
 	// dial frequency in hertz, and that mode.
-	import { onMount } from 'svelte';
+	import { onMount, untrack } from 'svelte';
 	import {
 		dialFromCarrier,
 		modemDrivesMode,
@@ -15,16 +15,18 @@
 		modemKindInfo,
 		type GatewayChannelView,
 		type GatewayList,
+		type Me,
 		type Modem,
 		type ModemKind,
 		type ModemStatus,
 		type SessionOptions,
 		type SessionRunResponse,
+		type SessionTarget,
 		type SessionTestResponse,
 		type Transceiver
 	} from '@rfmail/shared';
 	import { api, ApiRequestError } from '../api/client';
-	import { bandContains, parseClientIdentity } from '@rfmail/shared';
+	import { WINLINK_CLIENT_IDENTITY, bandContains, bandOf } from '@rfmail/shared';
 	import { chooseSessionMode } from '../session-default';
 	import {
 		dialNumber,
@@ -61,23 +63,24 @@
 	 * messages it may offer: a CMS routes for all of Winlink, a peer for itself alone,
 	 * a post office for its own users.
 	 */
-	let sessionMode = $state<'cms' | 'p2p' | 'postoffice'>('cms');
+	let sessionMode = $state<'cms' | 'p2p' | 'postoffice'>(
+		untrack(() => (me.user.hasWinlinkPassword ? 'cms' : 'p2p')),
+	);
 
 	/**
-	 * Present another program's identity in the SID. The value must survive the SID's own
-	 * format — `NAME-VERSION` — or it is ignored and the station sends `rfmail-<version>`.
+	 * The client identity is the mode's, not the operator's: `cms` presents the type a CMS
+	 * accepts, everything else this station's own name (decision 36).
 	 */
-	let fakeClient = $state(false);
-	let fakeClientValue = $state('RMS Express-1.8.6.0');
-	const fakeClientValid = $derived(parseClientIdentity(fakeClientValue) !== null);
-	/** This station's own SID identity, for showing what the peer would see instead. */
-	const ownSid = 'rfmail-0.1';
+	/** This station's own SID identity, shown with the mode's choice. */
+	const ownSid = 'RF Mail-0.1';
 	/** The dial is held in hertz; the input shows it in kHz or MHz (dial.ts). */
 	let frequencyHz = $state<number | null>(null);
 	let frequencyText = $state('');
 	let typedUnit = $state<DialUnit>('kHz');
 
 	let list = $state<GatewayList | null>(null);
+	/** Gateways this station has called before, most used first (decision 44). */
+	let targets = $state<SessionTarget[]>([]);
 	/** The connect test's state: null before the first run. */
 	let test = $state<{ state: 'calling' | 'done'; response: SessionTestResponse | null; error: string } | null>(
 		null
@@ -88,7 +91,15 @@
 	);
 
 	/** Told after an exchange, so the folder list behind the screen catches up. */
-	let { onSent }: { onSent?: () => void } = $props();
+	let { onSent, me }: { onSent?: () => void; me: Me } = $props();
+
+	/**
+	 * A station with no Winlink password is non-WL: an RMS gateway challenges the caller,
+	 * so a CMS would refuse the session (decision 21) and offering its channel list would
+	 * only lead the operator into that refusal. Such an account gets no gateway list and no
+	 * CMS session type; a peer-to-peer call to a station it names still works.
+	 */
+	const canWinlink = $derived(me.user.hasWinlinkPassword);
 	let loading = $state(false);
 	let error = $state('');
 
@@ -156,6 +167,7 @@
 			options = session;
 			modems = configured;
 			radios = rigs;
+			void loadTargets();
 			const status = await api.modemStatus().catch(() => null);
 			runningModems = status
 				? Object.fromEntries(status.statuses.map((entry) => [entry.id, entry.running]))
@@ -172,6 +184,11 @@
 	}
 
 	async function loadGateways(refresh = false): Promise<void> {
+		if (!canWinlink) {
+			// No password, no collection: nothing to ask Winlink for.
+			list = null;
+			return;
+		}
 		loading = true;
 		error = '';
 		try {
@@ -186,6 +203,29 @@
 
 	/** The unit shown is the one being typed in; it follows the band and the pick. */
 	const unit = $derived<DialUnit>(typedUnit);
+
+	/** The gateways called before, as the server ranks them: most used first. */
+	async function loadTargets(): Promise<void> {
+		try {
+			targets = (await api.sessionTargets()).targets;
+		} catch {
+			// A list of favourites is a convenience; a failed read costs nothing else.
+		}
+	}
+
+	/**
+	 * Fills the two fields from a gateway called before. The band, the unit and the dial are
+	 * set the same way the catalogue's pick() sets them, so a favourite behaves like a channel
+	 * that was chosen from the list rather than typed.
+	 */
+	function useTarget(target: SessionTarget): void {
+		callsign = target.callsign;
+		frequencyHz = target.frequencyHz;
+		frequencyText = dialNumber(target.frequencyHz);
+		typedUnit = dialUnitFor(target.frequencyHz);
+		band = bandOf(target.frequencyHz);
+		test = null;
+	}
 
 	function pick(channel: GatewayChannelView): void {
 		callsign = channel.callsign;
@@ -251,16 +291,11 @@
 	);
 
 	/**
-	 * The program on the port, when it is not the one this record claims. VARA, XARA,
-	 * Data2G and Mercury share ports, so a record can be right about the address and wrong
-	 * about the modem — and then the digital mode and the transceiver's mode are wrong too.
+	 * What the modem's port reports. VARA, XARA, Data2G and Mercury share ports, so the
+	 * status also says whether the program there is the kind this record claims — a mismatch
+	 * makes the modem unavailable and the reason carries the rest.
 	 */
 	const chosenReport = $derived(chosenModem === null ? null : (reportedModems[chosenModem.id] ?? null));
-	const chosenMismatch = $derived(
-		chosenReport?.mismatch === true && chosenReport.reportedKind
-			? `This port answers as ${modemKindInfo(chosenReport.reportedKind).label}${chosenReport.reportedVersion ? ` · ${chosenReport.reportedVersion}` : ''}, but the modem is configured as ${modemKindInfo(chosenModem!.kind).label}. A session would set the wrong digital mode.`
-			: ''
-	);
 
 	/** `VARA 40m, @TS-590SG : PKTUSB` — what the modem is, on which radio, in which mode. */
 	function modemLabel(entry: Modem): string {
@@ -328,8 +363,6 @@
 			const response = await api.runSession({
 				modemId: chosenModem.id,
 				mode: sessionMode,
-				// Only a valid identity travels; an invalid one is ignored rather than sent.
-				...(fakeClient && fakeClientValid ? { fakeClient: fakeClientValue.trim() } : {}),
 				target: callsign.trim().toUpperCase(),
 				frequencyHz: frequencyHz!,
 				bandwidthHz: pickedMode ? bandwidthOfMode(pickedMode) : undefined
@@ -337,6 +370,8 @@
 			session = { state: 'done', response, error: '' };
 			// The mailbox changed under the screen: let the folder list catch up.
 			onSent?.();
+			// A gateway that answered has just been counted; the ranking may have moved.
+			void loadTargets();
 		} catch (err) {
 			session = {
 				state: 'done',
@@ -383,8 +418,13 @@
 		<div>
 			<h2>Session</h2>
 			<p class="lede">
-				A session moves queued mail between this station and one RMS gateway. Choose the modem and the band,
-				then name the gateway — or take one from the list.
+				{#if canWinlink}
+					A session moves queued mail between this station and one RMS gateway. Choose the modem and the
+					band, then name the gateway — or take one from the list.
+				{:else}
+					A session calls one station over the air. This account is non-WL, so it collects nothing from an
+					RMS gateway: name the station you are calling and the session runs peer to peer.
+				{/if}
 			</p>
 		</div>
 	</header>
@@ -433,27 +473,20 @@
 				>
 					{#each compatibleModems as entry (entry.id)}
 						<option value={entry.id}>
-							{modemLabel(entry)}{runningModems[entry.id] === false ? ' — not running' : ''}
+							{modemLabel(entry)}{runningModems[entry.id] === false ? ' — unavailable' : ''}
 						</option>
 					{/each}
-					{#if chosenModem && chosenRunning === false}
-			<p class="warn">
-				{chosenModem.name} is configured but nothing is listening on
-				{chosenModem.host}:{chosenModem.commandPort ?? '?'} — start it before a session.
-			</p>
-		{:else if compatibleModems.length === 0}
+					{#if compatibleModems.length === 0}
 						<option value={null}>— none configured —</option>
 					{/if}
 				</select>
 			</label>
 		</div>
 
-		{#if chosenMismatch}
-			<p class="warn">{chosenMismatch}</p>
-		{:else if chosenModem && chosenRunning === false}
+		{#if chosenModem && chosenRunning === false}
 			<p class="warn">
-				{chosenModem.name} is configured but nothing is listening on
-				{chosenModem.host}:{chosenModem.commandPort ?? '?'} — start it before a session.
+				{chosenModem.name} is unavailable at {chosenModem.host}:{chosenModem.commandPort ?? '?'}
+				{chosenReport?.error ? ` — ${chosenReport.error}.` : ' — start it before a session.'}
 			</p>
 		{:else if compatibleModems.length === 0}
 			<p class="warn">
@@ -490,40 +523,47 @@
 			<label class="field narrow">
 				<span>Session type</span>
 				<select bind:value={sessionMode}>
-					<option value="cms">Winlink RMS gateway</option>
+					{#if canWinlink}
+						<option value="cms">Winlink RMS gateway</option>
+					{/if}
 					<option value="p2p">Peer to peer</option>
-					<option value="postoffice">Post office</option>
+					{#if canWinlink}
+						<option value="postoffice">Post office</option>
+					{/if}
 				</select>
 			</label>
 		</div>
 
+		{#if targets.length > 0}
+			<div class="targets" aria-label="Gateways called before">
+				<span class="targets-label">Called before</span>
+				{#each targets as target (target.callsign + target.frequencyHz)}
+					<button
+						class="target"
+						type="button"
+						title={`${target.callsign} on ${formatDial(target.frequencyHz)}, ${target.uses}×`}
+						onclick={() => useTarget(target)}
+					>
+						<strong>{target.callsign}</strong>
+						<span class="target-freq">{formatDial(target.frequencyHz)}</span>
+						{#if target.uses > 1}<span class="target-uses">{target.uses}×</span>{/if}
+					</button>
+				{/each}
+			</div>
+		{/if}
+
 		<div class="row">
-			<label class="field fake">
-				<span>
-					<input type="checkbox" bind:checked={fakeClient} />
-					Fake client in SID
-				</span>
-				<input
-					class="mono"
-					bind:value={fakeClientValue}
-					disabled={!fakeClient}
-					placeholder="RMS Express-1.8.6.0"
-					autocomplete="off"
-					spellcheck="false"
-					title="NAME-VERSION, as a SID carries it; anything else is ignored and {ownSid} is sent"
-				/>
-			</label>
-			{#if fakeClient}
-				<p class="hint">
-					{#if fakeClientValid}
-						The peer will see [{fakeClientValue.trim()}-B2FHM$] instead of
-						[{ownSid}-B2FHM$].
-					{:else}
-						Not NAME-VERSION (a letter-led name, no brackets, then digits and dots) — the
-						value is ignored and the station presents itself as rfmail.
-					{/if}
-				</p>
-			{/if}
+			<p class="forced">
+				Client identity:
+				{#if sessionMode === 'cms'}
+					<span class="mono">[{WINLINK_CLIENT_IDENTITY}-B2FHM$]</span> — the client type a Winlink CMS
+					accepts; it refuses any other, so this one is fixed for gateway sessions. This station's own
+					name, [{ownSid}-B2FHM$], is what it sends to a peer.
+				{:else}
+					<span class="mono">[{ownSid}-B2FHM$]</span> — this station's own name, which is what a peer
+					reads. A Winlink gateway session would present the client type the CMS accepts instead.
+				{/if}
+			</p>
 		</div>
 
 		<p class="hint">
@@ -536,9 +576,11 @@
 		</p>
 
 		<div class="actions">
-			<button class="btn" type="button" onclick={() => void loadGateways()}>
-				{list ? 'Refresh list' : 'Find gateways'}
-			</button>
+			{#if canWinlink}
+				<button class="btn" type="button" onclick={() => void loadGateways()}>
+					{list ? 'Refresh list' : 'Find gateways'}
+				</button>
+			{/if}
 			<button
 				class="btn"
 				type="button"
@@ -680,7 +722,19 @@
 		</section>
 	{/if}
 
-	{#if list}
+	{#if !canWinlink}
+		<div class="nonwl">
+			<h3>No Winlink collection</h3>
+			<p>
+				This account is <strong>non-WL</strong>: no Winlink password is stored, so an RMS gateway
+				would challenge the station and refuse the session. No gateway list is offered here. Add the
+				Winlink password on the Account page to collect mail; a peer-to-peer call to a station whose
+				callsign you name still works.
+			</p>
+		</div>
+	{/if}
+
+	{#if list && canWinlink}
 		<div class="list-head">
 			<h3>RMS gateways</h3>
 			<div class="order">
@@ -824,6 +878,56 @@
 		gap: 0.8rem;
 	}
 
+	/* The gateways called before: one compact button each, ranked by use. */
+	.targets {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		gap: 0.35rem;
+		margin: 0.55rem 0 0;
+	}
+
+	.targets-label {
+		font-size: 0.7rem;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		color: var(--faint);
+		margin-right: 0.15rem;
+	}
+
+	.target {
+		display: inline-flex;
+		align-items: baseline;
+		gap: 0.35rem;
+		font: inherit;
+		font-size: 0.78rem;
+		color: var(--fg);
+		background: var(--bg);
+		border: 1px solid var(--line);
+		border-radius: 999px;
+		padding: 0.12rem 0.55rem;
+		cursor: pointer;
+	}
+
+	.target:hover {
+		border-color: var(--accent);
+	}
+
+	.target strong {
+		font-weight: 600;
+	}
+
+	.target-freq {
+		color: var(--muted);
+		font-variant-numeric: tabular-nums;
+	}
+
+	.target-uses {
+		font-size: 0.68rem;
+		color: var(--faint);
+		font-variant-numeric: tabular-nums;
+	}
+
 	.field {
 		display: grid;
 		gap: 0.25rem;
@@ -873,6 +977,18 @@
 		margin: 0;
 		color: var(--muted);
 		font-size: 0.76rem;
+	}
+
+	/* The client identity a Winlink session will present, stated rather than chosen. */
+	.forced {
+		grid-column: 1 / -1;
+		margin: 0;
+		padding: 0.45rem 0.6rem;
+		border: 1px solid var(--line);
+		border-radius: 8px;
+		background: var(--bg-raised);
+		color: var(--muted);
+		font-size: 0.78rem;
 	}
 
 	.footnote {
@@ -1076,6 +1192,27 @@
 		color: var(--danger);
 		margin: 0 0 0.6rem;
 		font-size: 0.82rem;
+	}
+
+	/* The non-WL notice stands where the gateway list would be. */
+	.nonwl {
+		border: 1px solid var(--line);
+		border-left: 3px solid var(--accent);
+		border-radius: 8px;
+		background: var(--bg-raised);
+		padding: 0.7rem 0.85rem;
+		margin: 0.8rem 0;
+	}
+
+	.nonwl h3 {
+		margin: 0 0 0.35rem;
+		font-size: 0.9rem;
+	}
+
+	.nonwl p {
+		margin: 0;
+		font-size: 0.82rem;
+		color: var(--muted);
 	}
 
 	@media (max-width: 760px) {

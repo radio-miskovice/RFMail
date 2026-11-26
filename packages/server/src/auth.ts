@@ -15,6 +15,11 @@ export interface SessionPayload {
   csrf: string;
   /** Epoch seconds. */
   exp: number;
+  /**
+   * The session was opened as the post office owner. Optional so an old cookie still
+   * verifies; anything but `true` means an ordinary RF Mail client session.
+   */
+  postOffice?: boolean;
 }
 
 export class Sessions {
@@ -29,11 +34,16 @@ export class Sessions {
     return createHmac('sha256', this.secret).update(payload).digest('base64url');
   }
 
-  issue(uid: number, maxAgeSeconds: number = MAX_AGE_SECONDS): { token: string; payload: SessionPayload } {
+  issue(
+    uid: number,
+    maxAgeSeconds: number = MAX_AGE_SECONDS,
+    postOffice = false,
+  ): { token: string; payload: SessionPayload } {
     const payload: SessionPayload = {
       uid,
       csrf: randomBytes(18).toString('base64url'),
       exp: Math.floor(Date.now() / 1000) + maxAgeSeconds,
+      ...(postOffice ? { postOffice: true } : {}),
     };
     const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
     return { token: `${encoded}.${this.sign(encoded)}`, payload };

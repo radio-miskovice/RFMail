@@ -30,8 +30,21 @@
 	});
 	let password = $state('');
 	let needsPassword = $state(false);
+	/** The sign-in page can create an account for a callsign: client mode only. */
+	let registering = $state(false);
+	let winlinkPassword = $state('');
 	let error = $state('');
 	let busy = $state(false);
+
+	/** Field codes from the API are not sentences; the ones the form can cause are named. */
+	function messageFor(err: ApiRequestError): string {
+		const fields = err.fields ?? {};
+		if (fields['callsign'] === 'duplicate') return 'That callsign already has a mailbox here — sign in instead.';
+		if (fields['callsign']) return 'That is not a callsign.';
+		if (fields['winlinkPassword'] === 'required') return 'The Winlink password is required.';
+		if (fields['winlinkPassword'] === 'too long') return 'That Winlink password is too long.';
+		return err.message;
+	}
 
 	async function submit(event: SubmitEvent): Promise<void> {
 		event.preventDefault();
@@ -40,7 +53,12 @@
 		busy = true;
 		try {
 			const callsign = callsignTyped.trim();
-			const me = mode === 'setup' ? await api.setup(callsign) : await api.login(callsign, needsPassword ? password : undefined);
+			const me =
+				mode === 'setup'
+					? await api.setup(callsign)
+					: registering
+						? await api.register(callsign, winlinkPassword)
+						: await api.login(callsign, needsPassword ? password : undefined);
 			try {
 				localStorage.setItem('rfmail.callsign', me.user.callsign ?? callsign);
 			} catch {
@@ -53,7 +71,7 @@
 					needsPassword = true;
 					error = 'This account has a password.';
 				} else {
-					error = err.fields?.['callsign'] ?? err.message;
+					error = messageFor(err);
 				}
 			} else {
 				error = 'Cannot reach the backend.';
@@ -67,12 +85,24 @@
 <div class="screen">
 	<main class="card">
 		<div class="mark">rfmail</div>
-		<h1>{mode === 'setup' ? 'Create the station account' : fresh ? 'Change user' : 'Sign in'}</h1>
+		<h1>
+			{mode === 'setup'
+				? 'Create the station account'
+				: registering
+					? 'Create an account'
+					: fresh
+						? 'Change user'
+						: 'Sign in'}
+		</h1>
 		<p class="lede">
 			{#if mode === 'setup'}
 				This is the first start. Type the callsign of this station, which is also the account: the callsign
 				signs in, receives its own mail and is the originator of everything the station sends. No password is
 				set at this stage — mail access from this machine is enough for now, and one can be added later.
+			{:else if registering}
+				Type the callsign you want a mailbox for, and its Winlink password. The password is what this
+				station answers another station's challenge with; it is stored sealed on this machine, never shown
+				again, and can be changed later on the account page.
 			{:else if fresh}
 				Type the callsign whose mailbox you want. {needsPassword
 					? 'This account has a password.'
@@ -97,7 +127,19 @@
 				/>
 			</label>
 
-			{#if needsPassword}
+			{#if registering}
+				<label class="field">
+					<span>Winlink password</span>
+					<!-- svelte-ignore a11y_autofocus -->
+					<input
+						type="password"
+						name="winlinkPassword"
+						autocomplete="off"
+						bind:value={winlinkPassword}
+						autofocus
+					/>
+				</label>
+			{:else if needsPassword}
 				<label class="field">
 					<span>Password</span>
 					<!-- svelte-ignore a11y_autofocus -->
@@ -109,9 +151,46 @@
 				<p class="error" role="alert">{error}</p>
 			{/if}
 
-			<button class="btn primary submit" type="submit" disabled={busy || !callsignTyped.trim()}>
-				{busy ? 'Working…' : mode === 'setup' ? 'Create account' : 'Sign in'}
+			<button
+				class="btn primary submit"
+				type="submit"
+				disabled={busy || !callsignTyped.trim() || (registering && winlinkPassword.trim() === '')}
+			>
+				{busy
+					? 'Working…'
+					: mode === 'setup'
+						? 'Create account'
+						: registering
+							? 'Create account and sign in'
+							: 'Sign in'}
 			</button>
+
+			{#if mode === 'login'}
+				<p class="alt">
+					{#if registering}
+						Already have a mailbox here?
+						<button
+							class="link"
+							type="button"
+							onclick={() => {
+								registering = false;
+								error = '';
+							}}>Sign in</button
+						>
+					{:else}
+						No mailbox here yet?
+						<button
+							class="link"
+							type="button"
+							onclick={() => {
+								registering = true;
+								needsPassword = false;
+								error = '';
+							}}>Create an account</button
+						>
+					{/if}
+				</p>
+			{/if}
 		</form>
 
 		<p class="status">{statusLine}</p>
@@ -167,6 +246,26 @@
 		justify-content: center;
 		padding: 0.6rem 1rem;
 		margin-top: 0.25rem;
+	}
+
+	.alt {
+		margin: 0;
+		font-size: 0.82rem;
+		color: var(--muted);
+		text-align: center;
+	}
+
+	.link {
+		background: none;
+		border: none;
+		padding: 0;
+		font: inherit;
+		color: var(--accent);
+		cursor: pointer;
+	}
+
+	.link:hover {
+		text-decoration: underline;
 	}
 
 	.status {

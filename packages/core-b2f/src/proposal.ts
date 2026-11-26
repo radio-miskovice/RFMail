@@ -137,7 +137,7 @@ export function readAnswer(reply: string, index: number): { decision: 'accept' |
 }
 
 export interface Sid {
-  /** Application name as advertised, e.g. `WL2K` or `rfmail`. */
+  /** Application name as advertised, e.g. `WL2K` or `RF Mail`. */
   application: string;
   version: string;
   /** Upper-cased flag letters, e.g. `B2FHM$`. */
@@ -166,8 +166,12 @@ export function supportsB2(sid: Sid): boolean {
   return /\bB2\b/.test(sid.flags) || sid.flags.includes('B2');
 }
 
-/** The SID this station sends; `G` advertises gzip proposals, and `$` is always last. */
-export function localSid(application = 'rfmail', version = '0.1', flags = 'B2FHMG$'): string {
+/**
+ * The SID this station sends; `G` advertises gzip proposals, and `$` is always last.
+ * The name is the product as an operator knows it, and it may contain a space:
+ * `[RF Mail-0.1-B2FHM$]` splits into `RF Mail` and `0.1` at the first dash.
+ */
+export function localSid(application = 'RF Mail', version = '0.1', flags = 'B2FHMG$'): string {
   const safeVersion = version.replace(/-/g, '.');
   return `[${application}-${safeVersion}-${flags}]`;
 }

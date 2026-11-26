@@ -440,6 +440,11 @@ export class ImapServer {
 		return `${this.opts.host}:${this.opts.port}`;
 	}
 
+	/** True only while a socket is bound; a failed listen leaves this false. */
+	get listening(): boolean {
+		return this.server?.listening === true;
+	}
+
 	async listen(): Promise<void> {
 		if (this.server) return;
 		const server = createServer((socket) => void this.handle(socket));
@@ -447,6 +452,8 @@ export class ImapServer {
 		await new Promise<void>((resolve, reject) => {
 			const onError = (err: Error): void => {
 				server.off('listening', onListening);
+				// A socket that never bound must not look bound: a later start has to try again.
+				this.server = null;
 				reject(err);
 			};
 			const onListening = (): void => {

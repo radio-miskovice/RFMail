@@ -100,39 +100,6 @@
 		}
 	}
 
-	async function toggleOwner(user: User): Promise<void> {
-		notice = '';
-		error = '';
-		try {
-			await api.updateUser(user.id, { isPostOffice: !user.isPostOffice });
-			notice = user.isPostOffice
-				? `The post office no longer answers as ${user.callsign}.`
-				: `The post office now answers as ${user.callsign}.`;
-			await load();
-		} catch (err) {
-			error = err instanceof ApiRequestError ? err.message : 'Could not change the post office owner.';
-		}
-	}
-
-	async function resetPostOfficePassword(user: User): Promise<void> {
-		const value = window.prompt(
-			`Post-office password for ${user.callsign ?? 'this account'} — what it answers another station's challenge with (leave empty to remove):`,
-			''
-		);
-		if (value === null) return;
-		notice = '';
-		error = '';
-		try {
-			const updated = await api.updateUser(user.id, { postOfficePassword: value });
-			notice = updated.hasPostOfficePassword
-				? `Post-office password set for ${user.callsign}.`
-				: `Post-office password removed for ${user.callsign}.`;
-			await load();
-		} catch (err) {
-			error = err instanceof ApiRequestError ? (Object.values(err.fields ?? {})[0] ?? err.message) : 'Failed.';
-		}
-	}
-
 	async function remove(user: User): Promise<void> {
 		if (!window.confirm(`Delete the account ${user.callsign ?? 'this account'} and its mailbox? This cannot be undone.`)) return;
 		notice = '';
@@ -176,6 +143,7 @@
 					{#if user.id === me.user.id}<span class="you">you</span>{/if}
 					{#if !user.enabled}<span class="off">disabled</span>{/if}
 					{#if user.isPostOffice}<span class="owner" title="This account's callsign is what the post office answers as">post office</span>{/if}
+					{#if !user.hasWinlinkPassword}<span class="nonwl" title="No Winlink password: this account cannot collect mail from an RMS gateway">non-WL</span>{/if}
 				</span>
 				<span class="mono">{user.locator ?? '—'}</span>
 				<button class="btn ghost small-btn" type="button" onclick={() => changeRole(user)} title="Toggle role">
@@ -185,25 +153,6 @@
 				<span class="muted">{formatDateTime(user.createdAt)}</span>
 				<span class="actions">
 					<button class="btn ghost small-btn" type="button" onclick={() => resetPassword(user)}>Password</button>
-					<button
-						class="btn ghost small-btn"
-						type="button"
-						title="The password this account answers a post office's challenge with"
-						onclick={() => resetPostOfficePassword(user)}
-					>
-						Post-office pw
-					</button>
-					<button
-						class="btn ghost small-btn"
-						type="button"
-						title={user.isPostOffice
-							? 'Stop answering calls as this account'
-							: 'Make this account the station the post office answers as'}
-						disabled={!user.callsign}
-						onclick={() => toggleOwner(user)}
-					>
-						{user.isPostOffice ? 'Unown' : 'Make owner'}
-					</button>
 					<button class="btn ghost small-btn" type="button" onclick={() => toggleEnabled(user)}>
 						{user.enabled ? 'Disable' : 'Enable'}
 					</button>
@@ -326,6 +275,18 @@
 		border-radius: 0.25rem;
 		border: 1px solid var(--accent);
 		color: var(--accent);
+		font-size: 0.65rem;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+	}
+
+	/* Non-WL: no Winlink password, so no collection from an RMS gateway. */
+	.nonwl {
+		margin-left: 0.4rem;
+		padding: 0.05rem 0.35rem;
+		border-radius: 0.25rem;
+		border: 1px dashed color-mix(in oklab, var(--danger) 45%, var(--line));
+		color: var(--danger);
 		font-size: 0.65rem;
 		text-transform: uppercase;
 		letter-spacing: 0.05em;
