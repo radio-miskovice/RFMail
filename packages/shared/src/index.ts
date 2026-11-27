@@ -1249,3 +1249,52 @@ export interface PoArmRequest {
 export interface PoCallsResponse {
   calls: PoCall[];
 }
+
+/** The post office's one radio, as the operator configured it (decision 68). */
+export interface PoRadioInterface {
+  id: number;
+  name: string;
+  host: string;
+  port: number;
+  pttInput: 'rear' | 'front' | 'auto';
+}
+
+/** What the link to that radio says right now. Connection lives in the process, not here. */
+export interface PoRadioLink {
+  state: 'disconnected' | 'connecting' | 'connected' | 'error';
+  error: string | null;
+  frequencyHz: number | null;
+  mode: string | null;
+  passbandHz: number | null;
+  /** The radio's own model, as rigctld reported it; null until it answers. */
+  model: string | null;
+  ptt: boolean | null;
+}
+
+export interface PoRadio {
+  transceiver: PoRadioInterface | null;
+  link: PoRadioLink | null;
+}
+
+export interface PoRadioRequest {
+  host: string;
+  port?: number;
+  pttInput?: 'rear' | 'front' | 'auto';
+  /** An internal row label; the screen names the radio by the model rigctld reports. */
+  name?: string;
+}
+
+/**
+ * A dial typed the way the operator reads it. Below 10 MHz the dial is kilohertz
+ * (`7053.5`), from 10 MHz up it is megahertz (`14.1096`); the value is stored in hertz.
+ */
+export function dialHz(value: number, unit: 'khz' | 'mhz'): number {
+  return unit === 'khz' ? Math.round(value * 1000) : Math.round(value * 1_000_000);
+}
+
+/** The same frequency back in the unit the band uses, with the unit spelled. */
+export function dialText(hz: number | null): string {
+  if (hz === null || hz <= 0) return '—';
+  if (hz < 10_000_000) return `${Number((hz / 1000).toFixed(1))} kHz`;
+  return `${Number((hz / 1_000_000).toFixed(4))} MHz`;
+}

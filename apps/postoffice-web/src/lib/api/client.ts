@@ -14,6 +14,8 @@ import type {
 	PoCallsResponse,
 	PoMailbox,
 	PoMe,
+	PoRadio,
+	PoRadioRequest,
 	PoStation,
 	PoStatus,
 	UpdatePoAdministratorRequest,
@@ -121,11 +123,22 @@ export const api = {
 
 	station: (): Promise<PoStation> => request('GET', '/api/station'),
 
-	arm: (modemId: number): Promise<PoStation> => request('POST', '/api/station/arm', { modemId }),
+	arm: (modemId: number, frequencyHz: number): Promise<PoStation> =>
+		request('POST', '/api/station/arm', { modemId, frequencyHz }),
 
 	disarm: (): Promise<PoStation> => request('POST', '/api/station/disarm'),
 
 	calls: (limit = 100): Promise<PoCallsResponse> => request('GET', `/api/calls?limit=${limit}`),
+
+	radio: (): Promise<PoRadio> => request('GET', '/api/radio'),
+
+	saveRadio: (body: PoRadioRequest): Promise<PoRadio> => request('PUT', '/api/radio', body),
+
+	deleteRadio: (): Promise<{ ok: boolean }> => request('DELETE', '/api/radio'),
+
+	connectRadio: (): Promise<PoRadio> => request('POST', '/api/radio/connect'),
+
+	disconnectRadio: (): Promise<PoRadio> => request('POST', '/api/radio/disconnect'),
 
 	modems: (): Promise<{ modems: Modem[] }> => request('GET', '/api/modems'),
 

@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import type { PoAdministrator, PoCall, PoMailbox, PoMe, PoStation, PoStatus } from '@rfmail/shared';
+	import type { PoAdministrator, PoCall, PoMailbox, PoMe, PoRadio, PoStation, PoStatus } from '@rfmail/shared';
 	import { api, ApiRequestError } from '../lib/api/client';
 	import SignIn from '../lib/components/SignIn.svelte';
 	import StationView from '../lib/components/StationView.svelte';
@@ -17,6 +17,7 @@
 	let bootError = $state('');
 	let section = $state<Section>('station');
 	let station = $state<PoStation | null>(null);
+	let radio = $state<PoRadio | null>(null);
 	let mailboxes = $state<PoMailbox[]>([]);
 	let administrators = $state<Array<PoAdministrator & { self: boolean }>>([]);
 	let calls = $state<PoCall[]>([]);
@@ -40,6 +41,12 @@
 		if (fields['enabled'] === 'station') return 'The station cannot stop answering as itself.';
 		if (fields['modemId'] === 'unreachable') return err.message;
 		if (fields['id'] === 'armed') return 'That modem is answering calls; disarm it first.';
+		if (fields['radio'] === 'missing') return 'Configure the radio before arming.';
+		if (fields['radio'] === 'down') return err.message;
+		if (fields['radio'] === 'tune') return err.message;
+		if (fields['frequencyHz'] === 'required') return 'Type the dial to arm on.';
+		if (fields['host']) return 'The radio interface needs an address.';
+		if (fields['port']) return 'The port must be between 1 and 65535.';
 		return err.message;
 	}
 
@@ -57,7 +64,9 @@
 	}
 
 	async function loadStation(): Promise<void> {
-		station = await api.station();
+		const [nextStation, nextRadio] = await Promise.all([api.station(), api.radio()]);
+		station = nextStation;
+		radio = nextRadio;
 	}
 
 	async function loadAll(): Promise<void> {
@@ -96,9 +105,11 @@
 	$effect(() => {
 		if (phase !== 'app' || section !== 'station') return;
 		const timer = setInterval(() => {
-			void api
-				.station()
-				.then((next) => (station = next))
+			void Promise.all([api.station(), api.radio()])
+				.then(([nextStation, nextRadio]) => {
+					station = nextStation;
+					radio = nextRadio;
+				})
 				.catch(() => undefined);
 		}, 5000);
 		return () => clearInterval(timer);
@@ -119,9 +130,41 @@
 		error = '';
 	}
 
-	function onArm(modemId: number): void {
+	function onArm(modemId: number, frequencyHz: number): void {
 		void run(async () => {
-			station = await api.arm(modemId);
+			// The radio is tuned first, so its readout is worth refreshing even when the
+			// modem then refuses: that is the half that did happen.
+			try {
+				station = await api.arm(modemId, frequencyHz);
+			} finally {
+				radio = await api.radio().catch(() => radio);
+			}
+		});
+	}
+
+	function onSaveRadio(input: { host: string; port?: number; pttInput: 'rear' | 'front' | 'auto' }): void {
+		void run(async () => {
+			radio = await api.saveRadio(input);
+		});
+	}
+
+	function onDeleteRadio(): void {
+		if (!confirm('Remove the radio interface from this station?')) return;
+		void run(async () => {
+			await api.deleteRadio();
+			radio = await api.radio();
+		});
+	}
+
+	function onConnectRadio(): void {
+		void run(async () => {
+			radio = await api.connectRadio();
+		});
+	}
+
+	function onDisconnectRadio(): void {
+		void run(async () => {
+			radio = await api.disconnectRadio();
 		});
 	}
 
@@ -240,18 +283,21 @@
 			{#if section === 'station'}
 				<StationView
 					{station}
+					{radio}
 					{busy}
-					{error}
 					onarm={onArm}
 					ondisarm={onDisarm}
 					onaddmodem={onAddModem}
 					ondeletemodem={onDeleteModem}
+					onsaveradio={onSaveRadio}
+					ondelradio={onDeleteRadio}
+					onconnectradio={onConnectRadio}
+					ondisconnectradio={onDisconnectRadio}
 				/>
 			{:else if section === 'mailboxes'}
 				<MailboxesView
 					{mailboxes}
 					{busy}
-					{error}
 					oncreate={onCreateMailbox}
 					onupdate={onUpdateMailbox}
 					ondelete={onDeleteMailbox}
@@ -262,7 +308,6 @@
 				<AdminsView
 					{administrators}
 					{busy}
-					{error}
 					oncreate={onCreateAdmin}
 					onupdate={onUpdateAdmin}
 					ondelete={onDeleteAdmin}

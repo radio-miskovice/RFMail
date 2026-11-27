@@ -677,7 +677,9 @@ how it calls somebody else's post office.
 * **Postponed.** The native door — a `;RFPO: 1` doorbell on the same data port, Noise with
   static keys, PKI enrolment over the B2F door — is designed in decisions 59–62 and is not part
   of the first release; the first step is the seam between the mail policy and the B2F framing
-  (decision 65). Envelope inspection, forwarding and rig control are the screens after this one.
+  (decision 65). Envelope inspection and forwarding are the screens after this one; the radio —
+  one `rigctld`, tuned before the modem is armed, refused when its link is down — is in this
+  release (decision 68).
 
 ### 4.5 Concurrency and scheduling
 

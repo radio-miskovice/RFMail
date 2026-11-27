@@ -37,9 +37,11 @@ import {
   type AdministratorRecord,
   type PostOfficeCallRecord,
   type Store,
+  type TransceiverRecord,
   type UserRecord,
 } from '@rfmail/store';
-import type { PostOffice } from '@rfmail/server';
+import { transceiverConfigOf, type PostOffice } from '@rfmail/server';
+import type { LinkStatus, TransceiverLinks } from '@rfmail/rig';
 import {
   MODEM_KINDS,
   type CreatePoAdministratorRequest,
@@ -53,6 +55,9 @@ import {
   type PoLoginRequest,
   type PoMailbox,
   type PoMe,
+  type PoRadio,
+  type PoRadioInterface,
+  type PoRadioRequest,
   type PoSetupRequest,
   type PoStation,
   type PoStatus,
@@ -68,6 +73,8 @@ export interface PoApiServices {
   logger: Logger;
   storeKey: string;
   postOffice: PostOffice;
+  /** The station's one radio: configuration in the store, the link in this process. */
+  radio: TransceiverLinks;
   uiDir: string;
   secureCookies: boolean;
   appVersion: string;
@@ -86,7 +93,7 @@ export interface PoApi {
 }
 
 export function createPoApi(services: PoApiServices): PoApi {
-  const { store, sessions, policy, logger, postOffice } = services;
+  const { store, sessions, policy, logger, postOffice, radio } = services;
   const router = new Router();
   const loginAttempts = new Map<string, { count: number; resetAt: number }>();
   router.setFallback(createStaticHandler(services.uiDir));
@@ -109,6 +116,37 @@ export function createPoApi(services: PoApiServices): PoApi {
     received: call.received,
     reason: call.reason,
   });
+
+  /** The one transceiver the station transmits through, or null. */
+  const radioRow = async (): Promise<TransceiverRecord | null> =>
+    (await store.listTransceivers())[0] ?? null;
+
+  const radioDto = (row: TransceiverRecord): PoRadioInterface => ({
+    id: row.id,
+    name: row.name,
+    host: row.host,
+    port: row.port,
+    pttInput: row.pttInput,
+  });
+
+  const linkDto = (link: LinkStatus): PoRadio => ({
+    transceiver: null,
+    link: {
+      state: link.state,
+      error: link.error,
+      frequencyHz: link.frequencyHz,
+      mode: link.mode,
+      passbandHz: link.passbandHz,
+      model: link.rig?.model ?? null,
+      ptt: link.ptt,
+    },
+  });
+
+  const radioResponse = async (): Promise<PoRadio> => {
+    const row = await radioRow();
+    if (!row) return { transceiver: null, link: null };
+    return { transceiver: radioDto(row), link: linkDto(radio.status(row.id)).link };
+  };
 
   const stationCallsign = async (): Promise<string | null> => {
     const owner = await store.findPostOfficeOwner();
@@ -494,6 +532,89 @@ export function createPoApi(services: PoApiServices): PoApi {
     sendJson(ctx.res, 200, { ok: true });
   });
 
+  // -- the radio -----------------------------------------------------------------
+  //
+  // One transceiver, because the station answers on one modem with one radio. The
+  // connection itself lives in this process: a link that is down is dialled again every
+  // few seconds, and nothing about it is written to the store (decision 68).
+
+  router.add('GET', '/api/radio', async (ctx) => {
+    await requireAdministrator(ctx, false);
+    sendJson(ctx.res, 200, await radioResponse());
+  });
+
+  router.add('PUT', '/api/radio', async (ctx) => {
+    const admin = await requireAdministrator(ctx, true);
+    const body = await readJson<PoRadioRequest>(ctx.req);
+    const host = typeof body.host === 'string' ? body.host.trim() : '';
+    if (host === '') throw new HttpError(400, 'a host is required', { host: 'required' });
+    const port = body.port === undefined ? 4532 : Number(body.port);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new HttpError(400, 'the port must be between 1 and 65535', { port: 'invalid' });
+    }
+    const pttInput = body.pttInput ?? 'rear';
+    if (pttInput !== 'rear' && pttInput !== 'front' && pttInput !== 'auto') {
+      throw new HttpError(400, 'choose the rear input, the front microphone, or automatic', {
+        pttInput: 'invalid',
+      });
+    }
+    const name =
+      typeof body.name === 'string' && body.name.trim() !== ''
+        ? body.name.trim()
+        : `rigctld ${host}:${port}`;
+
+    const existing = await radioRow();
+    const record = existing
+      ? await store.updateTransceiver(existing.id, { name, host, port, pttInput })
+      : await store.createTransceiver({ name, host, port, pttInput });
+    if (!record) throw new HttpError(404, 'the radio interface no longer exists');
+
+    // A changed address is a different conversation: drop the old link, dial the new one.
+    radio.forget(record.id);
+    const settings = transceiverConfigOf(record);
+    const link = record.enabled ? await radio.connect(settings) : radio.status(record.id);
+    logger.info('post office radio configured', {
+      by: admin.name,
+      host,
+      port,
+      pttInput,
+      state: link.state,
+      error: link.error,
+    });
+    sendJson(ctx.res, 200, await radioResponse());
+  });
+
+  router.add('DELETE', '/api/radio', async (ctx) => {
+    const admin = await requireAdministrator(ctx, true);
+    if (postOffice.isArmed) {
+      throw new HttpError(409, 'the station is answering calls; disarm it before removing the radio', {
+        armed: 'already',
+      });
+    }
+    const existing = await radioRow();
+    if (!existing) throw new HttpError(404, 'no radio is configured');
+    radio.forget(existing.id);
+    await store.deleteTransceiver(existing.id);
+    logger.info('post office radio removed', { by: admin.name, host: existing.host });
+    sendJson(ctx.res, 200, { ok: true });
+  });
+
+  router.add('POST', '/api/radio/connect', async (ctx) => {
+    await requireAdministrator(ctx, true);
+    const existing = await radioRow();
+    if (!existing) throw new HttpError(404, 'no radio is configured');
+    await radio.connect(transceiverConfigOf(existing));
+    sendJson(ctx.res, 200, await radioResponse());
+  });
+
+  router.add('POST', '/api/radio/disconnect', async (ctx) => {
+    await requireAdministrator(ctx, true);
+    const existing = await radioRow();
+    if (!existing) throw new HttpError(404, 'no radio is configured');
+    radio.disconnect(existing.id);
+    sendJson(ctx.res, 200, await radioResponse());
+  });
+
   // -- the station -------------------------------------------------------------
 
   router.add('GET', '/api/station', async (ctx) => {
@@ -526,7 +647,42 @@ export function createPoApi(services: PoApiServices): PoApi {
         modemId: 'nodata',
       });
     }
-    const frequencyHz = typeof body.frequencyHz === 'number' && body.frequencyHz > 0 ? body.frequencyHz : 0;
+    const frequencyHz = typeof body.frequencyHz === 'number' ? body.frequencyHz : 0;
+    if (!(frequencyHz > 0)) {
+      throw new HttpError(400, 'arm on a dial: an inbound call cannot be tuned for', {
+        frequencyHz: 'required',
+      });
+    }
+
+    // The radio first, because an inbound call cannot be tuned for: the station must
+    // already be on the channel when somebody calls (decision 26). A link that is down
+    // refuses rather than keying a transmitter on whatever frequency it happened to hold.
+    const transceiver = await radioRow();
+    if (!transceiver) {
+      throw new HttpError(
+        409,
+        'this station has no radio configured, so it cannot be put on a channel',
+        { radio: 'missing' },
+      );
+    }
+    const link = radio.status(transceiver.id);
+    if (link.state !== 'connected') {
+      throw new HttpError(
+        409,
+        `the radio link is down${link.error ? `: ${link.error}` : ''}`,
+        { radio: 'down' },
+      );
+    }
+    try {
+      await radio.tune(transceiver.id, frequencyHz, modem.rigMode);
+    } catch (err) {
+      throw new HttpError(
+        502,
+        `the radio did not take the dial: ${err instanceof Error ? err.message : String(err)}`,
+        { radio: 'tune' },
+      );
+    }
+
     try {
       await postOffice.arm({
         owner,
@@ -541,13 +697,21 @@ export function createPoApi(services: PoApiServices): PoApi {
       });
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
-      throw new HttpError(
-        502,
-        `the modem did not answer at ${modem.host}:${modem.commandPort}: ${reason}`,
-        { modemId: 'unreachable' },
-      );
+      const plain = /ECONNREFUSED/.test(reason)
+        ? 'nothing is listening there'
+        : /ETIMEDOUT|timed out/i.test(reason)
+          ? 'it did not answer'
+          : reason;
+      throw new HttpError(502, `the modem did not answer at ${modem.host}:${modem.commandPort}: ${plain}`, {
+        modemId: 'unreachable',
+      });
     }
-    logger.info('post office armed', { by: admin.name, modem: modem.name, frequencyHz });
+    logger.info('post office armed', {
+      by: admin.name,
+      modem: modem.name,
+      frequencyHz,
+      radio: transceiver.host,
+    });
     sendJson(ctx.res, 200, await stationResponse());
   });
 

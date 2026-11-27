@@ -1,24 +1,51 @@
 <script lang="ts">
-	import { MODEM_KINDS, type PoStation } from '@rfmail/shared';
+	import { MODEM_KINDS, dialHz, dialText, type PoRadio, type PoStation } from '@rfmail/shared';
 	import { duration, utcTime } from '../format';
+	import RadioPanel from './RadioPanel.svelte';
 
 	let {
 		station,
+		radio,
 		busy,
-		error,
 		onarm,
 		ondisarm,
 		onaddmodem,
-		ondeletemodem
+		ondeletemodem,
+		onsaveradio,
+		ondelradio,
+		onconnectradio,
+		ondisconnectradio
 	}: {
 		station: PoStation | null;
+		radio: PoRadio | null;
 		busy: boolean;
-		error: string;
-		onarm: (modemId: number) => void;
+		onarm: (modemId: number, frequencyHz: number) => void;
 		ondisarm: () => void;
 		onaddmodem: (input: { kind: string; host: string; commandPort?: number; dataPort?: number }) => void;
 		ondeletemodem: (id: number) => void;
+		onsaveradio: (input: { host: string; port?: number; pttInput: 'rear' | 'front' | 'auto' }) => void;
+		ondelradio: () => void;
+		onconnectradio: () => void;
+		ondisconnectradio: () => void;
 	} = $props();
+
+	/** The dial as the operator reads it: kilohertz below 10 MHz, megahertz above. */
+	let dial = $state('');
+	let unit = $state<'khz' | 'mhz'>('khz');
+	let dialError = $state('');
+
+	const linkUp = $derived(radio?.link?.state === 'connected');
+
+	function arm(): void {
+		dialError = '';
+		const value = Number(dial.replace(',', '.').trim());
+		if (!Number.isFinite(value) || value <= 0) {
+			dialError = 'Type the dial to arm on.';
+			return;
+		}
+		if (selected === null) return;
+		onarm(selected, dialHz(value, unit));
+	}
 
 	let selected = $state<number | null>(null);
 	let adding = $state(false);
@@ -53,7 +80,9 @@
 			return {
 				tone: 'ok',
 				word: 'ARMED',
-				detail: `${station.modemName ?? ''} listening${station.callsign ? ` as ${station.callsign}` : ''}`
+				detail: `${station.modemName ?? ''} listening${station.callsign ? ` as ${station.callsign}` : ''}${
+					station.frequencyHz ? ` · ${dialText(station.frequencyHz)}` : ''
+				}`
 			};
 		return { tone: 'idle', word: 'DISARMED', detail: 'not listening' };
 	});
@@ -103,10 +132,27 @@
 			{#if station?.armed}
 				<button class="btn" onclick={ondisarm} disabled={busy}>Disarm</button>
 			{:else}
+				<label class="sr-only" for="dial">Dial</label>
+				<input
+					id="dial"
+					class="dial"
+					type="text"
+					inputmode="decimal"
+					bind:value={dial}
+					spellcheck="false"
+					autocomplete="off"
+					title="The dial to answer on"
+				/>
+				<label class="sr-only" for="unit">Unit</label>
+				<select id="unit" class="unit" bind:value={unit}>
+					<option value="khz">kHz</option>
+					<option value="mhz">MHz</option>
+				</select>
 				<button
 					class="btn primary"
-					onclick={() => selected !== null && onarm(selected)}
-					disabled={busy || selected === null || (station?.modems ?? []).length === 0}
+					onclick={arm}
+					disabled={busy || selected === null || (station?.modems ?? []).length === 0 || !linkUp}
+					title={linkUp ? 'Arm the modem on this dial' : 'the radio link is down'}
 				>
 					Arm
 				</button>
@@ -114,7 +160,16 @@
 		</div>
 	</div>
 
-	{#if error}<p class="error" role="alert">{error}</p>{/if}
+	{#if dialError}<p class="error" role="alert">{dialError}</p>{/if}
+
+	<RadioPanel
+		{radio}
+		{busy}
+		onsave={onsaveradio}
+		ondelete={ondelradio}
+		onconnect={onconnectradio}
+		ondisconnect={ondisconnectradio}
+	/>
 
 	<div class="panels">
 		<div class="panel">
@@ -266,6 +321,18 @@
 		color: var(--text);
 		max-width: 18rem;
 	}
+	.dial {
+		width: 7.5rem;
+		background: var(--bg);
+		border: 1px solid var(--line);
+		border-radius: 8px;
+		padding: 0.45rem 0.6rem;
+		color: var(--text);
+		font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+		font-size: 0.9rem;
+		text-align: right;
+	}
+	.unit { max-width: 5rem; }
 	.panels {
 		display: grid;
 		grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr);

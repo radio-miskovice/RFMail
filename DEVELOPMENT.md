@@ -130,6 +130,8 @@ rfmail/
     install.sh                the one command the operator runs (root, Linux)
     install-postoffice.sh     the post office's installer; it writes the unit, so a
                               checked-in .service file would be a second source
+    install-postoffice.ps1    the Windows installer: a task at boot, a logging shim, and
+                              the workspace links re-created after the copy
 ```
 
 Why workspaces rather than `src/`: `core-b2f` must be usable from a test with no
@@ -1038,7 +1040,14 @@ peers from milestone M4 come in.
   unit and touches neither the configuration nor the database. `--print-unit` exists so the unit
   can be reviewed and `systemd-analyze verify`ed without root, and `--no-service` installs files
   and configuration only, which is also how the installer is tested here.
+* **The station's radio is one rigctld, kept alive by a loop that also found a leak.** The post
+  office polls its transceiver every five seconds (retrying a failed dial after fifteen), which
+  is the first place a `rigctld` link runs unattended for days. That is how each completed round
+  trip was found to leave an `error` and a `close` listener behind on the shared socket — ten
+  commands later Node warns about a leak that is one. `roundTrip`'s `finish` now removes both, and
+  `test/rigctld.test.ts` polls twelve times and asserts no `MaxListeners` warning. Arming tunes
+  first (`radio.tune(id, hz, modem.rigMode)`) and arms second, so the sequence in a failure is
+  visible: the radio moves, the modem refuses, and the screen shows both.
 
-Next for this application: the rig link and the radio tile (arming tunes the transceiver), the
-envelope-inspection view behind the `inspect` grant, then the `po-mail` / `po-b2f` split that the
-native door will need.
+Next for this application: the envelope-inspection view behind the `inspect` grant, then the
+`po-mail` / `po-b2f` split that the native door will need, then forwarding.

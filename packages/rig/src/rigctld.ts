@@ -279,11 +279,20 @@ export class Rigctld {
       const answers: string[] = [];
       let settled = false;
 
+      // One command at a time on one socket, so every listener this round trip adds is
+      // removed when it settles — otherwise an unattended station that polls every few
+      // seconds piles up `error` listeners until Node warns about a leak that is not one.
+      const onSocketError = (error: Error): void =>
+        finish(new RigError(`rigctld connection failed: ${error.message}`, -1, line));
+      const onSocketClose = (): void => finish(new RigError('rigctld closed the connection', -1, line));
+
       const finish = (error: Error | null): void => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
         socket.off('data', onData);
+        socket.off('error', onSocketError);
+        socket.off('close', onSocketClose);
         if (error) reject(error);
         else resolve(answers);
       };
@@ -358,8 +367,8 @@ export class Rigctld {
       timer.unref?.();
 
       socket.on('data', onData);
-      socket.once('error', (error) => finish(new RigError(`rigctld connection failed: ${error.message}`, -1, line)));
-      socket.once('close', () => finish(new RigError('rigctld closed the connection', -1, line)));
+      socket.once('error', onSocketError);
+      socket.once('close', onSocketClose);
       socket.write(`${line}\n`);
       traceSink?.(line);
     });

@@ -26,8 +26,10 @@ import {
   openSecret,
   parseAddress,
   sealSecret,
+  transceiverConfigOf,
 } from '@rfmail/server';
 import { PeerPolicy } from '@rfmail/mailservers';
+import { TransceiverLinks } from '@rfmail/rig';
 import { SqliteStore } from '@rfmail/store';
 import { ensurePostOfficeSecret, loadPostOfficeConfig } from './config.ts';
 import { createPoApi } from './api.ts';
@@ -71,6 +73,9 @@ async function main(): Promise<void> {
   const store = new SqliteStore({ path: config.database.path, postOffice: true });
   await store.migrate();
   const sessions = new Sessions(config.server.secret);
+  // The radio is part of the station: dialled at start-up, kept alive, and never a
+  // property of a screen (decision 68).
+  const radio = new TransceiverLinks();
   const uiDir = config.server.uiDir || DEFAULT_UI_DIR;
   const storeKey = config.server.storeKey;
 
@@ -107,6 +112,7 @@ async function main(): Promise<void> {
     logger,
     storeKey,
     postOffice,
+    radio,
     uiDir,
     secureCookies: config.server.tls === 'files',
     appVersion: APP_VERSION,
@@ -139,6 +145,29 @@ async function main(): Promise<void> {
         ready();
       });
     });
+
+    // Keep the rigctld link up. A switched-off radio costs one attempt every fifteen
+    // seconds, not a stream of them, and a link that comes back needs no operator.
+    let radioPolling = false;
+    const pollRadio = (): Promise<void> =>
+      store
+        .listTransceivers()
+        .then((rows) => radio.keepAlive(rows.filter((row) => row.enabled).map(transceiverConfigOf)));
+    const radioLoop: ReturnType<typeof setInterval> = setInterval(() => {
+      if (radioPolling) return;
+      radioPolling = true;
+      void pollRadio()
+        .catch((err: unknown) =>
+          logger.warn('radio link poll failed', {
+            error: err instanceof Error ? err.message : String(err),
+          }),
+        )
+        .finally(() => {
+          radioPolling = false;
+        });
+    }, 5000);
+    (radioLoop as unknown as { unref?: () => void }).unref?.();
+    void pollRadio().catch(() => undefined);
 
     const actual = httpServer.address();
     const bound = typeof actual === 'object' && actual ? `${actual.address}:${actual.port}` : listenSpec;
@@ -190,6 +219,8 @@ async function main(): Promise<void> {
       // A station left listening is a station left answering: disarm first, which also
       // tells the modem to stop and waits for the link to come down.
       await postOffice.disarm().catch(() => undefined);
+      clearInterval(radioLoop);
+      radio.closeAll();
       const server = httpServer;
       if (server) {
         server.closeAllConnections?.();

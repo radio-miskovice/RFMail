@@ -15,6 +15,7 @@ administrators who are not mailboxes (decision 58).
 
     console     HTTP + the built SPA, on loopback by default
     store       SQLite: mailboxes, messages, administrators, the call log
+    radio       one rigctld, dialled at start-up and kept alive
     post office the answering half of the B2F exchange, armed on one modem
 
 It does **not** start: POP3, SMTP or IMAP (a post office's users collect over the radio, and
@@ -62,9 +63,50 @@ it rather than shipping a station whose screen is a placeholder: a radio PC shou
 Node toolchain to be repaired.
 
 **Upgrading** is the same command with the new tree: files and unit are replaced, the
-configuration and the database are not. **Windows** is a real target — VARA and most stations
-are on it — and needs a service wrapper (`nssm`, or a scheduled task) rather than systemd;
-that script does not exist yet and is recorded as the next platform task, not pretended.
+configuration and the database are not.
+
+### Windows
+
+```powershell
+.\deploy\install-postoffice.ps1                 # %ProgramFiles%, %ProgramData%, a task
+.\deploy\install-postoffice.ps1 -NoService ...  # files and configuration only
+.\deploy\install-postoffice.ps1 -DryRun         # say what it would do
+.\deploy\install-postoffice.ps1 -PrintTask      # print the registration, for review
+.\deploy\install-postoffice.ps1 -Uninstall      # stop and remove the task, keep the data
+```
+
+Windows has no service account in the Unix sense, and `node` is not service-aware, so the
+station runs as a **task at boot** rather than a service: Task Scheduler is on every station
+box already, while a service wrapper (`nssm`, WinSW) would have to be fetched first — and a
+station on a hill cannot fetch one. The task runs as SYSTEM, restarts every minute when it
+stops, has no execution time limit, and starts the shim below.
+
+What differs from Linux, and why:
+
+* **A launcher shim**, `run-postoffice.cmd` in the prefix. Task Scheduler captures nothing,
+  so the station writes its own log (`%ProgramData%\rfmail-postoffice\postoffice.log`),
+  rotates it at 5 MB, and the same shim is what an operator double-clicks when the console
+  does not come up.
+* **`-OpenFirewall`** adds the inbound rule for the console port in the Domain and Private
+  profiles. Not done by default: opening a port is the operator's decision, and the listener
+  stays on loopback until they change it.
+* **The configuration is ACL'd** to SYSTEM and Administrators instead of being chmod 0600.
+* Paths: `%ProgramFiles%\rfmail-postoffice` and `%ProgramData%\rfmail-postoffice`.
+
+Exercise of this script so far: PowerShell 7 on the development host with `-NoService` —
+copy, generated configuration, the shim text, and the installed tree started and serving its
+console. The Task Scheduler, `icacls` and firewall branches need a Windows machine and have
+not been run.
+
+### The links both installers restore
+
+After copying, each installer re-creates `node_modules/@rfmail/*` as links into `packages/`.
+That is load-bearing rather than tidiness: the workspace packages are TypeScript that Node
+runs directly, and Node refuses to strip types for a file under `node_modules`. A copy there
+makes the station fail at start with `ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING` — which is
+how the Windows installer's first draft was found to be wrong, because `robocopy` and
+`Copy-Item` dereference links. The installer now makes a junction (no privilege needed) on
+Windows and a symlink on Unix, so an archived tree that lost its links still installs.
 
 ### What the unit trusts
 
@@ -82,7 +124,7 @@ no explanatory paragraphs where a word will do.
 
 ### Station
 
-    ● ARMED     VARA HF 192.168.1.20 listening as OK4RM      [modem ▾]  [Disarm]
+    ● ARMED     VARA HF 192.168.1.20 listening as OK4RM · 3595.5 kHz   [modem ▾] [3595.5] [kHz ▾] [Disarm]
     ● CALL      OK1RAA · 41 s
     ● DISARMED  not listening
     ● FAULT     the modem closed the connection
@@ -92,8 +134,19 @@ grey = deliberate and dark red = it stopped by itself with the reason on the sam
 modem picker and one button; arming is `MYCALL` + `LISTEN ON`, disarming is `LISTEN OFF` and a
 waited-out link.
 
-Below it, two panels:
+Arm takes a dial and a unit: kilohertz below 10 MHz (`3595.5`), megahertz above (`14.1096`), the
+way the operator reads the radio. The station tunes the transceiver to it *before* it tells the
+modem to listen, because an inbound call cannot be tuned for; with no radio configured, or with
+its link down, the Arm button refuses rather than keying a transmitter on whatever frequency it
+happened to hold. The dial is recorded with the call.
 
+Below it, three panels:
+
+* **Radio** — the station's one rigctld: a lamp, the model the daemon reports (`TS-590S`, or the
+  address until it answers), the live readout (dial, mode, filter) and Connect / Disconnect /
+  Change / Remove. Adding one is three fields: address, port, transmit audio (rear input, front
+  microphone, or rear falling back). There is no model field — the daemon knows the radio — and
+  no power control: the station reads what the transmitter is set to, it does not set it.
 * **Modems** — the configured modems, with protocol, `host:port` and Remove. Adding one is a
   short form: protocol, address, command and data ports, prefilled from the vendor numbers for
   the protocol chosen. A modem that is answering calls cannot be removed.
@@ -149,10 +202,10 @@ message content by construction, which is what makes it safe to be the troublesh
 
 Recorded here so that the gap is a plan rather than an oversight:
 
-* **No rig control.** Arming records nothing about a frequency and writes nothing to a rig: the
-  operator tunes the transceiver. The transceiver registry, the tuning before arming, and the
-  radio tile arrive with the station screen's second cut. Until then a post office must not be
-  armed from a remote console without somebody on the frequency.
+* **No band plan.** The station has one rigctld and the operator types the dial; there
+  is no channel catalogue, no band select and no AF-carrier conversion here, because the post
+  office holds no gateway list to pick from. A station that answers on a published channel
+  number would want the catalogue's carrier-to-dial arithmetic; that comes with forwarding.
 * **No envelope inspection.** The `inspect` permission is stored and shown; the view it would
   open (timestamps, from, to, size — never subject or body, audited per read) is the next screen.
 * **No native protocol.** The B2F door is the only door, and it is frozen: `;PQ:`/`;PR:`, the
@@ -160,7 +213,6 @@ Recorded here so that the gap is a plan rather than an oversight:
   static keys, enrolment over B2F as a system message) is designed in decisions 59–62 and waits.
 * **No forwarding, no quotas enforcement on inbound** — the quota is stored and shown, not yet
   applied when mail arrives.
-* **Windows service wrapper** — see above.
 
 ---
 
@@ -169,7 +221,7 @@ Recorded here so that the gap is a plan rather than an oversight:
     apps/postoffice/src/main.ts    entry: config, store, API, listener, shutdown
     apps/postoffice/src/config.ts  the installation's TOML and its two generated keys
     apps/postoffice/src/api.ts     the console's routes; the two principals kept apart
-    apps/postoffice-web/           the console (SvelteKit static SPA)
+    apps/postoffice-web/           the console (SvelteKit static SPA); RadioPanel is the rig
     packages/store/src/schema.ts   MIGRATION_014: administrators and po_calls
     packages/server/src/postoffice.ts  the answering half — shared with the client
 

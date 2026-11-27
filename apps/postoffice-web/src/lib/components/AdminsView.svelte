@@ -5,14 +5,12 @@
 	let {
 		administrators,
 		busy,
-		error,
 		oncreate,
 		onupdate,
 		ondelete
 	}: {
 		administrators: Array<PoAdministrator & { self: boolean }>;
 		busy: boolean;
-		error: string;
 		oncreate: (input: { name: string; password: string; canInspect: boolean }) => void;
 		onupdate: (id: number, patch: { enabled?: boolean; canInspect?: boolean; password?: string }) => void;
 		ondelete: (id: number) => void;
@@ -112,7 +110,6 @@
 			</tbody>
 		</table>
 
-		{#if error}<p class="error" role="alert">{error}</p>{/if}
 
 		<form class="add" onsubmit={submit}>
 			<label class="field">

@@ -53,8 +53,9 @@ console: `POSTOFFICE.md`.
 
 ```sh
 npm run build:postoffice                       # build the console
-sudo deploy/install-postoffice.sh             # /opt, /etc, /var/lib, systemd unit
-#   or, without a service:
+sudo deploy/install-postoffice.sh             # Linux: /opt, /etc, /var/lib, systemd unit
+deploy\install-postoffice.ps1                 # Windows: Program Files, ProgramData, a boot task
+#   or, without a service, on either:
 deploy/install-postoffice.sh --no-service --prefix /opt/rfmail-po --data ~/.local/share/rfmail-postoffice
 ```
 

@@ -741,3 +741,35 @@ control were exercised against a stand-in modem only; what has *not* been seen o
   installation; the installer refuses without it rather than shipping a placeholder screen. The
   default listener is loopback, and the two edits for a LAN console are printed at the end. The
   Windows service wrapper is the next platform task and does not exist yet. (R7.9, R9.1)
+
+* **68** The post office's radio is one rigctld, and arming is a tuning act (settled 27 Nov 2026).
+  The console names the address and the transmit connector and nothing else about the radio: the
+  daemon knows the model, so a typed name could only agree with it by luck, and the station reads
+  the power rather than setting it. The link lives in the running process — dialled at start-up,
+  re-read every five seconds, retried fifteen seconds after a failure — and nothing about it is
+  written to the store. Arming tunes the transceiver to the dial the operator typed and only then
+  tells the modem to listen; with no radio configured or a link that is down the arm is refused,
+  because an inbound call cannot be tuned for and a transmitter must never be keyed on whatever
+  frequency the rig happened to hold. The dial is typed in the unit the band uses (kilohertz
+  below 10 MHz, megahertz above) and recorded with the call. The five-second read also exposed a
+  listener leak: each completed `rigctld` round trip left an `error` and a `close` handler on the
+  shared socket, so an unattended station would have run into `MaxListenersExceededWarning` after
+  ten commands; the handlers are now removed when a round trip settles, and a test polls twelve
+  times and asserts the warning never appears. (R4.4.3, R2.2)
+
+* **69** Windows installs the station as a task at boot, and both installers repair the
+  workspace links (settled 27 Nov 2026). `node` is not service-aware, so a "service" on Windows
+  would be a wrapper the operator has to fetch before anything works — and a station on a hill
+  cannot fetch one. Task Scheduler is already on every station box: the task runs as SYSTEM at
+  boot, restarts a minute after it stops, has no execution limit, and starts a shim
+  (`run-postoffice.cmd`) that writes the log and rotates it at 5 MB, because Task Scheduler
+  captures nothing. The console port is opened in the firewall only when `-OpenFirewall` is
+  asked for; the configuration is ACL'd to SYSTEM and Administrators instead of chmod 0600.
+  Both installers then re-create `node_modules/@rfmail/*` as links into `packages/`: Node
+  refuses to strip types for a file under `node_modules`, so a dereferenced copy — which is what
+  `robocopy` and `Copy-Item` make — refuses to start with
+  `ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`. A junction on Windows (no privilege), a
+  symlink on Unix, so a tree unpacked from an archive that stored links as files still installs.
+  Verified here with PowerShell 7 and `-NoService`: the copy, the generated configuration, the
+  shim, and the installed tree serving its console; the Task Scheduler, `icacls` and firewall
+  branches need a Windows machine and have not been run. (R7.9, R9.1)

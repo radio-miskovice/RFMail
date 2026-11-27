@@ -5,14 +5,12 @@
 	let {
 		mailboxes,
 		busy,
-		error,
 		oncreate,
 		onupdate,
 		ondelete
 	}: {
 		mailboxes: PoMailbox[];
 		busy: boolean;
-		error: string;
 		oncreate: (input: { callsign: string; password?: string }) => void;
 		onupdate: (id: number, patch: { enabled?: boolean; password?: string }) => void;
 		ondelete: (id: number) => void;
@@ -114,7 +112,6 @@
 			<p class="empty">No mailboxes yet.</p>
 		{/if}
 
-		{#if error}<p class="error" role="alert">{error}</p>{/if}
 
 		<form class="add" onsubmit={submit}>
 			<label class="field">

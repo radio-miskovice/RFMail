@@ -176,6 +176,19 @@ fi
 run mkdir -p "$DATA"
 run mkdir -p "$(dirname "$CONFIG")"
 
+# The workspace packages are TypeScript that node runs directly, and node refuses to strip
+# types for a file under node_modules. The link is what puts the real path outside
+# node_modules, so it is load-bearing: a tree whose links were lost (unpacked from an
+# archive that stored them as files) refuses to start with
+# ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING. Re-create them, whatever arrived.
+if [ "$DRY_RUN" -eq 0 ] && [ -d "$PREFIX/packages" ]; then
+	mkdir -p "$PREFIX/node_modules/@rfmail"
+	for package in "$PREFIX"/packages/*; do
+		[ -d "$package" ] || continue
+		ln -sfn "$package" "$PREFIX/node_modules/@rfmail/$(basename "$package")"
+	done
+fi
+
 # -- the configuration --------------------------------------------------------
 #
 # Written once and never again: it holds the two generated keys, and overwriting it would

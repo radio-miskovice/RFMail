@@ -13,8 +13,10 @@ import type { AddressInfo } from 'node:net';
 import { createLogger, SESSION_COOKIE, Sessions } from '@rfmail/server';
 import type { PostOffice, PostOfficeSnapshot } from '@rfmail/server';
 import { PeerPolicy } from '@rfmail/mailservers';
+import { TransceiverLinks } from '@rfmail/rig';
 import { hashPassword, SqliteStore } from '@rfmail/store';
 import { createPoApi } from '../apps/postoffice/src/api.ts';
+import { fakeRigctld } from './helpers/fake-rigctld.ts';
 
 const silent = createLogger('error', () => {});
 
@@ -65,12 +67,14 @@ async function harness(): Promise<{
 	base: string;
 	store: SqliteStore;
 	postOffice: FakePostOffice;
+	radio: TransceiverLinks;
 	close: () => Promise<void>;
 }> {
 	const store = new SqliteStore({ path: ':memory:', postOffice: true });
 	await store.migrate();
 	const storeKey = Buffer.alloc(32, 9).toString('base64');
 	const postOffice = new FakePostOffice();
+	const radio = new TransceiverLinks();
 	const api = createPoApi({
 		store,
 		sessions: new Sessions('postoffice-test-secret'),
@@ -78,6 +82,7 @@ async function harness(): Promise<{
 		logger: silent,
 		storeKey,
 		postOffice: postOffice as unknown as PostOffice,
+		radio,
 		uiDir: '/nonexistent-ui',
 		secureCookies: false,
 		appVersion: '0.0.0-test',
@@ -90,7 +95,9 @@ async function harness(): Promise<{
 		base: `http://127.0.0.1:${address.port}`,
 		store,
 		postOffice,
+		radio,
 		close: async () => {
+			radio.closeAll();
 			await new Promise<void>((resolve) => server.close(() => resolve()));
 			await store.close();
 		}
@@ -357,6 +364,7 @@ test('an administrator cannot lock the station out of itself', async () => {
 
 test('the station arms one modem and reports it, and a modem in use cannot be removed', async () => {
 	const app = await harness();
+	const rig = await fakeRigctld();
 	try {
 		await setup(app.base);
 		const { cookie, csrf } = await signIn(app.base, 'sysop', 'correct horse battery');
@@ -376,21 +384,54 @@ test('the station arms one modem and reports it, and a modem in use cannot be re
 		assert.equal(modem.status, 201);
 		assert.equal(modem.body.commandPort, 8300, 'the vendor port fills in on the server');
 
-		const armed = await call<{ armed: boolean; modemId: number; callsign: string }>(
+		// No radio yet: arming would key a transmitter on whatever frequency it held.
+		const noRadio = await call<{ fields?: Record<string, string> }>(app.base, 'POST', '/api/station/arm', {
+			cookie,
+			csrf,
+			body: { modemId: modem.body.id, frequencyHz: 3_595_500 }
+		});
+		assert.equal(noRadio.status, 409);
+		assert.equal(noRadio.body.fields?.['radio'], 'missing');
+
+		const radio = await call<{ transceiver: { host: string } | null; link: { state: string; model: string } }>(
+			app.base,
+			'PUT',
+			'/api/radio',
+			{ cookie, csrf, body: { host: '127.0.0.1', port: rig.port, pttInput: 'rear' } }
+		);
+		assert.equal(radio.status, 200);
+		assert.equal(radio.body.link.state, 'connected');
+		assert.equal(radio.body.link.model, 'TS-590S', 'the radio names itself');
+
+		// A dial is required, because an inbound call cannot be tuned for.
+		const noDial = await call<{ fields?: Record<string, string> }>(app.base, 'POST', '/api/station/arm', {
+			cookie,
+			csrf,
+			body: { modemId: modem.body.id }
+		});
+		assert.equal(noDial.status, 400);
+		assert.equal(noDial.body.fields?.['frequencyHz'], 'required');
+
+		const armed = await call<{ armed: boolean; modemId: number; callsign: string; frequencyHz: number }>(
 			app.base,
 			'POST',
 			'/api/station/arm',
-			{ cookie, csrf, body: { modemId: modem.body.id } }
+			{ cookie, csrf, body: { modemId: modem.body.id, frequencyHz: 3_595_500 } }
 		);
 		assert.equal(armed.status, 200);
 		assert.equal(armed.body.armed, true);
 		assert.equal(armed.body.modemId, modem.body.id);
 		assert.equal(armed.body.callsign, 'OK4RM');
+		assert.equal(armed.body.frequencyHz, 3_595_500);
+
+		// The radio was tuned before the modem was armed, and in the modem's own mode.
+		assert.ok(rig.received.includes('\\set_freq 3595500'), rig.received.join(' | '));
+		assert.ok(rig.received.includes('\\set_mode PKTUSB -1'), rig.received.join(' | '));
 
 		const twice = await call(app.base, 'POST', '/api/station/arm', {
 			cookie,
 			csrf,
-			body: { modemId: modem.body.id }
+			body: { modemId: modem.body.id, frequencyHz: 3_595_500 }
 		});
 		assert.equal(twice.status, 409);
 
@@ -401,6 +442,47 @@ test('the station arms one modem and reports it, and a modem in use cannot be re
 		assert.equal(disarmed.body.armed, false);
 		const removed = await call(app.base, 'DELETE', `/api/modems/${modem.body.id}`, { cookie, csrf });
 		assert.equal(removed.status, 200);
+	} finally {
+		await rig.close();
+		await app.close();
+	}
+});
+
+test('a radio link that is down refuses arming instead of keying into the dark', async () => {
+	const app = await harness();
+	try {
+		await setup(app.base);
+		const { cookie, csrf } = await signIn(app.base, 'sysop', 'correct horse battery');
+		const modem = await call<{ id: number }>(app.base, 'POST', '/api/modems', {
+			cookie,
+			csrf,
+			body: { kind: 'vara', host: '127.0.0.1' }
+		});
+
+		// A closed loopback port: instant, local, and never the station's own hardware.
+		const radio = await call<{ link: { state: string; error: string } }>(app.base, 'PUT', '/api/radio', {
+			cookie,
+			csrf,
+			body: { host: '127.0.0.1', port: 1 }
+		});
+		assert.equal(radio.status, 200);
+		assert.equal(radio.body.link.state, 'error');
+
+		const arm = await call<{ error: string; fields?: Record<string, string> }>(
+			app.base,
+			'POST',
+			'/api/station/arm',
+			{ cookie, csrf, body: { modemId: modem.body.id, frequencyHz: 3_595_500 } }
+		);
+		assert.equal(arm.status, 409);
+		assert.equal(arm.body.fields?.['radio'], 'down');
+		assert.match(arm.body.error, /the radio link is down/);
+
+		// The radio cannot be removed while the station is answering with it.
+		const radioRow = await call<{ transceiver: { id: number } }>(app.base, 'GET', '/api/radio', { cookie });
+		assert.equal(radioRow.status, 200);
+		const removed = await call(app.base, 'DELETE', '/api/radio', { cookie, csrf });
+		assert.equal(removed.status, 200, 'no call is up, so removing it is allowed');
 	} finally {
 		await app.close();
 	}
