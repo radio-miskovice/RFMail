@@ -55,6 +55,13 @@ export interface DialOptions {
   bandwidthChoices?: number[] | null;
   /** How long to wait for the call to settle. */
   timeoutMs?: number;
+  /**
+   * Asked for while the dial is still running: the modem is told DISCONNECT and the socket
+   * closed after the usual grace, as any other ending of a call (decision 51).
+   */
+  signal?: AbortSignal;
+  /** Asked for while the dial is still running and not settling: the socket is cut at once. */
+  cutSignal?: AbortSignal;
   /** How many connect frames ARDOP should send. */
   connectRequests?: number;
   /**
@@ -184,6 +191,30 @@ export async function dialModem(options: DialOptions): Promise<DialOutcome> {
       startedAt,
       link: null,
     };
+
+    /** No closing sequence at all: the socket goes and the call ends here. */
+    const cut = (): void => {
+      if (state.finished) return;
+      state.finished = true;
+      clearTimeout(timer);
+      clearTimeout(graceTimer);
+      clearInterval(busyWatch);
+      socket.destroy();
+      resolve({
+        result: 'cancelled',
+        message: 'the operator cut the call',
+        log: [...state.log],
+        elapsedMs: Date.now() - state.startedAt,
+        connectedBandwidthHz: state.connectedBandwidthHz,
+      });
+    };
+
+    // The operator may stop a dial that is not getting anywhere: politely first, then by
+    // cutting it. Both are heard here, because the dial is often the long part of a session.
+    options.signal?.addEventListener('abort', () => hangUp('cancelled', 'the operator asked the link to come down'), {
+      once: true,
+    });
+    options.cutSignal?.addEventListener('abort', cut, { once: true });
 
     const finish = (result: DialResult, message: string): void => {
       if (state.finished) return;

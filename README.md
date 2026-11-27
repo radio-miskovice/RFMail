@@ -39,9 +39,27 @@ This is the first implementation step. What works today:
   RFC 822 import; TOML configuration generated on first start.
 
 Not implemented yet, by design (see `REQUIREMENTS.md`): rig control, modem
-interfaces, the B2F session engine, MariaDB/PostgreSQL adapters, and
-gateway/post-office roles. Mail composed today is queued in OUTBOX and waits for
-the radio side.
+interfaces, the B2F session engine, MariaDB/PostgreSQL adapters, and the gateway
+relay. Mail composed today is queued in OUTBOX and waits for the radio side.
+
+## The post office
+
+A Winlink post office — the station that *answers* calls and holds mail for other
+callsigns — is a separate application in this tree, `apps/postoffice`, with its own
+console, configuration, data directory and service. Its mailboxes never sign in to a
+browser; they collect over the radio, and the people who run the station are
+administrators with a local password and no mailbox. Design, installation and the
+console: `POSTOFFICE.md`.
+
+```sh
+npm run build:postoffice                       # build the console
+sudo deploy/install-postoffice.sh             # /opt, /etc, /var/lib, systemd unit
+#   or, without a service:
+deploy/install-postoffice.sh --no-service --prefix /opt/rfmail-po --data ~/.local/share/rfmail-postoffice
+```
+
+The console opens on `http://127.0.0.1:8090`; its first screen names the station (a
+callsign) and its first administrator.
 
 ## Quick start
 

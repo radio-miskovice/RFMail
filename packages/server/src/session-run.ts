@@ -30,6 +30,7 @@ import { parseClientIdentity, type Logger, type ModemKind } from '@rfmail/shared
 import type { Store, UserRecord } from '@rfmail/store';
 import { bandwidthOfMode, dialModem, hangUpModem, type DialOutcome } from './modem-dial.ts';
 import { tcpDuplex } from './tcp-duplex.ts';
+import type { Duplex } from '@rfmail/core-b2f';
 
 export interface SessionModem {
   name: string;
@@ -66,6 +67,22 @@ export interface SessionRunOptions {
   /** How long the call may take to come up. */
   dialTimeoutMs?: number;
   onLine?: (direction: '>' | '<', text: string) => void;
+  /**
+   * Data that is not text — a compressed message or another binary block: the first bytes, and
+   * how many arrived. The exchange reads bytes, so without this a session carrying an LZHUF
+   * message looks silent on the screen (decision 52).
+   */
+  onBinary?: (direction: '>' | '<', info: { hex: string; count: number }) => void;
+  /** Everything the modem says and every command sent, for the live view (decision 51). */
+  onModemLine?: (atMs: number, line: string) => void;
+  onCommand?: (atMs: number, command: string) => void;
+  /** Where the session is: dialling, connected, exchanging, closing. */
+  onStage?: (stage: 'dialing' | 'connected' | 'exchange' | 'closing', detail?: string) => void;
+  /**
+   * Hands the caller the two ways to stop this session once its sockets exist: ask the link to
+   * come down, or cut it. The screen's single control escalates from the first to the second.
+   */
+  bindControl?: (control: { disconnect(): void; abort(): void }) => void;
 }
 
 export interface SessionReport {
@@ -81,6 +98,50 @@ export interface SessionReport {
 }
 
 /** Runs one session and returns what happened. Never throws for an RF failure. */
+/**
+ * The data stream with an eye on the bytes that are not text. The exchange speaks B2F in lines
+ * and carries messages as binary blocks; the lines reach the screen through `onLine`, but a
+ * compressed message would arrive as silence. Anything with a byte that is neither printable
+ * nor CR/LF/TAB is reported with its head in hex and its length (decision 52).
+ */
+export function watchBytes(
+  stream: Duplex,
+  report: ((direction: '>' | '<', info: { hex: string; count: number }) => void) | undefined,
+): Duplex {
+  if (!report) return stream;
+
+  const HEAD = 12;
+  const inspect = (direction: '>' | '<', chunk: Uint8Array): void => {
+    for (const byte of chunk) {
+      if (byte === 0x0d || byte === 0x0a || byte === 0x09) continue;
+      if (byte >= 0x20 && byte <= 0x7e) continue;
+      const hex = Array.from(chunk.subarray(0, HEAD), (value) =>
+        value.toString(16).toUpperCase().padStart(2, '0'),
+      ).join(' ');
+      report(direction, { hex, count: chunk.length });
+      return;
+    }
+  };
+
+  return {
+    write(chunk: Uint8Array): void {
+      inspect('>', chunk);
+      stream.write(chunk);
+    },
+    async flush(): Promise<void> {
+      await stream.flush();
+    },
+    async close(): Promise<void> {
+      await stream.close();
+    },
+    async read(): Promise<Uint8Array> {
+      const chunk = await stream.read();
+      inspect('<', chunk);
+      return chunk;
+    },
+  };
+}
+
 export async function runSession(options: SessionRunOptions): Promise<SessionReport> {
   const { store, account, modem, logger } = options;
   const callsign = account.callsign;
@@ -96,10 +157,47 @@ export async function runSession(options: SessionRunOptions): Promise<SessionRep
 
   const bandwidthHz = options.bandwidthHz ?? bandwidthOfMode('VARA');
   const mode: SessionMode = options.mode ?? 'cms';
+
+  /** What the operator asked for while it was running, if anything: `disconnecting` or `abort`. */
+  let stopped: 'disconnecting' | 'abort' | null = null;
+  let commandSocket: Socket | null = null;
+  let dataSocket: Socket | null = null;
+  /** How a stop reaches a dial that is still running: politely, or by cutting it. */
+  const askDial = new AbortController();
+  const cutDial = new AbortController();
+
+  // The stop control exists from the first moment, because a dial can be the long part: it is
+  // bound to whatever sockets exist at the time, and a stop asked for during the dial ends the
+  // session the instant the dial returns (decision 51).
+  options.bindControl?.({
+    disconnect: () => {
+      if (stopped) return;
+      stopped = 'disconnecting';
+      options.onStage?.('closing', 'disconnecting the link');
+      dataSocket?.destroy();
+      askDial.abort();
+      try {
+        commandSocket?.write('DISCONNECT\r');
+      } catch {
+        /* the modem may already be gone; the sockets still come down */
+      }
+    },
+    abort: () => {
+      stopped = 'abort';
+      options.onStage?.('closing', 'aborting');
+      dataSocket?.destroy();
+      commandSocket?.destroy();
+      cutDial.abort();
+    },
+  });
+  options.onStage?.('dialing', `${options.target} through ${modem.name}`);
+
   const dial = await dialModem({
     host: modem.host,
     port: modem.commandPort,
     dialect: 'vara',
+    signal: askDial.signal,
+    cutSignal: cutDial.signal,
     hf: modem.kind !== 'vara-fm',
     p2p: mode === 'p2p',
     plainVara: modem.kind === 'data2g' || modem.kind === 'mercury',
@@ -110,10 +208,31 @@ export async function runSession(options: SessionRunOptions): Promise<SessionRep
     keepConnected: true,
     // Every word the modem says, with its timestamp: whether the far end sent a
     // disconnect frame or our own deadline expired is the question an operator asks first.
-    onModemLine: (atMs, line) => logger.info('modem line', { target: options.target, atMs, line }),
-    onCommand: (atMs, command) => logger.debug?.('modem command', { target: options.target, atMs, command }),
+    onModemLine: (atMs, line) => {
+      logger.info('modem line', { target: options.target, atMs, line });
+      options.onModemLine?.(atMs, line);
+    },
+    onCommand: (atMs, command) => {
+      logger.debug?.('modem command', { target: options.target, atMs, command });
+      options.onCommand?.(atMs, command);
+    },
     ...(options.dialTimeoutMs === undefined ? {} : { timeoutMs: options.dialTimeoutMs }),
   });
+
+  commandSocket = dial.link ?? null;
+
+  if (stopped) {
+    // The operator stopped it while it was still dialling; there is nothing to exchange.
+    commandSocket?.destroy();
+    return {
+      result: 'aborted',
+      message: stopped === 'abort' ? 'the session was aborted while dialling' : 'the session was disconnected while dialling',
+      dial,
+      exchange: null,
+      sent: [],
+      received: [],
+    };
+  }
 
   if (dial.result !== 'connected' || !dial.link) {
     // The reason travels with the report and into the log: "failed" on its own cannot tell
@@ -136,10 +255,20 @@ export async function runSession(options: SessionRunOptions): Promise<SessionRep
     };
   }
 
-  const commandSocket = dial.link;
-  let dataSocket: Socket | null = null;
   try {
     dataSocket = await openSocket(modem.host, modem.dataPort, 10_000);
+    if (stopped) {
+      dataSocket.destroy();
+      return {
+        result: 'aborted',
+        message: stopped === 'abort' ? 'the session was aborted' : 'the session was disconnected',
+        dial,
+        exchange: null,
+        sent: [],
+        received: [],
+      };
+    }
+    options.onStage?.('exchange', 'the exchange is running');
     logger.info('session running', { target: options.target, by: callsign, modem: modem.name });
 
     const outbox = await store.findFolder(account.id, 'OUTBOX');
@@ -232,8 +361,22 @@ export async function runSession(options: SessionRunOptions): Promise<SessionRep
       ...(options.silenceMs === undefined ? {} : { silenceMs: options.silenceMs }),
     });
 
-    const exchange = await session.run(tcpDuplex(dataSocket));
+    const exchange = await session.run(watchBytes(tcpDuplex(dataSocket), options.onBinary));
     await fileAway(store, account.id, exchange);
+
+    if (stopped) {
+      const why = stopped === 'abort' ? 'the session was aborted' : 'the session was disconnected';
+      logger.warn('session stopped by the operator', { target: options.target, why, sent: exchange.sent.length });
+      options.onStage?.('closing', why);
+      return {
+        result: 'aborted',
+        message: `${why} after ${exchange.sent.length} sent and ${exchange.received.length} received`,
+        dial,
+        exchange,
+        sent: exchange.sent,
+        received: exchange.received,
+      };
+    }
 
     const summary = describe(exchange);
     logger.info('session finished', {
@@ -261,7 +404,7 @@ export async function runSession(options: SessionRunOptions): Promise<SessionRep
     return { result: 'error', message: `the session could not run: ${reason}`, dial, exchange: null, sent: [], received: [] };
   } finally {
     dataSocket?.destroy();
-    const hangUp = await hangUpModem(commandSocket);
+    const hangUp = await hangUpModem(commandSocket as Socket);
     // Who ended the call, and whether the modem confirmed it. `sawDisconnected: false`
     // means the link closed without the far end saying so — which is not success.
     logger.info('session hangup', {

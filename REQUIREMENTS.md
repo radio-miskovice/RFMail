@@ -363,13 +363,21 @@ Robust Packet are out of scope for v1. The driver interface must not presuppose
 TCP so they can be added without redesign.
 
 **R3.13** The station remembers the gateways it has called and offers them before the catalogue
-is consulted. The remembered pair is the callsign and the dial frequency: a gateway reached on
-two dials is two ways to call it, ranked separately, and case is not part of the identity. An
-entry is made automatically when a session's dial actually connects — a call that never got
-through proves nothing and is not recorded — and each entry counts its uses, so the list is
-ordered by how often the station has used it and, between equals, by how recently. A callsign
-and frequency typed in by hand therefore become a one-click choice without anyone having to
-enter them twice, and an account that cannot use the RMS catalogue still gets a working list.
+is consulted. The remembered entry is the callsign, the dial frequency, **the digital mode and
+the kind of session**: a gateway reached on two dials, on one dial with two modes, or called once
+as a gateway and once as a peer, is a different way in each time — ranked separately, with case
+not part of the identity. An entry is made automatically when a session's dial actually connects
+— a call that never got through proves nothing and is not recorded — and each entry counts its
+uses, so the list is ordered by how often the station has used it and, between equals, by how
+recently. Picking an entry puts all four back in the form: callsign, dial, mode and session kind
+(a mode the station no longer has a modem for is left alone rather than forced, and an account
+without a Winlink password is not pushed into a gateway or post-office session). A callsign and
+frequency typed by hand therefore become a one-click choice without anyone having to enter them
+twice, and an account that cannot use the RMS catalogue still gets a working list. Entries
+recorded before the mode or the kind of session was kept show what they know and nothing more:
+a recording never fills in a missing mode or session kind, because a guess made once becomes a
+fact in the list for ever. The list is read from the store again after every session, and a call
+that went unanswered says in its report that it was not counted.
 
 ---
 
@@ -640,6 +648,37 @@ mail stays queued with attempt counts and a next-attempt time; queued mail is
 flushed before new inbound work when connectivity returns. Nothing is dropped
 and nothing is reported sent until the remote accepted the proposal.
 
+**R4.4.6 The post office as its own application.** The station that answers calls is
+`apps/postoffice`: a separate process from the client, with its own configuration, data
+directory, service unit and console, built on the same B2F engine, mail store, modem driver
+and rig client (decision 57). It starts no POP3, SMTP or IMAP door — its users collect over
+the radio and no mailbox there has a password a mail program could use — dials nothing of
+its own, and relays nothing. The client keeps only the `postoffice` *session mode*, which is
+how it calls somebody else's post office.
+
+* **Principals.** A mailbox is a callsign the station holds mail for: its sealed post-office
+  password, its folders and messages, its quota, and no session of any kind. An administrator
+  is a person with a local password and an optional permission to read envelope metadata; it
+  has no callsign and no mailbox. The two are separate tables checked by separate verifiers,
+  and no caller's challenge is ever judged against an administrator's password (decision 58).
+* **The B2F door.** Unchanged and frozen: SID, `;PQ:` with a fresh nonce, `;PR:`, judged before
+  the first proposal. The post-office password is the credential it accepts (decision 64), and
+  `b2f: allow | refuse` on a mailbox limits collection only — mail for a refused mailbox is
+  still accepted, because the caller authenticates as the sender (decision 63).
+* **The console.** Four screens and no user-facing mail reader: Station (one lamp, one word,
+  the modem picker, the modem list and recent calls), Mailboxes, Calls, Administrators. Every
+  answered call is written to a persistent call log — caller, start in UTC, elapsed, result,
+  messages in and out, reason — before the station re-arms, and the log carries no message
+  content at all (decision 66).
+* **Installation.** `deploy/install-postoffice.sh` installs a service account, a copy of the
+  tree, a configuration written once with both generated keys, and a systemd unit that restarts,
+  disarms on stop and can write only its data directory. The console is built before
+  installation; the Windows service wrapper is a later task (decision 67).
+* **Postponed.** The native door — a `;RFPO: 1` doorbell on the same data port, Noise with
+  static keys, PKI enrolment over the B2F door — is designed in decisions 59–62 and is not part
+  of the first release; the first step is the seam between the mail policy and the B2F framing
+  (decision 65). Envelope inspection, forwarding and rig control are the screens after this one.
+
 ### 4.5 Concurrency and scheduling
 
 **R4.5.1** Several sessions may run at once on different modems, including
@@ -652,6 +691,33 @@ its state and can be cancelled before it starts.
 
 **R4.5.3** Aborting a session closes the B2F exchange at a protocol boundary if
 possible (the remote may then finish its turn), and force-closes otherwise.
+
+**R4.5.4** A running session is shown in a modal of its own, carrying what the modem
+is told and what the exchange says as they happen — the modem's commands and the
+B2F lines, time-stamped, over a WebSocket authenticated by the same session cookie
+as the pages. The modal carries a single stop control: the first press asks the
+link to come down (the modem is told to disconnect, so the far end sees an end of
+link rather than a dead carrier), a second press while that is still happening
+cuts it at once. The control is available from the moment the dial starts, because
+the dial is often the long part of a session; a stop before the exchange begins
+ends the session without one.
+
+Every line names its speaker: the modem, or the station being called (its callsign, or
+`PEER` when none is given), and what arrives from the peer is set apart from what was
+sent. A block that is not text — a compressed message, any binary data — is shown as
+its first bytes in hexadecimal, an ellipsis and the number of bytes received, so an
+exchange carrying a message never looks idle. The sheet remains on the screen when the
+session ends, until it is closed by its own controls or the backdrop.
+Only the data channel is emphasised — the peer's lines bold, in one colour when received
+and another when sent — while the command channel's replies are plain and the commands
+sent to it are italic. The modem's `PTT ON` and `PTT OFF` are not printed: the transmitter
+is shown by an ON AIR lamp in the sheet's header, and each transmission adds one line
+giving the moment it began and how long it held the channel. A stretch in which nothing is said to the modem
+and nothing arrives from the peer, between one transmission and the next, is written as one
+line carrying the moment it began and how long it lasted; what cancels it is traffic — data from
+the peer or a command sent to the modem — not the modem's own progress chatter. The sheet keeps a fixed
+height between the top of the session screen and the bottom of the window, so the feed
+fills it and scrolls when it is full rather than the window growing.
 
 ### 4.6 Channel catalogue and manual targets
 
@@ -670,7 +736,18 @@ possible (the remote may then finish its turn), and force-closes otherwise.
 
 A session profile may hold either form. The catalogue is refreshed on demand and
 on a configurable interval; an empty or unavailable catalogue never prevents a
-manual session.
+manual session. In the manual path the band is not a separate decision: a dial typed
+into the form moves the band to the one the dial belongs to, so the form cannot say
+80 m in one field and 40 m in the next. A number that belongs to no band in the unit
+the field shows is read in the other unit — `3597` in a megahertz field is 3.597 MHz,
+which is what was meant.
+
+**R4.6.2** The catalogue is presented over the session form as a modal: choosing a
+channel fills the form and closes the modal, and the modal can also be left without
+choosing — by its close control, by a Cancel button, by a click on the backdrop, or
+by Escape — leaving the form exactly as it was. The page behind is inert while it is
+open, so a session is assembled in one place and no half-made choice is lost by
+looking at the list.
 
 ---
 

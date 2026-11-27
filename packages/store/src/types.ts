@@ -108,6 +108,10 @@ export interface SessionTargetRecord {
   id: number;
   callsign: string;
   frequencyHz: number;
+  /** The modem kind that answered there; null for an entry recorded before modes were kept. */
+  kind: string | null;
+  /** The kind of session that was run there; null for an entry recorded before types were kept. */
+  sessionMode: string | null;
   uses: number;
   lastUsedAt: number;
   createdAt: number;
@@ -116,6 +120,8 @@ export interface SessionTargetRecord {
 export interface CreateSessionTargetInput {
   callsign: string;
   frequencyHz: number;
+  kind: string;
+  sessionMode: string;
 }
 
 export interface CreateModemInput {
@@ -207,6 +213,57 @@ export interface CreateUserInput {
   callsign: string;
   pwHash: string | null;
   role: Role;
+}
+
+/**
+ * A post office administrator: a person who runs the station, not a mailbox.
+ *
+ * Deliberately not an account: no callsign, no mailbox, no mail address, and no
+ * credential any B2F challenge path can consult. The password protects the
+ * browser session only; `canInspect` is the separate permission to read other
+ * mailboxes' envelope metadata when investigating a problem (decision 58).
+ */
+export interface AdministratorRecord {
+  id: number;
+  name: string;
+  /** scrypt hash; never serialised to a client. */
+  pwHash: string;
+  canInspect: boolean;
+  enabled: boolean;
+  createdAt: number;
+}
+
+export interface CreateAdministratorInput {
+  name: string;
+  pwHash: string;
+  canInspect?: boolean;
+}
+
+/** One answered call, as the post office recorded it (decision 66). */
+export interface PostOfficeCallRecord {
+  id: number;
+  /** The callsign that called, as the modem reported it. */
+  peer: string;
+  /** Epoch milliseconds, UTC. */
+  startedAt: number;
+  elapsedMs: number;
+  result: 'complete' | 'failed' | 'aborted';
+  /** Messages the caller accepted. */
+  sent: number;
+  /** Messages the station accepted from the caller. */
+  received: number;
+  /** Why it stopped, when the result is not `complete`. */
+  reason: string | null;
+}
+
+export interface RecordCallInput {
+  peer: string;
+  startedAt: number;
+  elapsedMs: number;
+  result: 'complete' | 'failed' | 'aborted';
+  sent: number;
+  received: number;
+  reason?: string | null;
 }
 
 /**
@@ -318,6 +375,25 @@ export interface Store {
   setFlags(userId: number, messageId: number, flags: number): Promise<void>;
   moveMessage(userId: number, messageId: number, folderId: number): Promise<boolean>;
   deleteMessage(userId: number, messageId: number): Promise<boolean>;
+
+  // -- the post office's own records (decision 57) ---------------------------
+
+  /** The station's administrators; a client database has none. */
+  listAdministrators(): Promise<AdministratorRecord[]>;
+  countAdministrators(): Promise<number>;
+  createAdministrator(input: CreateAdministratorInput): Promise<AdministratorRecord>;
+  /** Matched without regard to case: a name typed at the sign-in form. */
+  findAdministrator(name: string): Promise<AdministratorRecord | null>;
+  getAdministrator(id: number): Promise<AdministratorRecord | null>;
+  updateAdministrator(
+    id: number,
+    patch: { pwHash?: string; enabled?: boolean; canInspect?: boolean },
+  ): Promise<AdministratorRecord | null>;
+  deleteAdministrator(id: number): Promise<boolean>;
+
+  /** One answered call, so a postmaster can answer "did it arrive?" without mail. */
+  recordCall(input: RecordCallInput): Promise<PostOfficeCallRecord>;
+  listCalls(limit?: number): Promise<PostOfficeCallRecord[]>;
 
   /** Bytes used by a user's messages and attachments. */
   usage(userId: number): Promise<number>;

@@ -290,7 +290,7 @@
 		padding: 0.4rem 0.5rem;
 		border: 1px solid var(--border);
 		border-radius: 0.35rem;
-		background: var(--panel);
+		background: var(--bg-panel);
 		color: inherit;
 		font: inherit;
 	}

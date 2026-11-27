@@ -1,6 +1,8 @@
 node_modules/
 apps/web/build/
 apps/web/.svelte-kit/
+apps/postoffice-web/build/
+apps/postoffice-web/.svelte-kit/
 *.db
 *.db-shm
 *.db-wal

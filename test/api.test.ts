@@ -1234,8 +1234,15 @@ test('a session moves mail through the modem and into the mailbox over HTTP', as
 			await fetch(`${base}/api/session/targets`, { headers: { cookie } })
 		).json()) as SessionTargetsResponse;
 		assert.deepEqual(targets.targets, [
-			{ callsign: 'OK1RAA', frequencyHz: 3_597_000, uses: 1, lastUsedAt: targets.targets[0]?.lastUsedAt },
-		]);
+				{
+					callsign: 'OK1RAA',
+					frequencyHz: 3_597_000,
+					kind: 'data2g',
+					sessionMode: 'cms',
+					uses: 1,
+					lastUsedAt: targets.targets[0]?.lastUsedAt,
+				},
+			]);
 		assert.ok((targets.targets[0]?.lastUsedAt ?? 0) > 0, 'the use is stamped');
 	} finally {
 		await close();

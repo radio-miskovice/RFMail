@@ -140,6 +140,13 @@ async function main(): Promise<void> {
       httpServer = createHttpServer((req, res) => void api.handle(req, res));
     }
 
+    // A running session's live view: the browser opens a WebSocket on `/api/session/ws` and the
+    // station carries the modem's words to it (decision 51). The cookie authenticates it, so
+    // nothing extra is handed out; anything else is refused on the spot.
+    httpServer.on('upgrade', (req, socket) => {
+      void api.handleUpgrade(req, socket).catch(() => socket.destroy());
+    });
+
     await new Promise<void>((resolveReady, reject) => {
       const server = httpServer;
       if (!server) {

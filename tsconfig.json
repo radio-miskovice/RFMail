@@ -18,6 +18,7 @@
   "include": [
     "packages/**/*.ts",
     "apps/backend/**/*.ts",
+    "apps/postoffice/**/*.ts",
     "test/**/*.ts"
   ]
 }

@@ -875,12 +875,30 @@ export interface GatewayList {
 export interface SessionTarget {
   callsign: string;
   frequencyHz: number;
+  /** The digital mode the session used, or null for an entry recorded before modes were kept. */
+  kind: ModemKind | null;
+  /** The kind of session that ran there, or null for an entry recorded before types were kept. */
+  sessionMode: SessionMode | null;
   uses: number;
   lastUsedAt: number;
 }
 
 export interface SessionTargetsResponse {
   targets: SessionTarget[];
+}
+
+/** The live view of a running session, carried over `/api/session/ws` (decision 51). */
+export type SessionEvent =
+  | { t: 'state'; state: 'dialing' | 'connected' | 'exchange' | 'closing' | 'done'; detail: string | null }
+  | { t: 'modem'; dir: '>' | '<'; text: string; atMs: number }
+  | { t: 'line'; dir: '>' | '<'; text: string; atMs: number }
+  /** Data that is not text — a compressed message, a binary block: head bytes and length. */
+  | { t: 'hex'; dir: '>' | '<'; hex: string; count: number; atMs: number }
+  | { t: 'end'; result: string; message: string };
+
+/** What the one control did: the link was asked to come down, or it was cut. */
+export interface SessionStopResponse {
+  phase: 'idle' | 'disconnecting' | 'aborted';
 }
 
 /** Whether a configured modem is actually listening, as of the last check. */
@@ -959,6 +977,8 @@ export type SessionMode = 'cms' | 'p2p' | 'postoffice';
 export interface SessionRunRequest extends SessionTestRequest {
   /** Defaults to `cms`: a Winlink RMS gateway or the CMS. */
   mode?: SessionMode;
+  /** The id of the live view this session reports to (decision 51). */
+  streamId?: string;
 }
 
 /** One protocol line of a session, in the direction it travelled. */
@@ -971,6 +991,8 @@ export interface SessionRunResponse {
   /** `complete` when both sides quit; the exchange itself succeeded. */
   result: 'complete' | 'failed' | 'aborted' | 'error';
   message: string;
+  /** How the dial ended: only `connected` puts the call in what was called before (R3.13). */
+  dialResult: 'connected' | 'failed' | 'error' | 'cancelled' | null;
   /** MIDs transmitted and moved to SENT. */
   sent: string[];
   /** MIDs that arrived and are now in INBOX. */
@@ -1097,4 +1119,133 @@ export interface Logger {
 /** RFC 2047 / address helpers are the backend's job; these stay textual. */
 export function isB2FMid(value: string): boolean {
   return /^[A-Z2-7]{3,12}$/.test(value);
+}
+
+// -- the post office application (decision 57) ------------------------------
+//
+// Two principals, and neither is the other (decision 58): a *mailbox* is a callsign
+// with its sealed credentials and its folders — it never signs in to a browser — and
+// an *administrator* is a person with a local password and no callsign. The types
+// below keep the two apart all the way to the screen, so no view can offer a mailbox
+// a login or an administrator a mailbox.
+
+/** The station as the post office sees itself before anybody signs in. */
+export interface PoStatus {
+  app: string;
+  version: string;
+  /** `setup` until the first administrator and the station callsign exist. */
+  state: 'setup' | 'ready';
+  /** The callsign the station answers as, or null before setup. */
+  callsign: string | null;
+}
+
+export interface PoAdministrator {
+  id: number;
+  name: string;
+  /** The separate permission to read other mailboxes' envelope metadata (default off). */
+  canInspect: boolean;
+  enabled: boolean;
+  createdAt: number;
+}
+
+export interface PoMe {
+  administrator: PoAdministrator;
+  /** The station's identity, which is a mailbox — not the signed-in person. */
+  callsign: string | null;
+  csrf: string;
+}
+
+export interface CreatePoAdministratorRequest {
+  name: string;
+  password: string;
+  canInspect?: boolean;
+}
+
+export interface UpdatePoAdministratorRequest {
+  enabled?: boolean;
+  canInspect?: boolean;
+  password?: string;
+}
+
+/** One mailbox the station holds mail for: a callsign, never a person's login. */
+export interface PoMailbox {
+  id: number;
+  callsign: string;
+  enabled: boolean;
+  quotaBytes: number;
+  /** Bytes its messages and attachments occupy. */
+  bytes: number;
+  messages: number;
+  /** Whether a post-office password is set (never the value). */
+  hasPassword: boolean;
+  createdAt: number;
+  /** The mailbox the station answers as; it cannot be deleted. */
+  isStation: boolean;
+}
+
+export interface CreatePoMailboxRequest {
+  callsign: string;
+  /** The post-office password; sealed, verified by recomputation, never returned. */
+  password?: string;
+  quotaBytes?: number;
+}
+
+export interface UpdatePoMailboxRequest {
+  enabled?: boolean;
+  /** Set or replace the post-office password. */
+  password?: string;
+  quotaBytes?: number;
+}
+
+/** The first start: the station's callsign and the first administrator, in one act. */
+export interface PoSetupRequest {
+  callsign: string;
+  name: string;
+  password: string;
+  locator?: string;
+}
+
+export interface PoLoginRequest {
+  name: string;
+  password: string;
+}
+
+/** One call the station answered, as the record keeps it (decision 66). */
+export interface PoCall {
+  id: number;
+  peer: string;
+  /** Epoch milliseconds, UTC. */
+  startedAt: number;
+  elapsedMs: number;
+  result: 'complete' | 'failed' | 'aborted';
+  sent: number;
+  received: number;
+  reason: string | null;
+}
+
+/** The station screen: what is armed, what it is doing, and what it has heard. */
+export interface PoStation {
+  callsign: string | null;
+  armed: boolean;
+  busy: boolean;
+  modemId: number | null;
+  modemName: string | null;
+  frequencyHz: number | null;
+  /** Why the modem stopped listening, when it is not armed after being armed once. */
+  error: string | null;
+  /** The call in progress (a session that has not finished), or null. */
+  current: PostOfficeSession | null;
+  /** The modems the station can answer on. */
+  modems: Array<{ id: number; name: string; kind: string; host: string; commandPort: number | null; dataPort: number | null }>;
+  recent: PoCall[];
+}
+
+export interface PoArmRequest {
+  modemId: number;
+  /** Recorded for the report; the radio is tuned by the operator until rig control lands. */
+  frequencyHz?: number;
+}
+
+export interface PoCallsResponse {
+  calls: PoCall[];
 }

@@ -2,7 +2,7 @@
 // stored procedures, no native ENUM, timestamps as epoch milliseconds in
 // INTEGER columns. Later dialect adapters reproduce this shape exactly.
 
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 13;
 
 export const MIGRATION_001 = `
 CREATE TABLE users (
@@ -225,3 +225,66 @@ CREATE TABLE session_targets (
 CREATE UNIQUE INDEX session_targets_pair ON session_targets (callsign COLLATE NOCASE, frequency_hz);
 CREATE INDEX session_targets_rank ON session_targets (uses DESC, last_used_at DESC);
 `;
+
+// The digital mode belongs to the entry (decision 49). The same gateway on the same dial can be
+// reached with VARA or with ARDOP, and which one was used is half of what the operator chose, so
+// the mode joins the key: the same pair reached two ways is two entries, ranked apart, and
+// picking one puts the mode back in the form. Entries recorded before this column existed keep
+// an empty mode, which the next successful use fills in rather than leaving a duplicate behind.
+export const MIGRATION_012 = `
+ALTER TABLE session_targets ADD COLUMN kind TEXT NOT NULL DEFAULT '';
+DROP INDEX IF EXISTS session_targets_pair;
+CREATE UNIQUE INDEX session_targets_pair ON session_targets (callsign COLLATE NOCASE, frequency_hz, kind);
+`;
+
+// The kind of session belongs to the entry as well (decision 50). The same station on the same
+// dial can be called as a Winlink gateway, as a peer, or as the post office of this station, and
+// each is a different conversation — so the session type joins the key beside the mode.
+// Entries from before the column keep an empty type and are claimed by the next use.
+export const MIGRATION_013 = `
+ALTER TABLE session_targets ADD COLUMN session_mode TEXT NOT NULL DEFAULT '';
+DROP INDEX IF EXISTS session_targets_pair;
+CREATE UNIQUE INDEX session_targets_pair
+  ON session_targets (callsign COLLATE NOCASE, frequency_hz, kind, session_mode);
+`;
+
+// The post office application's own tables (decision 57). They are applied only when a
+// store is opened for the post office, so a client station's database never grows tables
+// it has no use for. Two principals that are not accounts: a mailbox is a row in `users`
+// (a callsign, its sealed credentials, its folders) and an administrator is one of these —
+// a local name and a password, with no callsign and no mailbox (decision 58).
+//
+// `po_calls` is the station's record of the calls it answered: who called, when, for how
+// long, what the exchange did and why it stopped. It is the first place a postmaster looks
+// when a user says a message never arrived, and it carries no message content at all.
+export const MIGRATION_014 = `
+CREATE TABLE administrators (
+  id          INTEGER PRIMARY KEY,
+  name        TEXT    NOT NULL,
+  pw_hash     TEXT    NOT NULL,
+  can_inspect INTEGER NOT NULL DEFAULT 0,
+  enabled     INTEGER NOT NULL DEFAULT 1,
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX administrators_name ON administrators (name COLLATE NOCASE);
+
+CREATE TABLE po_calls (
+  id         INTEGER PRIMARY KEY,
+  peer       TEXT    NOT NULL,
+  started_at INTEGER NOT NULL,
+  elapsed_ms INTEGER NOT NULL,
+  result     TEXT    NOT NULL,
+  sent       INTEGER NOT NULL DEFAULT 0,
+  received   INTEGER NOT NULL DEFAULT 0,
+  reason     TEXT
+);
+CREATE INDEX po_calls_started ON po_calls (started_at DESC);
+`;
+
+/**
+ * The version a post office database reaches: the client's schema plus its own tables.
+ * A client build refuses a database newer than its own version, which is what stops a
+ * client from half-reading a post office's file if the two were ever pointed at one path.
+ */
+export const POSTOFFICE_SCHEMA_VERSION = 14;

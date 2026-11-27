@@ -302,18 +302,18 @@ test('a gateway is remembered once per dial, ranked by how often it answered', a
 	assert.deepEqual(await store.listSessionTargets(), []);
 
 	// Three calls to one gateway on one dial count as one entry used three times.
-	await store.recordSessionTarget({ callsign: 'OK0N', frequencyHz: 3_597_000 });
-	await store.recordSessionTarget({ callsign: 'ok0n', frequencyHz: 3_597_000 });
-	const third = await store.recordSessionTarget({ callsign: 'OK0N', frequencyHz: 3_597_000 });
+	await store.recordSessionTarget({ callsign: 'OK0N', frequencyHz: 3_597_000, kind: 'vara', sessionMode: 'cms' });
+	await store.recordSessionTarget({ callsign: 'ok0n', frequencyHz: 3_597_000, kind: 'vara', sessionMode: 'cms' });
+	const third = await store.recordSessionTarget({ callsign: 'OK0N', frequencyHz: 3_597_000, kind: 'vara', sessionMode: 'cms' });
 	assert.equal(third.uses, 3, 'a repeated pair counts a use, not a second entry');
 	assert.equal(third.callsign, 'OK0N', 'the newest spelling is kept');
 
 	// The same gateway reached on another dial is a different way to call it.
-	await store.recordSessionTarget({ callsign: 'OK0N', frequencyHz: 7_043_000 });
+	await store.recordSessionTarget({ callsign: 'OK0N', frequencyHz: 7_043_000, kind: 'vara', sessionMode: 'cms' });
 	// A millisecond apart, so "most recent" is a real ordering rather than a tie.
 	await new Promise((resolve) => setTimeout(resolve, 2));
 	// A gateway called once ranks below one called three times, and below a more recent call.
-	await store.recordSessionTarget({ callsign: 'HB9AK', frequencyHz: 14_109_600 });
+	await store.recordSessionTarget({ callsign: 'HB9AK', frequencyHz: 14_109_600, kind: 'vara', sessionMode: 'cms' });
 
 	const ranked = await store.listSessionTargets();
 	assert.deepEqual(
@@ -326,6 +326,67 @@ test('a gateway is remembered once per dial, ranked by how often it answered', a
 		'most used first; equal counts fall back to the more recent use',
 	);
 	assert.equal((await store.listSessionTargets(2)).length, 2, 'the list can be capped');
+	assert.equal(third.kind, 'vara', 'the mode that answered is kept with the entry');
+
+	// The same gateway on the same dial reached with another mode is a separate way in, and it
+	// does not inherit the first one's count (decision 49).
+	const other = await store.recordSessionTarget({ callsign: 'OK0N', frequencyHz: 3_597_000, kind: 'ardop', sessionMode: 'cms' });
+	assert.equal(other.uses, 1);
+	assert.equal((await store.listSessionTargets()).filter((row) => row.frequencyHz === 3_597_000).length, 2);
+
+	// …and the same gateway, mode and dial called as a peer is a third entry, not a peer use of
+	// the gateway entry (decision 50).
+	const peer = await store.recordSessionTarget({
+		callsign: 'OK0N',
+		frequencyHz: 3_597_000,
+		kind: 'ardop',
+		sessionMode: 'p2p',
+	});
+	assert.equal(peer.uses, 1);
+	assert.deepEqual(
+		(await store.listSessionTargets())
+			.filter((row) => row.frequencyHz === 3_597_000)
+			.map((row) => [row.kind, row.sessionMode, row.uses])
+			.sort(),
+		[
+			['ardop', 'cms', 1],
+			['ardop', 'p2p', 1],
+			['vara', 'cms', 3],
+		],
+	);
+
+	// An entry from before the mode was kept knows nothing about it. A call that does know one is
+	// its own entry; the older one keeps what it knows and is never rewritten with a mode, let
+	// alone a session type, it did not have (decision 55).
+	(store as unknown as { run: (sql: string, ...args: unknown[]) => unknown }).run(
+		"INSERT INTO session_targets (callsign, frequency_hz, kind, session_mode, uses, last_used_at, created_at) VALUES ('OK0N', 10148000, '', '', 2, 1, 1)",
+	);
+	const typed = await store.recordSessionTarget({ callsign: 'OK0N', frequencyHz: 10_148_000, kind: 'xara', sessionMode: 'p2p' });
+	assert.equal(typed.kind, 'xara');
+	assert.equal(typed.sessionMode, 'p2p');
+	assert.equal(typed.uses, 1, 'a call of a known kind is its own entry, not a use of the unknown one');
+	const half = (await store.listSessionTargets()).filter((row) => row.frequencyHz === 10_148_000);
+	assert.deepEqual(
+		half.map((row) => [row.kind, row.sessionMode, row.uses]).sort(),
+		[
+			[null, null, 2],
+			['xara', 'p2p', 1],
+		],
+		'the unknown entry is left unknown, and nothing was invented into it',
+	);
+
+	// The same peer call again counts on the peer entry only: a gateway call never becomes one.
+	await store.recordSessionTarget({ callsign: 'ok0n', frequencyHz: 10_148_000, kind: 'xara', sessionMode: 'p2p' });
+	assert.deepEqual(
+		(await store.listSessionTargets())
+			.filter((row) => row.frequencyHz === 10_148_000)
+			.map((row) => [row.callsign, row.kind, row.sessionMode, row.uses])
+			.sort(),
+		[
+			['OK0N', null, null, 2],
+			['ok0n', 'xara', 'p2p', 2],
+		],
+	);
 
 	await store.close();
 });

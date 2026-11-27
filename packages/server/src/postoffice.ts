@@ -63,6 +63,13 @@ export interface PostOfficeOptions {
   /** Opens the sealed credentials; the caller owns the key. */
   openSecret(blob: string): string | null;
   silenceMs?: number;
+  /**
+   * Called once for every finished call, before the station re-arms. The post office
+   * application writes it to its call log, which is the record a postmaster reads when
+   * a user asks whether a message arrived. A client station has nowhere to keep one and
+   * leaves it out. Never throws: a failed record must not stop a station answering.
+   */
+  onCall?(session: PostOfficeSession): void;
 }
 
 export interface PostOfficeSnapshot {
@@ -100,12 +107,14 @@ export class PostOffice {
   private current: PostOfficeSession | null = null;
   /** Serialises re-arming so a second call cannot open two sessions. */
   private working = false;
+  private readonly onCall: ((session: PostOfficeSession) => void) | undefined;
 
   constructor(options: PostOfficeOptions) {
     this.store = options.store;
     this.logger = options.logger;
     this.openSecret = options.openSecret;
     this.silenceMs = options.silenceMs;
+    this.onCall = options.onCall;
   }
 
   snapshot(): PostOfficeSnapshot {
@@ -323,10 +332,19 @@ export class PostOffice {
       };
       this.logger.warn('post office session could not run', { peer, reason });
     } finally {
-      this.sessions = [this.current as PostOfficeSession, ...this.sessions]
+      const finished = this.current as PostOfficeSession;
+      this.sessions = [finished, ...this.sessions]
         .filter((entry) => entry.result !== null)
         .slice(0, SESSION_HISTORY);
       this.current = null;
+      try {
+        this.onCall?.(finished);
+      } catch (recordFailure) {
+        this.logger.warn('post office call was not recorded', {
+          peer,
+          reason: recordFailure instanceof Error ? recordFailure.message : String(recordFailure),
+        });
+      }
       this.data?.destroy();
       this.data = null;
       this.session = null;

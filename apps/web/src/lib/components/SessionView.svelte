@@ -7,7 +7,7 @@
 	// session itself uses, so there is no second dropdown to keep in step. The
 	// three things a session actually needs are then the gateway callsign, the
 	// dial frequency in hertz, and that mode.
-	import { onMount, untrack } from 'svelte';
+	import { onMount, tick, untrack } from 'svelte';
 	import {
 		dialFromCarrier,
 		modemDrivesMode,
@@ -20,6 +20,8 @@
 		type ModemKind,
 		type ModemStatus,
 		type SessionOptions,
+		type SessionEvent,
+		type SessionMode,
 		type SessionRunResponse,
 		type SessionTarget,
 		type SessionTestResponse,
@@ -79,6 +81,11 @@
 	let typedUnit = $state<DialUnit>('kHz');
 
 	let list = $state<GatewayList | null>(null);
+	/** How a remembered entry names the kind of session it ran (decision 50). */
+	const SESSION_KIND_LABEL: Record<SessionMode, string> = { cms: 'GW', p2p: 'P2P', postoffice: 'PO' };
+	/** The catalogue is a modal: it is a place to choose from and leave, not a second page. */
+	let listDialog = $state<HTMLDialogElement | null>(null);
+	let listOpen = $state(false);
 	/** Gateways this station has called before, most used first (decision 44). */
 	let targets = $state<SessionTarget[]>([]);
 	/** The connect test's state: null before the first run. */
@@ -89,6 +96,163 @@
 	let session = $state<{ state: 'running' | 'done'; response: SessionRunResponse | null; error: string } | null>(
 		null
 	);
+
+	// The live view of a running session (decision 51): the modem's own words and the exchange's
+	// lines, arriving over a WebSocket, in a modal that also carries the stop control.
+	let sessionDialog = $state<HTMLDialogElement | null>(null);
+	let liveBox = $state<HTMLOListElement | null>(null);
+	/** One line of the feed. `·` is not a direction: it marks a line about the air itself. */
+	type LiveLine = {
+		kind: 'modem' | 'line';
+		dir: '>' | '<' | '·';
+		text: string;
+		atMs: number;
+		note?: boolean;
+	};
+	let live = $state<LiveLine[]>([]);
+	/** Who the data lines are with: the station this session called, or plain PEER. */
+	let livePeer = $state('PEER');
+	let liveState = $state<{ state: string; detail: string | null } | null>(null);
+	/** What the single control has done so far: nothing, a disconnect asked, or an abort. */
+	let stopPhase = $state<'idle' | 'disconnecting' | 'aborted'>('idle');
+	/** The transmitter: the modem says `PTT ON` when it keys and `PTT OFF` when it stops. */
+	let onAir = $state(false);
+	/** When the current transmission began, in the session's own milliseconds. */
+	let transmitFrom = $state<number | null>(null);
+	/** When the key last dropped: the start of a silence, if nothing breaks it (decision 54). */
+	let idleFrom = $state<number | null>(null);
+	let streamId = $state<string | null>(null);
+	let socket: WebSocket | null = null;
+
+	/** Opens the session's own modal. Called when a session starts, not by an effect: the
+	 *  dialog is bound by then, and a screen that is not there to open is a bug worth seeing. */
+	async function openSessionSheet(): Promise<void> {
+		await tick();
+		const dialog = sessionDialog;
+		if (dialog && !dialog.open) dialog.showModal();
+	}
+
+	/** Adds a line where its own timestamp belongs, and keeps the tail short. */
+	function insertLive(entry: LiveLine): void {
+		const at = live.findIndex((other) => other.atMs > entry.atMs);
+		const next = at < 0 ? [...live, entry] : [...live.slice(0, at), entry, ...live.slice(at)];
+		live = next.slice(-400);
+		void tick().then(() => {
+			if (liveBox) liveBox.scrollTop = liveBox.scrollHeight;
+		});
+	}
+
+	/** Opens the live view before the session starts, so nothing said is missed. */
+	function openStream(id: string): void {
+		socket?.close();
+		try {
+			const ws = new WebSocket(api.sessionStreamUrl(id));
+			socket = ws;
+			ws.onmessage = (message) => {
+				let event: SessionEvent;
+				try {
+					event = JSON.parse(String(message.data)) as SessionEvent;
+				} catch {
+					return;
+				}
+				if (event.t === 'state') {
+					liveState = { state: event.state, detail: event.detail };
+					return;
+				}
+				if (event.t === 'end') return;
+
+				// PTT is not something to read in a log: it is a lamp in the header, and one line
+				// when the transmission ends saying how long it held the channel (decision 53).
+				if (event.t === 'modem') {
+					const ptt = /^PTT\s+(ON|OFF)\b/i.exec(event.text.trim());
+					if (ptt) {
+						if (ptt[1]!.toUpperCase() === 'ON') {
+							// Nothing was said or sent while the key was down, but the silence after it
+							// may be worth a line: a call that is listening, not talking.
+							if (idleFrom !== null) {
+								const waited = (event.atMs - idleFrom) / 1000;
+								if (waited >= 0.1) {
+									insertLive({
+										kind: 'modem',
+										dir: '·',
+										text: `waiting ${waited.toFixed(1)} s`,
+										atMs: idleFrom,
+										note: true
+									});
+								}
+								idleFrom = null;
+							}
+							onAir = true;
+							transmitFrom = event.atMs;
+						} else {
+							onAir = false;
+							if (transmitFrom !== null) {
+								const held = Math.max(0, (event.atMs - transmitFrom) / 1000);
+								insertLive({
+									kind: 'modem',
+									dir: '>',
+									text: `TRANSMIT ${held.toFixed(1)} s`,
+									atMs: transmitFrom,
+									note: true
+								});
+								transmitFrom = null;
+							}
+							// The key is down and the air is the station's to listen to.
+							idleFrom = event.atMs;
+						}
+						return;
+					}
+				}
+				// Only traffic breaks the silence: data arriving from the peer, or a command sent
+				// to the modem. The modem's own chatter — `MODE …`, `IAMALIVE` — is not a sign that
+				// anything passed between the stations, and Data2G prints a `MODE` line after most
+				// transmissions; counting those would hide the waits this line exists to show.
+				if (event.t === 'hex' || event.t === 'line' || event.dir === '>') idleFrom = null;
+				if (event.t === 'hex') {
+					live = [
+						...live.slice(-399),
+						{
+							kind: 'line',
+							dir: event.dir,
+							text: `${event.hex} … ${event.count} bytes`,
+							atMs: event.atMs
+						}
+					];
+					void tick().then(() => {
+						if (liveBox) liveBox.scrollTop = liveBox.scrollHeight;
+					});
+					return;
+				}
+				// A long session says a great deal; the screen keeps the recent tail, and the
+				// whole of it is still in the report that follows.
+				live = [...live.slice(-399), { kind: event.t, dir: event.dir, text: event.text, atMs: event.atMs }];
+				void tick().then(() => {
+					if (liveBox) liveBox.scrollTop = liveBox.scrollHeight;
+				});
+			};
+			ws.onclose = () => {
+				if (socket === ws) socket = null;
+			};
+		} catch {
+			/* no live view: the session runs all the same, only without a running commentary */
+		}
+	}
+
+	/**
+	 * The one control. The first press asks the modem to disconnect, which the far end sees as a
+	 * normal end of link; a second press, while that is happening, cuts the link with no closing
+	 * sequence — what an operator needs when the signal has gone and the repeats would take
+	 * minutes to give up (decision 51).
+	 */
+	async function stopSession(): Promise<void> {
+		const id = streamId;
+		if (!id || session?.state !== 'running') return;
+		try {
+			stopPhase = (await api.stopSession(id)).phase;
+		} catch (err) {
+			error = err instanceof ApiRequestError ? err.message : 'the session did not take the request';
+		}
+	}
 
 	/** Told after an exchange, so the folder list behind the screen catches up. */
 	let { onSent, me }: { onSent?: () => void; me: Me } = $props();
@@ -204,6 +368,27 @@
 	/** The unit shown is the one being typed in; it follows the band and the pick. */
 	const unit = $derived<DialUnit>(typedUnit);
 
+	/** Opens the catalogue over the screen, fetching it only when there is nothing to show. */
+	async function openGateways(): Promise<void> {
+		if (!canWinlink) return;
+		listOpen = true;
+		if (!list) await loadGateways();
+	}
+
+	/** Closing leaves whatever was chosen alone: the form behind is the truth. */
+	function closeGateways(): void {
+		listOpen = false;
+	}
+
+	// The dialog is opened and closed from state, so the button that opens it, the row that
+	// picks, the close icon, Cancel and Escape all end in the same place.
+	$effect(() => {
+		const dialog = listDialog;
+		if (!dialog) return;
+		if (listOpen && !dialog.open) dialog.showModal();
+		else if (!listOpen && dialog.open) dialog.close();
+	});
+
 	/** The gateways called before, as the server ranks them: most used first. */
 	async function loadTargets(): Promise<void> {
 		try {
@@ -214,9 +399,9 @@
 	}
 
 	/**
-	 * Fills the two fields from a gateway called before. The band, the unit and the dial are
-	 * set the same way the catalogue's pick() sets them, so a favourite behaves like a channel
-	 * that was chosen from the list rather than typed.
+	 * Fills the three choices from a gateway called before: the callsign, the dial, and the
+	 * digital mode it answered on (decision 49). The band and the unit follow the dial the same
+	 * way the catalogue's pick() sets them.
 	 */
 	function useTarget(target: SessionTarget): void {
 		callsign = target.callsign;
@@ -224,6 +409,18 @@
 		frequencyText = dialNumber(target.frequencyHz);
 		typedUnit = dialUnitFor(target.frequencyHz);
 		band = bandOf(target.frequencyHz);
+		// Only a mode this station has a modem for can be put back in the form; an entry from
+		// before modes were kept leaves the choice as it is.
+		if (target.kind && options?.modems.some((entry) => entry.kind === target.kind)) {
+			modem = target.kind;
+		}
+		// The kind of session is half of the choice too: a gateway is not a peer (decision 50).
+		// A gateway or post-office session needs the Winlink password, so an account without
+		// one keeps the peer-to-peer choice it is allowed to make.
+		if (target.sessionMode && (target.sessionMode === 'p2p' || canWinlink)) {
+			sessionMode = target.sessionMode;
+		}
+		pickedMode = null;
 		test = null;
 	}
 
@@ -241,13 +438,50 @@
 		// The service code decides: `VARA (DATA2G)` is a Data2G channel, whatever the mode
 		// string says, and picking it has to set Data2G or the session dials the wrong modem.
 		modem = modemForChannel(channel.family, channel.serviceCode);
+		// Choosing a channel is the reason the modal was opened; it closes behind the choice.
+		closeGateways();
 	}
 
-	/** Typing sets the hertz value; the text is left alone so the caret stays put. */
+	/** Waiting for the typing to settle before the catalogue is read again. */
+	let gatewayTimer: ReturnType<typeof setTimeout> | null = null;
+	function scheduleGateways(): void {
+		if (gatewayTimer) clearTimeout(gatewayTimer);
+		gatewayTimer = setTimeout(() => {
+			gatewayTimer = null;
+			void loadGateways();
+		}, 350);
+	}
+
+	/**
+	 * Typing sets the hertz value, and the band follows it: a 3597 kHz dial is an 80 m dial
+	 * whatever the list was showing before, so the band field can no longer sit on 40 m while
+	 * the form talks about 80 m. The text is left alone so the caret stays put.
+	 *
+	 * A number that lands in no band in the unit the field shows is read in the other one:
+	 * `3597` in a megahertz field is 3597 MHz by the letter, and 3.597 MHz by the intent.
+	 */
 	function onFrequencyInput(): void {
-		const parsed = parseDial(frequencyText, unit);
-		frequencyHz = parsed ? parsed.hz : null;
-		if (parsed) typedUnit = parsed.unit;
+		const typed = parseDial(frequencyText, unit);
+		if (!typed) {
+			frequencyHz = null;
+			return;
+		}
+		let parsed = typed;
+		if (bandOf(typed.hz) === 'unknown') {
+			const other = parseDial(frequencyText, typed.unit === 'kHz' ? 'MHz' : 'kHz');
+			if (other && bandOf(other.hz) !== 'unknown') parsed = other;
+		}
+		frequencyHz = parsed.hz;
+		typedUnit = parsed.unit;
+
+		const typedBand = bandOf(parsed.hz);
+		if (typedBand !== 'unknown' && typedBand !== band) {
+			band = typedBand;
+			// Above 144 MHz there is no estimate to order by, so the order falls back to
+			// distance instead of sorting by a column that is not shown.
+			if ((band === '2m' || band === '70cm') && sort === 'quality') sort = 'distance';
+			scheduleGateways();
+		}
 	}
 
 	/**
@@ -283,7 +517,11 @@
 		modems.filter((entry) => entry.enabled && modemDrivesMode(entry.kind, modem))
 	);
 
-	const chosenModem = $derived(compatibleModems.find((entry) => entry.id === modemId) ?? null);
+	// With one compatible modem the field shows one line, and that line is the choice: an
+	// unpicked select whose only option is shown must not read as "no modem".
+	const chosenModem = $derived(
+		compatibleModems.find((entry) => entry.id === modemId) ?? compatibleModems[0] ?? null
+	);
 
 	/** Whether the chosen modem is listening; null while the answer is unknown. */
 	const chosenRunning = $derived(
@@ -358,26 +596,51 @@
 	 */
 	async function runExchange(): Promise<void> {
 		if (!chosenModem || !isDial(frequencyHz)) return;
+		// An id for this run's live view. Not `crypto.randomUUID`, which a page served over
+		// plain HTTP to a LAN address does not get: the station is often opened that way.
+		const id = `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+		livePeer = callsign.trim().toUpperCase() || 'PEER';
+		streamId = id;
+		live = [];
+		liveState = null;
+		stopPhase = 'idle';
+		openStream(id);
 		session = { state: 'running', response: null, error: '' };
+		await openSessionSheet();
 		try {
 			const response = await api.runSession({
 				modemId: chosenModem.id,
 				mode: sessionMode,
 				target: callsign.trim().toUpperCase(),
 				frequencyHz: frequencyHz!,
-				bandwidthHz: pickedMode ? bandwidthOfMode(pickedMode) : undefined
+				bandwidthHz: pickedMode ? bandwidthOfMode(pickedMode) : undefined,
+				streamId: id
 			});
 			session = { state: 'done', response, error: '' };
 			// The mailbox changed under the screen: let the folder list catch up.
 			onSent?.();
-			// A gateway that answered has just been counted; the ranking may have moved.
-			void loadTargets();
 		} catch (err) {
 			session = {
 				state: 'done',
 				response: null,
 				error: err instanceof ApiRequestError ? err.message : 'The session failed.'
 			};
+		} finally {
+			// The sheet is a verdict now, not a running commentary: the stage starts over, and
+			// nothing is on the air any more.
+			onAir = false;
+			transmitFrom = null;
+			idleFrom = null;
+			liveState = { state: 'done', detail: 'the session has ended' };
+			stopPhase = 'idle';
+			// A call that answered has just been counted; the ranking may have moved, and the
+			// list of what this station calls is read from the store rather than remembered.
+			void loadTargets();
+			// The report is in hand; the socket has said what it had to say.
+			const closing = socket;
+			socket = null;
+			setTimeout(() => closing?.close(), 500);
+			streamId = null;
 		}
 	}
 
@@ -400,10 +663,6 @@
 			band !== '70cm' &&
 			(list === null || list.channels.length === 0 || list.channels.some((channel) => channel.frequencyHz < 144_000_000))
 	);
-	const placeholder = $derived(
-		unit === 'kHz' ? '7053.5' : band === '2m' || band === '70cm' || band === '6m' ? '144.8750' : '14.1096'
-	);
-
 	function sourceLine(): string {
 		if (!list) return '';
 		if (list.error) return `The catalogue could not be reached (${list.error}); showing ${list.stale ? 'what was cached earlier' : 'nothing'}.`;
@@ -500,7 +759,6 @@
 				<input
 					class="call"
 					bind:value={callsign}
-					placeholder="OK0N"
 					maxlength="10"
 					autocomplete="off"
 					spellcheck="false"
@@ -514,7 +772,6 @@
 					class="dial"
 					bind:value={frequencyText}
 					oninput={onFrequencyInput}
-					placeholder={placeholder}
 					inputmode="decimal"
 					autocomplete="off"
 				/>
@@ -534,51 +791,44 @@
 			</label>
 		</div>
 
-		{#if targets.length > 0}
+	{#if targets.length > 0}
 			<div class="targets" aria-label="Gateways called before">
 				<span class="targets-label">Called before</span>
-				{#each targets as target (target.callsign + target.frequencyHz)}
+				{#each targets as target (target.callsign + target.frequencyHz + (target.kind ?? '') + (target.sessionMode ?? ''))}
 					<button
 						class="target"
 						type="button"
-						title={`${target.callsign} on ${formatDial(target.frequencyHz)}, ${target.uses}×`}
+						title={`${target.callsign} on ${formatDial(target.frequencyHz)}${target.kind ? `, ${modemKindInfo(target.kind).label}` : ''}${target.sessionMode ? `, ${SESSION_KIND_LABEL[target.sessionMode]}` : ''} — used ${target.uses}×`}
 						onclick={() => useTarget(target)}
 					>
 						<strong>{target.callsign}</strong>
 						<span class="target-freq">{formatDial(target.frequencyHz)}</span>
+						{#if target.kind}<span class="target-mode">{modemKindInfo(target.kind).label}</span>{/if}
+						{#if target.sessionMode}<span class="target-type">{SESSION_KIND_LABEL[target.sessionMode]}</span>{/if}
 						{#if target.uses > 1}<span class="target-uses">{target.uses}×</span>{/if}
 					</button>
 				{/each}
 			</div>
 		{/if}
 
-		<div class="row">
-			<p class="forced">
-				Client identity:
-				{#if sessionMode === 'cms'}
-					<span class="mono">[{WINLINK_CLIENT_IDENTITY}-B2FHM$]</span> — the client type a Winlink CMS
-					accepts; it refuses any other, so this one is fixed for gateway sessions. This station's own
-					name, [{ownSid}-B2FHM$], is what it sends to a peer.
-				{:else}
-					<span class="mono">[{ownSid}-B2FHM$]</span> — this station's own name, which is what a peer
-					reads. A Winlink gateway session would present the client type the CMS accepts instead.
-				{/if}
-			</p>
-		</div>
+		<p class="sid">
+			SID:
+			<span class="mono">[{sessionMode === 'cms' ? WINLINK_CLIENT_IDENTITY : ownSid}-B2FHM$]</span>
+		</p>
 
 		<p class="hint">
 			{#if isDial(frequencyHz)}
 				{formatDial(frequencyHz!)} — the dial {band === 'any' ? '' : `on ${band}`}, 1.5 kHz below
 				the AF carrier the gateway lists.
 			{:else}
-				Below 10 MHz the dial is written in kilohertz (7053.5), from 10 MHz upwards in megahertz (14.1096).
+				Below 10 MHz the dial is written in kilohertz (3595.5), from 10 MHz upwards in megahertz (14.1096).
 			{/if}
 		</p>
 
 		<div class="actions">
 			{#if canWinlink}
-				<button class="btn" type="button" onclick={() => void loadGateways()}>
-					{list ? 'Refresh list' : 'Find gateways'}
+				<button class="btn" type="button" onclick={() => void openGateways()}>
+					{list ? 'Choose from the list' : 'Find gateways'}
 				</button>
 			{/if}
 			<button
@@ -645,82 +895,136 @@
 		</section>
 	{/if}
 
-	{#if session}
-		<section
-			class="report"
-			class:calling={session.state === 'running'}
-			class:ok={session.response?.result === 'complete'}
-			class:bad={session.state === 'done' &&
-				(session.error !== '' || (session.response !== null && session.response.result !== 'complete'))}
-		>
-			{#if session.state === 'running'}
-				<p class="verdict">
-					In session with {callsign.trim().toUpperCase()} on {formatDial(frequencyHz!)} through
-					{chosenModem?.name}…
-				</p>
+	<dialog
+		class="sheet running"
+		bind:this={sessionDialog}
+		oncancel={(event) => {
+			// While the transmitter is up, the sheet is not a thing to dismiss by accident.
+			if (session?.state === 'running') event.preventDefault();
+		}}
+		onclose={() => (session = null)}
+		onclick={(event) => {
+			// The sheet is dismissed by the backdrop, its close control, Escape or Close — but
+			// not while the transmitter is up.
+			if (event.target === sessionDialog && session?.state !== 'running') sessionDialog?.close();
+		}}
+	>
+		<div class="sheet-head">
+			<h3>
+				{#if session?.state === 'running'}
+					In session with {callsign.trim().toUpperCase()}
+				{:else if session?.response?.result === 'complete'}
+					Session complete
+				{:else if session?.response?.result === 'aborted'}
+					Session cancelled
+				{:else if session?.response?.result === 'failed'}
+					The session failed
+				{:else}
+					The session could not run
+				{/if}
+			</h3>
+			<span class="onair" class:lit={onAir} title={onAir ? 'The transmitter is on the air' : 'The transmitter is idle'}>
+				<span class="led" aria-hidden="true"></span>
+				ON AIR
+			</span>
+			<span class="stage">
+				{liveState?.detail ??
+					(stopPhase === 'disconnecting'
+						? 'disconnecting the link'
+						: stopPhase === 'aborted'
+							? 'aborting'
+							: (liveState?.state ?? ''))}
+			</span>
+			{#if session?.state !== 'running'}
+				<button class="sheet-close" type="button" aria-label="Close" title="Close" onclick={() => sessionDialog?.close()}>
+					×
+				</button>
+			{/if}
+		</div>
+
+		<div class="sheet-body">
+			{#if session?.state === 'running'}
 				<p class="detail">
-					The modem is transmitting. A session can take several minutes; the link is dropped at the end
-					either way.
+					{formatDial(frequencyHz!)} through {chosenModem?.name}. The modem is transmitting; the link is
+					dropped at the end either way.
 				</p>
-			{:else if session.response}
-				<p class="verdict">
-					{#if session.response.result === 'complete'}
-						Session complete
-					{:else if session.response.result === 'failed'}
-						The session failed
-					{:else if session.response.result === 'aborted'}
-						Session cancelled
-					{:else}
-						The session could not run
-					{/if}
-				</p>
+			{:else if session?.response}
 				<p class="detail">
 					{session.response.message} · {Math.round(session.response.elapsedMs / 100) / 10} s ·
 					{session.response.modemName}{session.response.transceiverName
 						? ` via ${session.response.transceiverName}`
 						: ''}
 				</p>
+				{#if session.response.dialResult !== 'connected'}
+					<p class="detail">
+						Not counted in Called before: the far end never answered, so this call says nothing
+						about that station.
+					</p>
+				{/if}
 				{#if session.response.remoteSid}
 					<p class="detail">The far end identified itself as {session.response.remoteSid}.</p>
 				{/if}
 				{#if session.response.sent.length > 0}
 					<p class="detail">
-						Sent {session.response.sent.join(', ')} — {session.response.sent.length === 1
-							? 'moved'
-							: 'each moved'} to SENT.
+						Sent {session.response.sent.join(', ')} — {session.response.sent.length === 1 ? 'moved' : 'each moved'} to SENT.
 					</p>
 				{/if}
 				{#if session.response.received.length > 0}
-					<p class="detail">
-						Received {session.response.received.join(', ')} — waiting in INBOX.
-					</p>
+					<p class="detail">Received {session.response.received.join(', ')} — waiting in INBOX.</p>
 				{/if}
 				{#if session.response.deferred.length > 0}
-					<p class="detail">
-						Asked for again later, still in OUTBOX: {session.response.deferred.join(', ')}.
-					</p>
+					<p class="detail">Asked for again later, still in OUTBOX: {session.response.deferred.join(', ')}.</p>
 				{/if}
 				{#if session.response.failed.length > 0}
 					<p class="detail">
-						Arrived damaged: {session.response.failed
-							.map((entry) => `${entry.mid} (${entry.reason})`)
-							.join('; ')}.
+						Arrived damaged: {session.response.failed.map((entry) => `${entry.mid} (${entry.reason})`).join('; ')}.
 					</p>
 				{/if}
-				<details class="log">
-					<summary>The exchange ({session.response.log.length} lines)</summary>
-					<pre>{session.response.log.map((entry) => `${entry.direction} ${entry.text}`).join('\n')}</pre>
-				</details>
-				<details class="log">
-					<summary>What the modem said while dialling ({session.response.dialLog.length} lines)</summary>
-					<pre>{session.response.dialLog.join('\n')}</pre>
-				</details>
-			{:else}
-				<p class="verdict">The session did not run</p>
+			{:else if session?.error}
 				<p class="detail">{session.error}</p>
 			{/if}
-		</section>
-	{/if}
+
+			{#if live.length > 0}
+				<ol class="live" bind:this={liveBox}>
+					{#each live as event, index (index)}
+						<li
+							class:modem={event.kind === 'modem'}
+							class:peer={event.kind !== 'modem'}
+							class:recv={event.dir === '<'}
+							class:out={event.dir === '>'}
+							class:note={event.note === true}
+						>
+							<span class="at">{(event.atMs / 1000).toFixed(1)}</span>
+							<span class="who">{event.kind === 'modem' ? 'MODEM' : livePeer}</span>
+							<span class="dir">{event.dir}</span>
+							<span class="text">{event.text}</span>
+						</li>
+					{/each}
+				</ol>
+			{:else if session?.state === 'running'}
+				<p class="hint">Waiting for the modem to answer…</p>
+			{/if}
+		</div>
+
+		<div class="sheet-foot">
+			{#if session?.state === 'running'}
+				<button
+					class="btn"
+					class:primary={stopPhase === 'idle'}
+					class:danger={stopPhase !== 'idle'}
+					type="button"
+					title={stopPhase === 'idle'
+						? 'Ask the modem to disconnect: the far end sees an end of link instead of a dead carrier'
+						: 'Cut the link now: no closing sequence, no waiting for repeats'}
+					onclick={() => void stopSession()}
+				>
+					{stopPhase === 'idle' ? 'Disconnect' : stopPhase === 'disconnecting' ? 'Abort' : 'Aborting…'}
+				</button>
+			{:else}
+				<button class="btn primary" type="button" onclick={() => sessionDialog?.close()}>Close</button>
+			{/if}
+		</div>
+	</dialog>
 
 	{#if !canWinlink}
 		<div class="nonwl">
@@ -734,113 +1038,140 @@
 		</div>
 	{/if}
 
-	{#if list && canWinlink}
-		<div class="list-head">
-			<h3>RMS gateways</h3>
-			<div class="order">
-				<label class="inline check" title="Stations open for emergency traffic only, in addition to the ordinary ones">
-					<input type="checkbox" bind:checked={emcomm} onchange={() => void loadGateways()} />
-					<span>EMCOMM stations</span>
-				</label>
-				<label class="inline">
-					<span>Order</span>
-					<select bind:value={sort} onchange={() => void loadGateways()}>
-						{#if showEstimates}
-							<option value="quality">estimate (Rel × Qual)</option>
-						{/if}
-						<option value="distance">distance</option>
-						<option value="callsign">callsign</option>
-					</select>
-				</label>
-				<button class="btn ghost small" type="button" onclick={() => void loadGateways(true)} disabled={loading}>
-					{loading ? 'Fetching…' : 'Ask Winlink again'}
+	{#if canWinlink}
+		<dialog
+			class="sheet gateways"
+			bind:this={listDialog}
+			onclose={() => (listOpen = false)}
+			onclick={(event) => {
+				// A click that lands on the backdrop, not on the sheet, means "leave".
+				if (event.target === event.currentTarget) closeGateways();
+			}}
+		>
+			<div class="sheet-head">
+				<h3>RMS gateways</h3>
+				<div class="order">
+					<label class="inline check" title="Stations open for emergency traffic only, in addition to the ordinary ones">
+						<input type="checkbox" bind:checked={emcomm} onchange={() => void loadGateways()} />
+						<span>EMCOMM stations</span>
+					</label>
+					<label class="inline">
+						<span>Order</span>
+						<select bind:value={sort} onchange={() => void loadGateways()}>
+							{#if showEstimates}
+								<option value="quality">estimate (Rel × Qual)</option>
+							{/if}
+							<option value="distance">distance</option>
+							<option value="callsign">callsign</option>
+						</select>
+					</label>
+					<button class="btn ghost small" type="button" onclick={() => void loadGateways(true)} disabled={loading}>
+						{loading ? 'Fetching…' : 'Ask Winlink again'}
+					</button>
+				</div>
+				<button class="sheet-close" type="button" aria-label="Close the gateway list" title="Close" onclick={closeGateways}>
+					×
 				</button>
 			</div>
-		</div>
 
-		<p class="hint">
-			{sourceLine()}
-			{#if !list.origin}
-				· No grid square on this account, so distances are unknown — set it on the Account page.
-			{/if}
-		</p>
-
-		<table class="grid">
-			<thead>
-				<tr>
-					<th>Gateway</th>
-					<th class="num" title="AF carrier frequency as the gateway publishes it; the dial is 1.5 kHz lower">AF carrier</th>
-					<th>Locator</th>
-					<th>Mode</th>
-					<th>Hours</th>
-					<th class="num" title="Distance in kilometres from your WW-Locator">km</th>
-					<th class="num">Bearing</th>
-					{#if showEstimates}
-						<th class="num" title="Link Reliability">Rel</th>
-						<th class="num" title="Link Quality">Qual</th>
-					{/if}
-				</tr>
-			</thead>
-			<tbody>
-				{#each list.channels as channel (channel.callsign + channel.frequencyHz + channel.mode)}
-					<tr class:closed={!channel.openNow} onclick={() => pick(channel)} title="Use this channel">
-						<td class="mono strong">{channel.callsign}</td>
-						<td class="num mono">{formatDial(channel.frequencyHz)}</td>
-						<td class="mono dim">{channel.gridsquare || '—'}</td>
-						<td>
-							{channel.mode}
-							{#if channel.serviceCode !== 'PUBLIC'}
-								<span
-									class="svc"
-									class:emcomm={channel.serviceCode === 'EMCOMM'}
-									title={channel.serviceCode === 'EMCOMM'
-										? 'Open for emergency traffic only'
-										: `The gateway lists this channel under service code ${channel.serviceCode}`}
-								>
-									({channel.serviceCode})
-								</span>
-							{/if}
-						</td>
-						<td class="mono dim">{channel.hours}</td>
-						<td class="num">{channel.distanceKm === null ? '—' : channel.distanceKm}</td>
-						<td class="num dim">{channel.bearingDeg === null ? '—' : `${channel.bearingDeg}°`}</td>
-						{#if showEstimates}
-							<td class="num" class:low={channel.reliability < 0.35}>{channel.reliability.toFixed(2)}</td>
-							<td class="num" class:low={channel.quality < 0.45}>{channel.quality.toFixed(2)}</td>
-						{/if}
-					</tr>
+			<div class="sheet-body">
+				{#if loading && !list}
+					<p class="hint">Fetching the catalogue…</p>
+				{:else if !list}
+					<p class="hint">
+						The catalogue could not be read{error ? `: ${error}` : ''}. Close this and name the gateway by hand.
+					</p>
 				{:else}
-					<tr>
-						<td colspan={showEstimates ? 9 : 7} class="empty">
-							{#if (band === '2m' || band === '70cm' || band === '6m') && modem !== 'vara-fm'}
-								No {options?.modems.find((entry) => entry.kind === modem)?.label ?? modem} channel on {band}:
-								the FM gateways there take VARA FM.
-							{:else if modem === 'vara-fm'}
-								No VARA FM channel on {band}: FM gateways sit on 6 m, 2 m and 70 cm.
-							{:else}
-								No channel matches this modem and band.
-							{/if}
-						</td>
-					</tr>
-				{/each}
-			</tbody>
-		</table>
+					<p class="hint">
+						{sourceLine()}
+						{#if !list.origin}
+							· No grid square on this account, so distances are unknown — set it on the Account page.
+						{/if}
+					</p>
 
-		{#if list.channels.length > 0}
-			<p class="hint footnote">
-			{#if showEstimates}
-				Winlink publishes no reliability or quality figure: its catalogue carries the callsign, frequency, grid
-				square, modes, hours and claimed range, and nothing about propagation. Both columns are therefore our own
-				estimates, each from one set of facts — <strong>Rel</strong> (link reliability) from when the gateway last
-				reported and whether it is open now, <strong>Qual</strong> (link quality) from the band against the
-				distance. Neither knows the hour of day or the solar flux; a VOACAP prediction replaces both. Rows in
-				grey are outside their operating hours.
-			{:else}
-				At 144 MHz and above the path is line of sight, so no propagation estimate is offered — only distance and
-					bearing, which are facts. Rows in grey are outside their operating hours.
+					<table class="grid">
+						<thead>
+							<tr>
+								<th>Gateway</th>
+								<th class="num" title="AF carrier frequency as the gateway publishes it; the dial is 1.5 kHz lower">AF carrier</th>
+								<th>Locator</th>
+								<th>Mode</th>
+								<th>Hours</th>
+								<th class="num" title="Distance in kilometres from your WW-Locator">km</th>
+								<th class="num">Bearing</th>
+								{#if showEstimates}
+									<th class="num" title="Link Reliability">Rel</th>
+									<th class="num" title="Link Quality">Qual</th>
+								{/if}
+							</tr>
+						</thead>
+						<tbody>
+							{#each list.channels as channel (channel.callsign + channel.frequencyHz + channel.mode)}
+								<tr class:closed={!channel.openNow} onclick={() => pick(channel)} title="Use this channel">
+									<td class="mono strong">{channel.callsign}</td>
+									<td class="num mono">{formatDial(channel.frequencyHz)}</td>
+									<td class="mono dim">{channel.gridsquare || '—'}</td>
+									<td>
+										{channel.mode}
+										{#if channel.serviceCode !== 'PUBLIC'}
+											<span
+												class="svc"
+												class:emcomm={channel.serviceCode === 'EMCOMM'}
+												title={channel.serviceCode === 'EMCOMM'
+													? 'Open for emergency traffic only'
+													: `The gateway lists this channel under service code ${channel.serviceCode}`}
+											>
+												({channel.serviceCode})
+											</span>
+										{/if}
+									</td>
+									<td class="mono dim">{channel.hours}</td>
+									<td class="num">{channel.distanceKm === null ? '—' : channel.distanceKm}</td>
+									<td class="num dim">{channel.bearingDeg === null ? '—' : `${channel.bearingDeg}°`}</td>
+									{#if showEstimates}
+										<td class="num" class:low={channel.reliability < 0.35}>{channel.reliability.toFixed(2)}</td>
+										<td class="num" class:low={channel.quality < 0.45}>{channel.quality.toFixed(2)}</td>
+									{/if}
+								</tr>
+							{:else}
+								<tr>
+									<td colspan={showEstimates ? 9 : 7} class="empty">
+										{#if (band === '2m' || band === '70cm' || band === '6m') && modem !== 'vara-fm'}
+											No {options?.modems.find((entry) => entry.kind === modem)?.label ?? modem} channel on {band}:
+											the FM gateways there take VARA FM.
+										{:else if modem === 'vara-fm'}
+											No VARA FM channel on {band}: FM gateways sit on 6 m, 2 m and 70 cm.
+										{:else}
+											No channel matches this modem and band.
+										{/if}
+									</td>
+								</tr>
+							{/each}
+						</tbody>
+					</table>
+
+					{#if list.channels.length > 0}
+						<p class="hint footnote">
+							{#if showEstimates}
+								Winlink publishes no reliability or quality figure: its catalogue carries the callsign, frequency, grid
+								square, modes, hours and claimed range, and nothing about propagation. Both columns are therefore our own
+								estimates, each from one set of facts — <strong>Rel</strong> (link reliability) from when the gateway last
+								reported and whether it is open now, <strong>Qual</strong> (link quality) from the band against the
+								distance. Neither knows the hour of day or the solar flux; a VOACAP prediction replaces both. Rows in
+								grey are outside their operating hours.
+							{:else}
+								At 144 MHz and above the path is line of sight, so no propagation estimate is offered — only distance and
+								bearing, which are facts. Rows in grey are outside their operating hours.
+							{/if}
+						</p>
+					{/if}
 				{/if}
-			</p>
-		{/if}
+			</div>
+
+			<div class="sheet-foot">
+				<button class="btn" type="button" onclick={closeGateways}>Cancel</button>
+			</div>
+		</dialog>
 	{/if}
 </section>
 
@@ -867,7 +1198,7 @@
 		padding: 0.9rem 1rem;
 		border: 1px solid var(--line);
 		border-radius: 10px;
-		background: var(--panel);
+		background: var(--bg-panel);
 		display: grid;
 		gap: 0.7rem;
 	}
@@ -920,6 +1251,20 @@
 	.target-freq {
 		color: var(--muted);
 		font-variant-numeric: tabular-nums;
+	}
+
+	/* The digital mode the entry was reached with, said quietly beside the dial. */
+	.target-mode {
+		color: var(--faint);
+		font-size: 0.72rem;
+	}
+
+	/* …and the kind of session: a gateway, a peer, or the post office. */
+	.target-type {
+		color: var(--faint);
+		font-size: 0.66rem;
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
 	}
 
 	.target-uses {
@@ -979,14 +1324,9 @@
 		font-size: 0.76rem;
 	}
 
-	/* The client identity a Winlink session will present, stated rather than chosen. */
-	.forced {
-		grid-column: 1 / -1;
-		margin: 0;
-		padding: 0.45rem 0.6rem;
-		border: 1px solid var(--line);
-		border-radius: 8px;
-		background: var(--bg-raised);
+	/* What the station will call itself on the air: one line, no explanation. */
+	.sid {
+		margin: 0.6rem 0 0;
 		color: var(--muted);
 		font-size: 0.78rem;
 	}
@@ -1003,52 +1343,125 @@
 		flex-wrap: wrap;
 	}
 
-	.report {
-		margin: 1rem 0 1.4rem;
-		padding: 0.8rem 1rem;
+	/* ON AIR: the modem's PTT, shown instead of its two lines. */
+	.onair {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4rem;
+		margin-left: auto;
+		font-size: 0.7rem;
+		letter-spacing: 0.06em;
+		color: var(--faint);
+	}
+
+	.onair .led {
+		width: 0.65rem;
+		height: 0.65rem;
+		border-radius: 50%;
 		border: 1px solid var(--line);
-		border-left-width: 4px;
+		background: var(--bg);
+	}
+
+	.onair.lit {
+		color: #ff4444;
+		font-weight: 700;
+	}
+
+	/* A lamp that is on is red, not "the theme's danger colour": red is what a keyed
+	   transmitter looks like on a panel, and nothing else in the sheet is that colour. */
+	.onair.lit .led {
+		border-color: #ff0000;
+		background: #ff0000;
+		box-shadow: 0 0 6px #ff0000, 0 0 14px rgb(255 68 68 / 80%);
+	}
+
+	/* The running session says where it is, beside its title. */
+	.stage {
+		margin-left: auto;
+		font-size: 0.74rem;
+		color: var(--muted);
+	}
+
+	/* The live view: one line per thing said, the modem's words and the protocol's, in order. */
+	.live {
+		/* The data channel's two colours, distinct from the modem's grey. */
+		--peer: #123c8c;
+		--data-out: #1f7a3d;
+		margin: 0.5rem 0 0;
+		padding: 0.4rem 0.5rem;
+		list-style: none;
+		max-height: 45vh;
+		overflow: auto;
+		border: 1px solid var(--line);
 		border-radius: 8px;
-		background: var(--panel);
-		max-width: 62ch;
+		background: var(--bg);
+		font-family: ui-monospace, 'SFMono-Regular', Consolas, monospace;
+		font-size: 0.72rem;
+		line-height: 1.45;
+		/* The feed takes the height the sheet has; past that it scrolls. */
+		flex: 1;
+		min-height: 0;
+		max-height: none;
 	}
 
-	.report.calling {
-		border-left-color: var(--accent);
+	.live li {
+		display: grid;
+		grid-template-columns: 3.2rem 6rem 1rem 1fr;
+		gap: 0.5rem;
+		white-space: pre-wrap;
+		word-break: break-word;
 	}
 
-	.report.ok {
-		border-left-color: var(--ok, #2e7d32);
+	.live .at {
+		color: var(--faint);
+		text-align: right;
 	}
 
-	.report.bad {
-		border-left-color: var(--danger);
+	.live .who {
+		color: var(--faint);
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
 	}
 
-	.verdict {
-		margin: 0;
-		font-size: 0.95rem;
-		font-weight: 600;
+	.live .dir {
+		color: var(--accent);
+	}
+
+	.live li.modem .who {
+		color: var(--muted);
+	}
+
+	/* The data channel is the traffic the operator came for: bold, blue when it arrives and
+	   green when it goes. The command channel is machinery — its replies plain, its commands
+	   in italic, and neither of them bold. */
+	.live li.peer .who {
+		font-weight: 700;
+	}
+
+	.live li.peer.recv .who,
+	.live li.peer.recv .text,
+	.live li.peer.recv .dir {
+		color: var(--peer);
+	}
+
+	.live li.peer.out .who,
+	.live li.peer.out .text,
+	.live li.peer.out .dir {
+		color: var(--data-out);
+	}
+
+	.live li.peer .text {
+		font-weight: 700;
+	}
+
+	.live li.modem.out:not(.note) .text {
+		font-style: italic;
 	}
 
 	.detail {
 		margin: 0.3rem 0 0;
 		color: var(--muted);
 		font-size: 0.8rem;
-	}
-
-	.log {
-		margin-top: 0.5rem;
-		font-size: 0.78rem;
-		color: var(--muted);
-	}
-
-	.log pre {
-		margin: 0.3rem 0 0;
-		max-height: 12rem;
-		overflow: auto;
-		white-space: pre-wrap;
-		font-size: 0.74rem;
 	}
 
 	.warn {
@@ -1064,17 +1477,114 @@
 		max-width: 44ch;
 	}
 
-	.list-head {
-		display: flex;
-		align-items: baseline;
-		justify-content: flex-start;
-		gap: 1.3rem;
-		margin-bottom: 0.4rem;
+	/* The catalogue comes up over the screen: choosing is the point, and leaving is one click. */
+	.sheet {
+		width: min(78rem, calc(100vw - 2rem));
+		max-height: calc(100vh - 3rem);
+		padding: 0;
+		border: 1px solid var(--line);
+		border-radius: 12px;
+		background: var(--bg-panel);
+		color: var(--fg);
+		overflow: auto;
 	}
 
-	.list-head h3 {
+	/* The session's sheet is a frame, not a box that grows: it spans the session screen — from
+	   under the app's 56px header to just above the bottom of the window — and hands the space
+	   to the feed, which scrolls when it is full (decision 53). */
+	/* `[open]` matters: a dialog that is not open is hidden by `display: none`, and a plain
+	   class rule that sets `display: flex` would put the closed sheet on the page, over the
+	   fields it belongs to. */
+	.sheet.running[open] {
+		inset: calc(56px + 1rem) 0 1rem 0;
+		height: auto;
+		max-height: none;
+		margin: 0 auto;
+		display: flex;
+		flex-direction: column;
+		overflow: hidden;
+	}
+
+	.sheet.running .sheet-head,
+	.sheet.running .sheet-foot {
+		position: static;
+		flex: none;
+	}
+
+	.sheet.running .sheet-body {
+		display: flex;
+		flex-direction: column;
+		flex: 1;
+		min-height: 0;
+		overflow: hidden;
+	}
+
+	.sheet::backdrop {
+		background: rgb(0 0 0 / 45%);
+	}
+
+	.sheet-head {
+		position: sticky;
+		top: 0;
+		z-index: 1;
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.8rem;
+		padding: 0.7rem 0.9rem;
+		background: var(--bg-panel);
+		border-bottom: 1px solid var(--line);
+	}
+
+	.sheet-head h3 {
 		margin: 0;
-		font-size: 0.9rem;
+		font-size: 0.95rem;
+	}
+
+	.sheet-head .order {
+		margin-left: auto;
+	}
+
+	.sheet-close {
+		font: inherit;
+		font-size: 1.15rem;
+		line-height: 1;
+		width: 1.9rem;
+		height: 1.9rem;
+		border: 1px solid var(--line);
+		border-radius: 8px;
+		background: var(--bg);
+		color: var(--muted);
+		cursor: pointer;
+	}
+
+	.sheet-close:hover {
+		color: var(--fg);
+		border-color: var(--accent);
+	}
+
+	.sheet-body {
+		padding: 0.2rem 0.9rem 0.6rem;
+	}
+
+	.sheet-foot .btn.danger {
+		border-color: var(--danger);
+		color: var(--danger);
+	}
+
+	.sheet-foot .btn.danger:hover {
+		background: var(--bg-hover);
+	}
+
+	.sheet-foot {
+		position: sticky;
+		bottom: 0;
+		display: flex;
+		justify-content: flex-end;
+		gap: 0.5rem;
+		padding: 0.6rem 0.9rem;
+		background: var(--bg-panel);
+		border-top: 1px solid var(--line);
 	}
 
 	.order {

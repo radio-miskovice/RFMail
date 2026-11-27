@@ -5,6 +5,7 @@
 // registered explicitly, so a new endpoint has to say whether it wants a user.
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { Duplex } from 'node:stream';
 import {
   DEFAULT_FOLDERS,
   FLAG_ANSWERED,
@@ -82,6 +83,7 @@ import { findUserByCredential, isLoopback, type MailEvents, type MailInterfaces,
 import type { TransceiverConfig, TransceiverLinks } from '@rfmail/rig';
 import { sanitiseHtml } from './html.ts';
 import { SESSION_COOKIE, parseCookies, type Sessions } from './auth.ts';
+import { SessionStreams } from './session-stream.ts';
 import { openSecret, sealSecret } from './secrets.ts';
 import { bandwidthOfMode, dialModem, identifyModem, probeModem, setModemListening } from './modem-dial.ts';
 import { runSession } from './session-run.ts';
@@ -94,6 +96,7 @@ import {
   selectChannels,
 } from './catalogue.ts';
 import { HttpError, Router, readJson, sendBytes, sendError, sendJson, type Ctx, type Handler } from './http.ts';
+import { normaliseCallsign, normaliseLocator } from './callsign.ts';
 import { createStaticHandler } from './static.ts';
 import type { Logger } from '@rfmail/shared';
 
@@ -259,10 +262,14 @@ export const transceiverConfigOf = (record: TransceiverRecord): TransceiverConfi
 export function createApi(services: ApiServices): {
   router: Router;
   handle: (req: IncomingMessage, res: ServerResponse) => Promise<void>;
+  /** The WebSocket upgrade for a running session's live view (decision 51). */
+  handleUpgrade: (req: IncomingMessage, socket: Duplex) => Promise<void>;
   loginAttempts: Map<string, { count: number; resetAt: number }>;
 } {
   const { store, sessions, policy, logger, storeKey, links, postOffice } = services;
   const router = new Router();
+  /** Live session views, keyed by the id the screen made up before it started (decision 51). */
+  const streams = new SessionStreams();
   const loginAttempts = new Map<string, { count: number; resetAt: number }>();
   const registrations = new Map<string, { count: number; resetAt: number }>();
 
@@ -1543,6 +1550,9 @@ export function createApi(services: ApiServices): {
     requireCsrf(ctx);
     const body = await readJson<SessionRunRequest>(ctx.req);
     const mode: SessionMode = body.mode ?? 'cms';
+    // The screen that asked for this session gets the modem's words as they happen and the
+    // one control that stops it (decision 51).
+    const stream = body.streamId ? streams.open(body.streamId) : null;
     if (mode !== 'cms' && mode !== 'p2p' && mode !== 'postoffice') {
       return sendJson(ctx.res, 400, { error: 'mode must be cms, p2p or postoffice' });
     }
@@ -1563,6 +1573,7 @@ export function createApi(services: ApiServices): {
     const startedAt = Date.now();
     logger.info('session start', { modem: modem.name, target, mode, frequencyHz, by: authed.user.callsign });
 
+    stream?.publish({ t: 'state', state: 'dialing', detail: `${target} through ${modem.name}` });
     const report = await runSession({
       store,
       account: authed.user,
@@ -1583,7 +1594,25 @@ export function createApi(services: ApiServices): {
       // own SID, which is what `localSid` defaults to.
       fakeClient: mode === 'cms' ? WINLINK_CLIENT_IDENTITY : null,
       logger,
+      // Everything the modem says, and every line of the exchange, as it happens.
+      onModemLine: (atMs, line) => stream?.publish({ t: 'modem', dir: '<', text: line, atMs }),
+      onCommand: (atMs, command) => stream?.publish({ t: 'modem', dir: '>', text: command, atMs }),
+      onLine: (direction, text) => stream?.publish({ t: 'line', dir: direction, text, atMs: Date.now() - startedAt }),
+      onBinary: (direction, info) =>
+        stream?.publish({ t: 'hex', dir: direction, hex: info.hex, count: info.count, atMs: Date.now() - startedAt }),
+      onStage: (state, detail) => stream?.publish({ t: 'state', state, detail: detail ?? null }),
+      // The screen's stop control, bound to the sockets this run owns.
+      bindControl: (control) => stream?.bind(control),
     });
+
+    stream?.publish({ t: 'end', result: report.result, message: report.message });
+    if (body.streamId) {
+      // The channel outlives its session by a minute, so a screen that reconnects after the end
+      // still reads the closing lines; the backlog is dropped when the next session starts.
+      const id = body.streamId;
+      const timer = setTimeout(() => streams.forget(id), 60_000);
+      timer.unref?.();
+    }
 
     logger.info('session ended', {
       modem: modem.name,
@@ -1601,12 +1630,18 @@ export function createApi(services: ApiServices): {
     // not limited to what the RMS catalogue lists (decision 44). A dial that never connected
     // proves nothing about the gateway and is not recorded.
     if (report.dial?.result === 'connected') {
-      await store.recordSessionTarget({ callsign: target.toUpperCase(), frequencyHz });
+      await store.recordSessionTarget({
+        callsign: target.toUpperCase(),
+        frequencyHz,
+        kind: modem.kind,
+        sessionMode: mode,
+      });
     }
 
     sendJson(ctx.res, 200, {
       result: report.result,
       message: report.message,
+      dialResult: report.dial?.result ?? null,
       sent: report.sent,
       received: report.received,
       deferred: report.exchange?.deferred ?? [],
@@ -1624,6 +1659,23 @@ export function createApi(services: ApiServices): {
   });
 
   /**
+   * The one control a running session has (decision 51). The first request asks the link to come
+   * down; a second, while that is still happening, cuts it. The server decides which step it is
+   * from the channel's own phase, so a screen cannot ask for an abort before a disconnect.
+   */
+  router.add('POST', '/api/session/stop', async (ctx) => {
+    const authed = requireLogin(ctx);
+    requireCsrf(ctx);
+    const body = await readJson<{ streamId?: string }>(ctx.req);
+    const id = typeof body.streamId === 'string' ? body.streamId : '';
+    const channel = id ? streams.get(id) : null;
+    if (!channel) throw new HttpError(404, 'no session is running under that id');
+    const phase = channel.stop();
+    logger.info('session stop', { streamId: id, phase, by: authed.user.callsign });
+    sendJson(ctx.res, 200, { phase });
+  });
+
+  /**
    * The gateways this station has called, most used first (decision 44). Not a setting: the
    * list is built from what the station did, so a gateway typed in from a bulletin appears
    * without anyone having to enter it twice.
@@ -1635,6 +1687,8 @@ export function createApi(services: ApiServices): {
       targets: rows.map((row) => ({
         callsign: row.callsign,
         frequencyHz: row.frequencyHz,
+        kind: row.kind as ModemKind | null,
+        sessionMode: row.sessionMode as SessionMode | null,
         uses: row.uses,
         lastUsedAt: row.lastUsedAt,
       })),
@@ -1970,7 +2024,25 @@ export function createApi(services: ApiServices): {
     }
   };
 
-  return { router, handle, loginAttempts };
+  /**
+   * The live view of a session: a WebSocket on `/api/session/ws?id=…`. The cookie is the same
+   * one the screens use, so a browser opens it with no extra credential; anything else is
+   * refused before the handshake (decision 51).
+   */
+  const handleUpgrade = async (req: IncomingMessage, socket: Duplex): Promise<void> => {
+    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+    if (url.pathname !== '/api/session/ws') {
+      socket.end('HTTP/1.1 404 Not Found\r\n\r\n');
+      return;
+    }
+    const cookies = parseCookies(req.headers.cookie);
+    const token = cookies[SESSION_COOKIE];
+    const session = token ? sessions.verify(token) : null;
+    const user = session ? await store.getUser(session.uid) : null;
+    streams.handleUpgrade(req, socket, Boolean(user && user.enabled));
+  };
+
+  return { router, handle, handleUpgrade, loginAttempts };
 }
 
 async function loadMailMessage(store: Store, userId: number, record: MessageRecord): Promise<MailMessage> {
@@ -2004,40 +2076,6 @@ function safeFilename(name: string): string {
  * Callsigns are stored upper case. A suffix such as `-10` or `/P` is allowed;
  * anything else is a validation error rather than a silent rewrite.
  */
-/** One callsign per account: an empty value clears it, anything else must look
- *  like a call sign (letters, digits, optionally one SSID). */
-function normaliseCallsign(input: unknown): string | null {
-  if (input === null || input === undefined) return null;
-  if (typeof input !== 'string') {
-    throw new HttpError(400, 'the callsign must be a string', { callsign: 'invalid' });
-  }
-  const value = input.trim().toUpperCase();
-  if (!value) return null;
-  if (!/^[A-Z0-9]{1,10}([-/][A-Z0-9]{1,3})?$/.test(value)) {
-    throw new HttpError(400, `invalid callsign: ${input}`, { callsign: 'invalid' });
-  }
-  if (/^[0-9]+$/.test(value)) {
-    throw new HttpError(400, `invalid callsign: ${input}`, { callsign: 'invalid' });
-  }
-  return value;
-}
-
-/** A grid square locator (`JO70AA` or the four-character `JO70`), or null. */
-function normaliseLocator(input: unknown): string | null {
-  if (input === null || input === undefined) return null;
-  if (typeof input !== 'string') {
-    throw new HttpError(400, 'the locator must be a string', { locator: 'invalid' });
-  }
-  const value = input.trim().toUpperCase();
-  if (!value) return null;
-  if (!/^[A-R]{2}[0-9]{2}([A-X]{2})?$/.test(value)) {
-    throw new HttpError(400, `invalid locator: ${input} (expected a grid square like JO70AA)`, {
-      locator: 'invalid',
-    });
-  }
-  return value;
-}
-
 /** A callsign belongs to exactly one mailbox; refuse to share it. */
 async function assertCallsignFree(
   store: Store,

@@ -1,0 +1,20 @@
+{
+  "name": "@rfmail/postoffice",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The post office application: answers B2F calls and holds mail for its mailboxes",
+  "bin": {
+    "rfmail-postoffice": "./src/main.ts"
+  },
+  "scripts": {
+    "start": "node src/main.ts"
+  },
+  "dependencies": {
+    "@rfmail/core-b2f": "*",
+    "@rfmail/mailservers": "*",
+    "@rfmail/server": "*",
+    "@rfmail/shared": "*",
+    "@rfmail/store": "*"
+  }
+}

@@ -34,6 +34,7 @@ import type {
 	SessionOptions,
 	SessionRunRequest,
 	SessionRunResponse,
+	SessionStopResponse,
 	SessionTargetsResponse,
 	SessionTestRequest,
 	SessionTestResponse,
@@ -283,6 +284,19 @@ export const api = {
 	/** The exchange itself: dial, move mail both ways, file it away, hang up. */
 	runSession: (body: SessionRunRequest): Promise<SessionRunResponse> =>
 		request('POST', '/api/session/run', body),
+
+	/**
+	 * The live view of a session: a WebSocket carrying the modem's words and the exchange's
+	 * lines as they happen. Opened before the run is posted, with the id the run carries.
+	 */
+	sessionStreamUrl: (streamId: string): string => {
+		const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+		return `${scheme}//${location.host}/api/session/ws?id=${encodeURIComponent(streamId)}`;
+	},
+
+	/** The one control: first call asks for a disconnect, a second during it aborts. */
+	stopSession: (streamId: string): Promise<SessionStopResponse> =>
+		request('POST', '/api/session/stop', { streamId }),
 
 	/** Arms or disarms a modem for inbound calls: `LISTEN ON` / `LISTEN OFF`. */
 	setModemListening: (id: number, on: boolean): Promise<ModemListenResponse> =>

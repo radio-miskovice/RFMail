@@ -116,6 +116,9 @@ rfmail/
   apps/
     backend/                  entry point: config load, migrate, start services
     web/                      SvelteKit 3 SPA (adapter-static), TypeScript
+    postoffice/               the station that answers calls: its own entry, config,
+                              console API and service (POSTOFFICE.md)
+    postoffice-web/           that station's console (SvelteKit static SPA)
   test/
     peers/                    scripted peers: fake-vara, fake-ardop, fake-rigctld,
                               fake-b2f-peer, fake-cms
@@ -125,6 +128,8 @@ rfmail/
   deploy/
     rfmail.service            systemd unit (Linux reference deployment)
     install.sh                the one command the operator runs (root, Linux)
+    install-postoffice.sh     the post office's installer; it writes the unit, so a
+                              checked-in .service file would be a second source
 ```
 
 Why workspaces rather than `src/`: `core-b2f` must be usable from a test with no
@@ -366,8 +371,10 @@ GET    /api/message/:id/attachment/:name
 GET    /api/message/:id/raw           .b2f download
 GET    /api/audit                     admin
 GET    /api/channels                  cached channel catalogue (optional)
-WS     /ws                            events: status, session.progress, session.log,
-                                      prompt, mailbox.changed, modem.state, rig.state
+WS     /api/session/ws?id=…           one running session's live view: its stage, the
+                                      modem's commands, the exchange's lines, its end;
+                                      authenticated by the session cookie (R4.5.4)
+POST   /api/session/stop              {streamId} — the one control: disconnect, then abort
 ```
 
 **Frontend**: SvelteKit 3, `adapter-static`, SPA (no SSR — the backend is the
@@ -660,6 +667,11 @@ packages/server/src/config.ts         TOML config, generated on first start
 packages/server/src/auth.ts           signed session cookie + CSRF nonce
 packages/server/src/http.ts           router, body limits, JSON helpers
 packages/server/src/api.ts            REST API, accounts, password changes
+packages/server/src/session-stream.ts the live view of a running session: a small
+                                      WebSocket server (handshake, text frames, close,
+                                      ping), a backlog per session, and the one control
+                                      that escalates from a disconnect to an abort
+                                      (decision 51)
 packages/server/src/html.ts           allowlist sanitiser for HTML bodies
 packages/server/src/secrets.ts        AES-256-GCM sealing for stored credentials
 packages/server/src/static.ts         SPA assets with fallback
@@ -865,7 +877,21 @@ Deviations from the plan above, and why:
   compared `NOCASE`; `recordSessionTarget()` upserts and counts, `listSessionTargets()` orders by
   `uses DESC, last_used_at DESC`. `POST /api/session/run` calls it only when
   `report.dial.result === 'connected'`, and `GET /api/session/targets` feeds the chips above the
-  client identity; clicking one sets target, dial, unit and band exactly as `pick()` does.
+  client identity; clicking one sets target, dial, unit and band exactly as `pick()` does. The
+  write is one `INSERT … ON CONFLICT (callsign COLLATE NOCASE, frequency_hz, kind, session_mode)
+  DO UPDATE` — no earlier `UPDATE` that filled a half-known row's missing mode or type, because
+  that is what relabelled peer calls as gateway calls; the chips are re-read after every run.
+  The run's answer carries `dialResult`, and when the dial did not connect the sheet says so in one
+  line — "Not counted in Called before: the far end never answered" — so a call that was made and
+  not counted is not a mystery. The client identity is shown as `SID: [<identity>-B2FHM$]` and
+  nothing else: which identity, and why, is the mode's business, not the operator's reading.
+* **The band is derived from the typed dial, not chosen beside it.** `onFrequencyInput()` parses
+  the field, and when the result lies in a band other than the selected one it sets `band` and
+  schedules one catalogue read (`scheduleGateways()`, 350 ms, so typing does not fire a request per
+  keystroke). A parse that lands in no band is retried in the other unit, which is what makes
+  `3597` in a MHz field mean 3.597 MHz. `onBandChange()` keeps the opposite rule — a frequency
+  outside the newly chosen band is dropped — so the two directions cannot contradict each other
+  and leave the form half-true.
 * **`RFMAIL_RIG_TRACE=1` logs every command the station sends to rigctld.** `setRigTrace()` in
   `packages/rig/src/rigctld.ts` is called from `exchange()` for each line written, so a setting
   that moved on the radio can be traced to a command or to the absence of one. Measured on
@@ -897,6 +923,24 @@ Deviations from the plan above, and why:
   ladder the operator read off the rig (00=50 … 13=2500), and a code outside it is reported as
   unknown rather than converted from another mode's table. `describeRig()` computes `usableHz` =
   filter − |shift − 1500|, which is what a centred signal can actually use.
+* **The catalogue is a `<dialog>`.** `listOpen` drives `showModal()`/`close()` from one
+  `$effect`, so the row click, the × , Cancel, the backdrop and Escape all land in the same
+  state; `onclose` (which is what Escape fires) only sets the flag. The gateway table moved
+  unchanged into `.sheet-body`, and the sort/EMCOMM/refresh controls stayed with it in a sticky
+  header.
+* **`--panel` did not exist.** The session panel and the catalogue sheet named a custom property
+  the stylesheet never defined, so both were transparent; they now use `--bg-panel`, which is
+  what `app.css` declares.
+* **The session target carries its mode.** Migration 12 adds `kind` to `session_targets` and
+  rebuilds the unique index over `(callsign NOCASE, frequency_hz, kind)`; `recordSessionTarget()`
+  first tries to claim a row whose mode is still empty (an entry from before the column) and
+  otherwise upserts on the triple. `POST /api/session/run` passes `modem.kind`, `GET
+  /api/session/targets` returns it, and the chip shows the mode label from `modemKindInfo`.
+* **The session kind joins the key.** Migration 13 adds `session_mode` and rebuilds the index over
+  `(callsign NOCASE, frequency_hz, kind, session_mode)`; `/api/session/run` records the mode it
+  ran in. The claim for rows written before the columns is `(kind = '' OR kind = ?) AND
+  (session_mode = '' OR session_mode = ?) AND (kind = '' OR session_mode = '')`, which fills a row
+  that knows nothing or agrees, and never lets two half-known rows take each other's place.
 
 Verified by hand, not only by tests: first-run creation, sign-in with the
 remembered name, three-pane mailbox with an imported multipart message, opening
@@ -926,6 +970,75 @@ image carried `data-src` only until the reader asked for images.
 Gates: `npm run check` 0 errors 0 warnings (tsc + svelte-check), `npm test`
 89/89, `npm run build:web` writes `apps/web/build`.
 
+* **The session is watched over a WebSocket, and stopped by one control** (decision 51).
+  `packages/server/src/session-stream.ts` speaks the WebSocket itself — the handshake
+  (`Sec-WebSocket-Accept` is `websocketAccept()`), one unmasked text frame per event, close and
+  ping — because the handshake and the frames this needs are a hundred lines and the station
+  already speaks its protocols by hand. `apps/backend/src/main.ts` hands `httpServer`'s `upgrade`
+  event to `api.handleUpgrade`, which checks the session cookie and then the id; the channel is
+  created on the upgrade rather than on the run, because the screen opens its view first and the
+  run joins it a moment later, and a screen that connects late is given the backlog (400 events).
+  `runSession` reports through `onStage`, `onCommand`, `onModemLine` and `onLine`, and hands the
+  two ways to stop it to `bindControl` before the dial, so a stop can reach `dialModem` through
+  `signal` (send `DISCONNECT`, wait out the grace) and `cutSignal` (destroy the socket now). The
+  screen's single button reads `Disconnect` → `Abort` → `Aborting…` from the phase the server
+  returns, and the sheet ends as `Session cancelled` with `the session was disconnected while
+  dialling` or `the session was aborted while dialling` — a stopped session is not a failed one.
+  `runSession` also wraps the data stream in `export function watchBytes()`, which reports any
+  chunk carrying a byte that is neither printable nor CR/LF/TAB as one `hex` event — the first
+  twelve bytes and the length — because the exchange reads messages as binary blocks and would
+  otherwise show nothing while a message came in; the screen prints those as
+  `3C 2A 4C 5A … 4128 bytes` under the peer's own label. Lines are labelled `MODEM` or by the
+  callsign being called, received text is dark blue and bold, and the sheet stays open after the
+  session until it is dismissed (button, ×, Escape or backdrop; none of them while running).
+  In the sheet the two channels are drawn apart: peer lines are bold (dark blue received, green
+  sent, `--peer` / `--data-out` under `.live`), modem replies plain, modem commands italic, and
+  `PTT ON`/`PTT OFF` become the header's `ON AIR` lamp plus one `TRANSMIT <n> s` line stamped with
+  A `PTT OFF` also remembers its moment in `idleFrom`, and the next `PTT ON` turns a gap with no
+  traffic in it into `· waiting <n> s`. Only traffic clears it — a peer line (`t: 'line'`), a
+  binary block (`t: 'hex'`) or a command sent to the modem (`t: 'modem'`, `dir: '>'`); the modem's
+  own replies (`MODE …`, `IAMALIVE`) are chatter and leave the wait standing, because Data2G sends
+  a `MODE` line after most transmissions and an "any line" rule hid every gap there was. `.sheet.running` is a
+  fixed frame (`inset: calc(56px + 1rem) 0 1rem 0`, flex column) and `.live` takes the remaining
+  height with `overflow: auto`, so a long session scrolls the feed and not the window.
+  The frame is written as `.sheet.running[open]`: a closed `<dialog>` is hidden by the user
+  agent's `display: none`, and a class rule setting `display: flex` without `[open]` puts the
+  closed sheet on the page, over the very fields the session form is there to fill.
+
 Next: the MariaDB/PostgreSQL adapters, then rig control and the modem drivers,
 then the B2F engine — which is where the LZHUF golden vectors and the scripted
 peers from milestone M4 come in.
+
+---
+
+## 14. The post office application (2026-11-27)
+
+* **It is a second application, and that is what retires the seat.** `apps/postoffice` has its
+  own entry point, configuration, data directory, console and service, and its database is never
+  the client's. The client's copy of the post office — `is_post_office`, the sign-in seat,
+  `postOffice` on the session payload, `/api/postoffice/*` and the post office screen — is still
+  in the tree; it is removed the next time the client is opened, and until then two ways into
+  one role exist, which is exactly what decision 57 retires. Do not add anything to the client's
+  post office screen in the meantime. What stays in the client for good is the `postoffice`
+  *session mode*, which is how it calls somebody else's post office.
+* **The store knows which application opened it.** `new SqliteStore({ postOffice: true })` adds
+  exactly one migration (`MIGRATION_014`: `administrators`, `po_calls`) and raises the supported
+  version to 14; a client store stays at 13 and refuses a file that has been to 14. That is
+  cheaper than two migration lists and keeps the client's schema honest.
+* **Two principals, two tables, two verifiers.** A mailbox is a `users` row with a callsign, a
+  sealed post-office password and no `pw_hash`; an administrator is an `administrators` row with
+  a name and a scrypt hash and no callsign. The console's session token carries an
+  *administrator* id, so its API never calls `store.getUser(session.uid)` — in that database the
+  same integer is a mailbox.
+* **A call is recorded where it ends.** `PostOffice` takes an optional `onCall` and fires it in
+  its `finally`, before re-arming; the post office writes that to `po_calls`. A client station
+  passes nothing, so its process keeps the in-memory history the session sheet uses.
+* **Installation generates, it does not template.** `deploy/install-postoffice.sh` writes the
+  configuration once (both keys) and then leaves it alone; re-running replaces the tree and the
+  unit and touches neither the configuration nor the database. `--print-unit` exists so the unit
+  can be reviewed and `systemd-analyze verify`ed without root, and `--no-service` installs files
+  and configuration only, which is also how the installer is tested here.
+
+Next for this application: the rig link and the radio tile (arming tunes the transceiver), the
+envelope-inspection view behind the `inspect` grant, then the `po-mail` / `po-b2f` split that the
+native door will need.

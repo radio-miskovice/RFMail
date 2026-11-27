@@ -1,11 +1,14 @@
 # Picking this up
 
-Written the evening of 25 November 2026. Everything below was run, measured or read
-from the real thing — where it was not, it says so.
+Written the evening of 26 November 2026, for the morning after. Everything below was
+run, measured or read from the real thing — where it was not, it says so.
 
-Repository `/home/jvavruska/dev/rfmail`, branch `main`, working tree dirty with the
-B2F session work described below, plus migration 007 (the login is the callsign).
-171 tests pass, `tsc` and `svelte-check` are clean.
+Repository `/home/jvavruska/dev/rfmail`, branch `master` (tracking `dev/master`),
+working tree dirty with **21 paths and nothing committed**: the session window and its
+live view (decisions 51–54), the corrections to *Called before* and to what the sheet
+says (55), the band that follows the typed dial (56), plus migrations 011–013 on
+`session_targets`. `npm test` 203/203, `tsc` and `svelte-check` clean, the web build
+written. Schema v13.
 
 ---
 
@@ -43,7 +46,7 @@ and a live check that shows whether each one is actually there: one small tile p
 protocol and LED, the address, then command, data and KISS port in three columns — with
 the labelled ports, the radio, the mode and the reason it is unavailable under the click.
 
-**Post office — new.** A station can now answer calls instead of only making them:
+**Post office.** A station can answer calls instead of only making them:
 `packages/server/src/postoffice.ts` arms one modem (`MYCALL`, `LISTEN ON`, the command
 socket stays open because `CONNECTED` is the only notice of a call), challenges the
 caller with a fresh `;PQ:` nonce, files inbound mail in the INBOX of every local
@@ -58,8 +61,8 @@ dropped, never answered `-`. Screen: **Post office** in the top bar; API:
 `GET /api/postoffice/status`, `POST /api/postoffice/arm` (`modemId`, `frequencyHz`),
 `POST /api/postoffice/disarm`. No gateway registration is involved.
 
-**The B2F exchange — new, and the point of the last day's work.** A session now
-dials, runs the FBB B2 protocol over the modem's data port, and files the mail away:
+**The B2F exchange.** A session dials, runs the FBB B2 protocol over the modem's data
+port, and files the mail away:
 
 - `packages/core-b2f/src/session.ts` is the exchange: handshake (`;FW:`, SID,
   `;PQ`→`;PR`, greeting), turns, proposal blocks with their `F>` checksum, the
@@ -77,6 +80,29 @@ dials, runs the FBB B2 protocol over the modem's data port, and files the mail a
 - `Store.findMessageByMid` answers "do I already have this MID", which is what makes
   a re-proposal after a dropped link harmless.
 
+**The session window — new.** A session now runs in a modal of its own and can be watched
+while it runs, instead of a button that says "In session…" for three minutes. The modem's
+command channel and the exchange's data channel are carried over a WebSocket
+(`/api/session/ws?id=…`, the page's own session cookie, a channel the screen names before it
+starts the run) and drawn as what they are: `MODEM` for the command channel — replies plain,
+commands in italic — and the callsign being called for the data channel, bold, dark blue when
+received and green when sent. `PTT ON`/`PTT OFF` are not logged; they drive an **ON AIR** lamp in
+the header (bright red), and each transmission leaves one line with the moment it began and how
+long it held the channel (`1.0 MODEM > TRANSMIT 3.0 s`); a gap with no traffic in it becomes
+`4.0 MODEM · waiting 5.0 s`. A binary block — a compressed message — is reported as its first
+twelve bytes in hex and a length, because the exchange carries messages as bytes and would
+otherwise look silent. The sheet carries one control: **Disconnect** asks the modem to bring the
+link down, and a second press while that is happening — the button now reads **Abort** — cuts
+both sockets. The server decides which step it is, and the control exists from the moment the
+dial starts, because the dial is often the long part. The sheet is a fixed frame between the app
+header and the bottom of the window; the feed scrolls, and the sheet stays until it is closed.
+
+**Called before, and the form.** The chips list what the station has actually called — callsign,
+dial, digital mode and the kind of session (GW/P2P/PO) — ranked by uses and then recency, read
+from the store again after every session, and a call that never got an answer says in its report
+that it was not counted. Typing a dial moves the band to the one that dial belongs to. The target
+field starts empty and carries nothing invented; the identity line is one line, `SID: [ … ]`.
+
 ---
 
 ## Running it
@@ -85,13 +111,12 @@ dials, runs the FBB B2 protocol over the modem's data port, and files the mail a
 export PATH="$HOME/.nvm/versions/node/v24.21.0/bin:$PATH"   # the system npm is broken
 
 cd /home/jvavruska/dev/rfmail
-npm test                                    # 141 pass
-npx tsc -p tsconfig.json                    # clean
-npm --workspace apps/web run check          # svelte-check, 0/0
+npm test                                    # 203 pass
+npm run check                               # tsc + svelte-check, 0 errors 0 warnings
 npm --workspace apps/web run build          # static site the backend serves
 ```
 
-The test instance, which is running now (started 25 Nov, built from this tree):
+The test instance, which is running now (restarted tonight from this tree, port 8082):
 
 ```bash
 T=$HOME/.hermes/cache/scratch/rfmail-phase2
@@ -103,7 +128,7 @@ HOME="$T/home" node apps/backend/src/main.ts --config "$T/rfmail.toml" --log inf
   the station is a Winlink client and has no post office owner, so the mail interfaces
   stay down (decision 31). Access is `strict` with `192.168.132.0/23`.
 * config `$T/rfmail.toml`; database `$T/home/.local/share/rfmail/rfmail.db`, schema
-  v7 (migration 007 copied each callsign into its login)
+  v13 (`session_targets` gained the digital mode in 012 and the kind of session in 013)
 * accounts OK1ABC (admin, **no mail password**), OK4RM, OK2XYZ (has a password set
   while testing) — the callsigns are the logins now, so the old names `jvavruska`,
   `ok4rm` and `operator` no longer sign in. The running instance still has the code
@@ -113,48 +138,40 @@ HOME="$T/home" node apps/backend/src/main.ts --config "$T/rfmail.toml" --log inf
 
 ---
 
-## The one thing that is blocked
+## Where the air time stands
 
-**Data2G is not reachable from this machine.** Measured today from 192.168.133.207:
+**The modem answers again.** The Data2G instance on `192.168.133.222` was unreachable when this
+file was first written; it is reachable now, and every session started today went out through
+it — the station keyed the transmitter, the modem reported its bandwidth, and the call either
+completed or timed out on the *far end*. The same host runs the other modems too: ARDOP on
+8515/8516 still refuses, and a Data2G restart can take the command port away again, so a modem
+that stops answering is still the first thing to check.
+
+**Three sessions have completed on the air, not just on sockets:**
 
 ```
-ping 192.168.133.222           answers, 0% loss, 0.6 ms
-135 139 445 3389 5040 5357 7680   open (Windows itself)
-8300 8301 8100 8515 8516          refused on .222
-4532 (rigctld)                    refused — it answered yesterday
-
-192.168.133.86:8300, :8301        no answer at all (SYN dropped), ping 6.9 ms
+2026-11-25 22:41  HB9AK   cms  3591.5 kHz  Data2G  complete
+2026-11-26 10:09  OK1RAA  p2p  3597.0 kHz  Data2G  complete
+2026-11-26 18:38  OK1RAA  p2p  3597.0 kHz  Data2G  complete
 ```
 
-Two different signals, and on Windows they mean the same thing. Data2G binds loopback
-by its own defaults (`data2g/host.py`: `--host 127.0.0.1`, `--command-port 8300`,
-`--kiss-address 127.0.0.1`, `--kiss-port 8100`), so a LAN connect either gets a refusal
-(.222 yesterday, where the firewall let the RST through) or is dropped by the
-Windows firewall before any RST (.86 today). A timeout is *not* evidence that the
-program is not running: a loopback-only listener produces exactly that from the client
-side. Settle it on the host, not from here.
+Those are what *Called before* lists, twice each, and they are the only entries the store has.
 
-In order, on the machine running Data2G:
+**Tonight's calls got no answer.** Two peer calls at 22:22 and 22:28 to `OK1RAA` and one gateway
+call at 22:29 to `HB9AK` all ended `dial=failed`, `no answer from … within 45 seconds` — the
+modem was there, the station transmitted, the gateway did not come back. Nothing was recorded,
+which is why the counts did not move; the sheet now says so in as many words.
 
-1. `powershell -c "Get-NetTCPConnection -LocalPort 8300 | Select LocalAddress,State,OwningProcess"`
-   (or `netstat -ano | findstr :8300`). `127.0.0.1:8300` means loopback-only;
-   `0.0.0.0:8300` means it is on the LAN and the firewall is dropping us.
-2. If loopback-only, start Data2G with `--host 0.0.0.0 --kiss-address 0.0.0.0`.
-   (Alternatives: run rfmail's backend on that machine and point the modem at
-   `127.0.0.1`; or `netsh interface portproxy add v4tov4 listenport=8300
-   connectaddress=127.0.0.1 connectport=8300`, same for 8301 and 8100.)
-3. If it is already on `0.0.0.0`, the firewall is the blocker:
-   `netsh advfirewall firewall add rule name="Data2G" dir=in action=allow protocol=TCP
-   localport=8300,8301,8100 remoteip=192.168.132.0/23`.
-4. Start rigctld too — 4532 was up yesterday and is down now, and a session refuses
-   to key a transmitter that it cannot tune first.
-5. Then, in the app: Session → Data2G → target `OK1RAA` → dial `3597.0` (kHz, 40 m) →
-   **Start session**. The TS-590S was left on 3597.0 kHz PKTUSB.
+Before the next call, check:
 
-That session transmits. Expect the exchange log: the gateway's SID and prompt, our
-`;FW: OK1ABC` and SID, the proposals for anything in OUTBOX, and either `FS +` with
-the framed message or `FQ`. With an empty OUTBOX it will be the short shape —
-`FF`/`FQ` — and still tells you whether the far end speaks B2.
+1. Put the rig back where a session expects it — it is sitting on **7041.0 kHz** now; an 80 m
+   peer call wants **3597.0 kHz PKTUSB**.
+2. Check the station being called is actually on: the catalogue (`GET /api/session/gateways`)
+   carries each channel's `openNow` from `api.winlink.org`, and a peer has to be listening by
+   arrangement.
+3. Then a peer call to `OK1RAA` on `3597.0` (kHz), or a gateway call through the catalogue, and
+   watch the new sheet: `MODEM` lines while dialling, `ON AIR` when the key goes down, `PEER`
+   lines when the far end answers.
 
 ---
 
@@ -162,54 +179,56 @@ the framed message or `FQ`. With an empty OUTBOX it will be the short shape —
 
 Proven by tests (over real sockets, not stubs of the engine):
 
-* `test/postoffice.test.ts` — a calling station dials a scripted modem, authenticates
-  with its post-office password, leaves a message for the owner and collects what was
-  waiting for it; the collected message is not offered a second time; a wrong password
-  is refused before anything is offered (the client sees `*** the secure-login response
-  did not match…`); an account with no credential gets nothing.
-
 * `test/session.test.ts` — the exchange against a hand-written gateway: outbound
   accepted/rejected/deferred, inbound LZHUF and gzip, a duplicated proposal, an
   offset resume, a secure-login challenge answered with the response in the log,
   a peer without B2, a wrong proposal checksum, one damaged message inside an
   otherwise good block, a silent peer, an aborted session, and the master half.
 * `test/session-run.test.ts` — a scripted VARA-family modem (command port plus data
-  port) with the real store: dial, exchange both ways, message moved OUTBOX→SENT,
+  port) with the real store: dial, exchange both ways, messages moving OUTBOX→SENT,
   inbound unread in INBOX, a MID the store already holds answered `-` and not
   transmitted, ARDOP refused with a reason.
-* `test/api.test.ts` — the same through `POST /api/session/run` over HTTP, against
+* `test/session-stream.test.ts` — the live view's own protocol: the single control
+  escalates once (disconnect, then abort, and a third press does nothing), the channel is
+  found by the id and forgotten when the run ends, `Sec-WebSocket-Accept` is the token the
+  RFC computes, and an event reaches a screen as one unmasked text frame with the backlog
+  ahead of it.
+* `test/session-bytes.test.ts` — `watchBytes()`: a binary block is reported once with its
+  head in hex and its length, a protocol line is not reported at all, and what is sent is
+  reported as sent.
+* `test/postoffice.test.ts` — a calling station dials a scripted modem, authenticates with
+  its post-office password, leaves a message for the owner and collects what was waiting;
+  a wrong password is refused before anything is offered; an account with no credential
+  gets nothing.
+* `test/api.test.ts` — the same session through `POST /api/session/run` over HTTP, against
   rigctld and a scripted modem, including CSRF.
+* `test/store.test.ts` — what *Called before* keeps and what it refuses to invent: one row
+  per callsign/dial/mode/kind, ranked by uses then recency, a known call never rewriting a
+  half-known row.
 
-Not proven, in order of how much it matters:
+Proven on the air (the three sessions above): the modem's command and data ports, the dial,
+the B2F exchange against a real peer, and filing what arrived. The live view and the stop
+control were exercised against a stand-in modem only; what has *not* been seen on a real link:
 
-0. **The post office has never been armed on the air.** Everything above is a scripted
-   modem and two in-memory stores. The accept path assumes the VARA-family data port
-   can be opened after `CONNECTED` (as the client path already does) and that `LISTEN
-   ON` survives while the post office holds its own command socket; both need one real
-   call to confirm. The rig is tuned before arming, because an inbound call cannot be
-   tuned for.
-
-1. **Nothing has been on the air.** No session has run against a real gateway — the
-   modem is not reachable (above). Everything above is sockets and stores.
-2. **ARDOP sessions do not exist.** ARDOP carries the session bytes on the same
-   socket as its text command replies, which needs ARDOP's binary framing
-   (`BUFFER`/`ARQ` frames); `runSession` refuses an ARDOP modem with that sentence
-   rather than half-running one. VARA HF/FM, XARA, Data2G and Mercury take a plain
-   data port and work as written.
-3. **The secure-login answer has never been accepted by a CMS.** The construction is
-   copied byte-for-byte from the reference and unit-tested, but a real `;PQ` has not
-   answered it. The first live session will say.
-4. **No queue, no progress, no cancellation.** `POST /api/session/run` holds the HTTP
-   request open for the whole session (minutes), and the screen shows "In session…"
-   with no live log until it returns. A queue with priority, a WebSocket log and an
-   abort button are M7.
-5. **Inbound mail always lands in the account's INBOX** — correct for a client
-   session, wrong for a gateway relaying for other callsigns, which is M12 (the
-   answering half of the engine is ready for it).
-6. Nothing retries. A deferred message stays in OUTBOX, but there is no attempt
-   counter or next-attempt time yet.
-
----
+1. **The hex line and the exchange's own traffic.** No message has crossed the new feed yet —
+   the three completed sessions ran before it existed. The first session that carries a
+   message should show `PEER <`/`PEER >` lines in bold and one `… N bytes` line per binary
+   block. If it does not, `watchBytes()` is measuring chunks the engine never reads.
+2. **Aborting mid-exchange.** The data socket is destroyed on abort, which ends the exchange at
+   its next read; only the dialling half has been watched live.
+3. **The post office has never been armed on the air.** Everything is a scripted modem and two
+   in-memory stores. The accept path assumes the VARA-family data port can be opened after
+   `CONNECTED` and that `LISTEN ON` survives while the post office holds its own command
+   socket; both need one real call.
+4. **ARDOP sessions do not exist.** ARDOP carries session bytes on its command socket, which
+   needs its binary framing; `runSession` refuses an ARDOP modem with that sentence rather
+   than half-running one.
+5. **The secure-login answer has never been accepted by a CMS.** The construction is copied
+   from the reference and unit-tested; the completed `HB9AK` gateway session of 25 Nov did not
+   report a refusal, but the exchange may have ended before the challenge.
+6. **No queue and no retries.** `POST /api/session/run` still holds the HTTP request open for
+   the whole session; there is no priority queue, no attempt counter and no next-attempt time.
+   A deferred message stays in OUTBOX for the operator to try again.
 
 ## Decisions taken (REQUIREMENTS.md §12, R3.0 / R4.4 / R4.4.0 / R4.4.05)
 
@@ -272,13 +291,37 @@ Not proven, in order of how much it matters:
   lines.
 * It also sets the receiver filter: after a session the rig read PKTUSB with a 1000 Hz
   passband where the station had 2000, so the app's own mode/passband set at the start of
-  the session does not last. Nothing in rfmail did it; the modem did.
+  the session does not last. Nothing in rfmail did it; the modem did. *(Corrected on the
+  evening of 26 Nov: the filter was ours after all — `\set_mode … 0` recomputes the passband
+  and `\dump_caps` re-applies the rig's state. Decisions 45 and 46 removed both; the station
+  now sends `-1` and never asks for capabilities.)*
 * Its command port answers `VERSION Data2G 0.5.3` and reports `BUSY ON` about 300 ms
   before `CONNECTED` on a call that comes up, plus `PTT ON`/`PTT OFF`, `BUFFER <n>`,
   `MODE <name>`, `IAMALIVE` and `DISCONNECTED`. It says nothing while merely listening, so
   a channel cannot be checked before the first connect frame goes out.
 * A completed session ran 53 s end to end for two messages of 266 and 200 bytes, and both
   were accepted by a pat station (`FS ++`).
+
+---
+
+## Tomorrow
+
+1. **Commit.** 21 paths are dirty and nothing is in git yet; the work is one coherent step —
+   the session window, its live view and its control, the corrections to *Called before*, the
+   band that follows the dial. `git add` the 21 paths by name and commit with a message about
+   the session window; the tree should be clean before anything else is touched.
+2. **One real session, watched.** Rig back to `3597.0 kHz PKTUSB`, a peer call to `OK1RAA` or a
+   gateway call from the catalogue, and the sheet open from the first second. The things to
+   look for that have never been seen on the air: `PEER` lines in the feed, the `… N bytes`
+   line when a message crosses, the `ON AIR` lamp during a transmission, and the count in
+   *Called before* moving by one when the call completes.
+3. **Then the stop control, on a real call.** Abort mid-exchange once, in a session that is
+   repeating, and confirm the sheet ends as `Session cancelled` and the modem is not left
+   keyed. That is the case the control exists for.
+4. After that, the open items below: ARDOP's binary framing, the post office on the air, and
+   the secure-login answer at a real CMS.
+
+---
 
 ## Open questions
 
@@ -528,3 +571,173 @@ Not proven, in order of how much it matters:
   those two calls is `['w SH;', 'w SL;']`. The shift is reported as centred or, when it is not,
   with the width it costs: 2500 Hz at `SH01;` passes 2100 Hz, which is the 2300 Hz mode's
   passband gone. (R2.2.5)
+* **48** The RMS catalogue is a modal, not a second page. "Find gateways" puts it over the
+  session form, where the choice is made and the modal leaves behind the answer; the form behind
+  is never unmounted, so a half-typed dial survives a look at the list. Five ways out, all ending
+  in the same state: a row (which picks and fills the form), the × in the header, the Cancel
+  button in the footer, a click on the backdrop, and Escape — the last two come from the dialog
+  element itself, which is why it is a `<dialog>` and not a styled `<div>`. Opened and closed from
+  one `listOpen` flag through an `$effect`, so the native close (Escape) cannot leave the state
+  disagreeing with the screen. While it is open the page behind cannot be touched or tabbed into,
+  which is the point: a session is assembled in one place. (R4.7)
+* **49** A gateway called before is remembered with the mode it answered on, not only the callsign
+  and the dial. The mode is half of what the operator chose — the same RMS on the same dial is
+  reachable with VARA or with ARDOP, and a chip that forgets which one leaves the question open —
+  so it joins the key, and the chip reads `OK1RAA · 3597.0 kHz · Data2G · 2×`. Picking one fills
+  the form with all three, and only a mode the station still has a modem for is put back (an
+  entry whose modem has been deleted leaves the choice as the operator left it rather than
+  selecting nothing). Entries recorded before the mode was kept have none and show a dash. The
+  claim rule written here — the next successful use filling the gap instead of leaving a second
+  row — was withdrawn by decision 55: it is what relabelled a peer call as a gateway call. (R3.13)
+* **50** The kind of session is remembered with the gateway too. A station called as a Winlink
+  gateway, as a peer, or as this station's post office is three different conversations, even on
+  the same dial with the same mode — a peer session hands the far end its own mail and nothing of
+  the CMS's — so `cms`, `p2p` and `postoffice` join the key, and the chip reads `OK1RAA · 3597.0
+  kHz · Data2G · GW · 3×`. Picking it sets the Session type select as well; a `cms` or
+  `postoffice` entry is not forced on an account without a Winlink password, which may not make
+  that call at all. Entries from before the column have no type and show nothing where it would
+  be; the claiming rule written here was withdrawn by decision 55. (R3.13)
+* **51** A running session is watched, not guessed at, and has one way out. The modem's commands
+  and the exchange's lines are carried to the screen over a WebSocket on
+  `/api/session/ws?id=…`, opened with the session cookie the page already holds, in a channel
+  the screen makes up an id for *before* it starts the run — so the channel exists when the
+  first command is written, and a screen that connects a moment late is given the backlog. The
+  protocol is spoken here (handshake, text frames, close and ping) rather than through a
+  library, like the mail protocols. The session then runs in a modal of its own, and the modal
+  has one control: the **first** press asks the link to come down — the modem is told
+  `DISCONNECT`, the data socket closes, the far end sees a normal end of link — and a **second**
+  press, while that is still happening, cuts it: both sockets destroyed, no closing sequence,
+  no waiting for repeats. The server decides which step it is from the channel's own phase, so
+  a screen cannot ask for an abort before a disconnect, and a third press does nothing. The
+  control exists from the moment the dial starts, because the dial is often the long part: a
+  stop asked for during the dial reaches `dialModem` through two `AbortSignal`s — a polite one
+  that sends `DISCONNECT` and waits out the grace, and a hard one that destroys the socket — and
+  the run reports `aborted` with which of the two happened (`the session was aborted while
+  dialling`, `the session was disconnected while dialling`) rather than as a failure of the
+  modem. (R4.5.3, R4.5.4)
+* **52** The feed names who is speaking, and does not go quiet on a binary block. Every line
+  carries its speaker: `MODEM` for what the modem is told, the callsign being called (or `PEER`
+  when there is none) for the B2F lines, which are set in dark blue bold when they are received —
+  the traffic is the reason the sheet exists, the modem's chatter is not. A message travels as a
+  binary block, and the exchange reads bytes, so `runSession` wraps the data stream in
+  `watchBytes()`: anything with a byte that is neither printable nor CR/LF/TAB is reported once,
+  as its first twelve bytes in hex, an ellipsis and how many bytes arrived (`3C 2A 4C 5A 00 FF 80
+  01 7C 2A 3E 0D … 4128 bytes`). Protocol lines are pure ASCII, so they are left to the line
+  report and never repeated. The sheet is a report, not a transcript: the two collapsible logs
+  under the feed are gone, and the sheet stays until it is closed — by its button, its ×, Escape
+  or a click on the backdrop, but by none of those while the transmitter is up.
+* **53** The feed is a log of two channels, and each is drawn as what it is. Only the *data*
+  channel is emphasised: the peer's lines are bold, dark blue when received and green when sent,
+  under the callsign being called. The command channel is machinery — its replies plain grey, the
+  commands sent to it in italic — and nothing there is bold. `PTT ON` and `PTT OFF` are not logged
+  at all: the modem keys the transmitter, so that is a lamp marked **ON AIR** in the sheet's
+  header, red while it is lit, and when the key drops the feed gains one line carrying the moment
+  the transmitter came on, `MODEM > TRANSMIT 3.0 s` — the duration between the two, so a hundred
+  keyed frames do not become two hundred lines. The sheet is a fixed frame: it spans the session
+  screen from just under the app's 56px header to just above the bottom of the window, the feed
+  takes the height it is given and scrolls once it is full, and the head and foot stay put.
+* **54** Silence is worth a line too, once. The modem keys the transmitter frame after frame; between
+  the key dropping and the next time it comes on there is often a gap in which nothing is said to
+  the modem and nothing comes back from it — the station listening, which is what the operator
+  wants to see when a call is slow. So after `PTT OFF` the sheet remembers the moment, and if the
+  next `PTT ON` arrives with no line in between — no command sent, no data received, not even a
+  modem reply — it writes one line stamped with that moment: `4.0 MODEM · waiting 5.0 s`. Any line
+  at all cancels it: the gap is then already accounted for, and a session that is working does not
+  collect waits. A wait shorter than a tenth of a second is not written, and the silence must be one: what
+  breaks it is traffic — data from the peer or a command sent to the modem — while the modem's own
+  `MODE …` and `IAMALIVE` lines do not count, because Data2G prints a `MODE` line after most
+  transmissions and counting those hid every wait.
+* **55** A recorded call says what it was, and is never rewritten into something else. `CALLED
+  BEFORE` is a list of calls that actually happened — callsign, dial, digital mode, *and* the kind
+  of session — and it was lying: an entry made before the session type was kept has an empty one,
+  and the first later use claimed it, which is how a peer call came to be listed as a Winlink
+  gateway call. The claim is gone. Recording is one statement, an insert-or-count on the whole
+  quadruple: a call of a known kind is its own entry, and an entry left half-known by an older
+  version keeps what it knows and shows nothing where it knows nothing — guessing the missing
+  half is how the guess becomes a fact. The list is read from the store again after every session,
+  successful or not, so it is a record of what the station has been doing rather than a snapshot
+  taken when the page opened. (R3.13)
+* **56** The band follows the dial. Typing a frequency into the session form used to leave the
+  band select where it was — 3597 kHz typed under 40 m, with the form then describing 80 m in one
+  field and 40 m in the next. The typed dial now sets the band to the one that contains it (and
+  reloads the catalogue for that band once the typing has settled), and a number that lands in no
+  band in the unit the field shows is read in the other unit: `3597` in a megahertz field is 3.597
+  MHz rather than 3597 MHz. The dial field carries no placeholder either — a greyed `7053.5` was
+  read, reasonably, as something already entered.
+
+* **57** The post office is a separate application (settled 27 Nov 2026): `apps/postoffice`
+  with its own console, its own configuration, its own data directory and its own service,
+  built on the same `core-b2f`, `store`, `rig` and modem code as the client. The client loses
+  the seat at the door, the post office screen and `/api/postoffice/*`, and decisions 31, 32
+  and 33 fall with them: a session is a client session, and a station is either one application
+  or the other. The two databases are separate files — one holds a person's mailbox, the other
+  other people's mailboxes — and the store admits the post office's own tables only when it is
+  opened for it. (R4.4.3, R7.2, R7.9)
+* **58** A mailbox and an administrator are two principals. A *mailbox* is a callsign the
+  station holds mail for: a sealed post-office password, folders, messages, a quota — and no
+  password hash, no session and no route, because its owner collects over the radio. An
+  *administrator* is a person: a name, a scrypt password, a session, and the optional permission
+  to read other mailboxes' envelope metadata; it has no callsign and no mailbox. Two tables, two
+  verifiers, and the `;PQ`/`;PR` path never consults an administrator's password — one shared
+  verifier is one refactor away from a `pw_hash IS NULL` branch that admits a stranger. The
+  console's session carries an administrator id, and its API never resolves that id through the
+  mailbox table. (R7.2, R8.7, R9.1)
+* **59** The B2F door is frozen: SID, `;PQ:` with a fresh nonce, `;PR:` folded to eight digits,
+  and nothing added to the handshake that carries authentication. Two facts decide it. wl2k-go
+  ignores every handshake line it does not know (`default: // Ignore`, with its own review note
+  that unknown `;`-comments ought to be allowed), so an extra line would not break pat; but the
+  answering side speaks first, so the post office has committed to a handshake shape before it
+  knows who is calling, and any new line goes to every caller including the closed-source
+  clients nobody here can test. A second password protocol inside B2F would also be thrown away
+  when the native door arrives. (R4.4.1.1, R4.4.3)
+* **60** The native door is announced, not negotiated: one line after the post office's SID,
+  `;RFPO: 1`, ignored by every B2F client as a comment. A native client answers it with its own
+  hello instead of `;FW:` and the station switches to the new protocol on the same data port;
+  a B2F client never notices. The challenge that has already gone out costs a dozen bytes. This
+  is the comment convention used as a doorbell, never as a second authentication. (R4.4.3)
+* **61** Identity in the native door is PKI, and the post office is its own CA. Each mailbox gets
+  one static key bound to its callsign; enrolment happens once, as a system message over the B2F
+  door, accepted only in a session that authenticated as that mailbox with its post-office
+  password, which can then be revoked. The private key never leaves the client, so no form here
+  can issue one. Revocation is a store flag, not a CRL, because the post office is the verifier.
+  The volume is a one-time 100–150 bytes of binding (a certificate, if wanted as a document, is
+  300–400); per session there is none, because Noise proves possession of a key both ends
+  already hold. (R4.4.3, R9.1)
+* **62** The native handshake is Noise IK/KK with Ed25519/X25519 static keys — about 200 bytes
+  each way, one round trip, mutual authentication, forward secrecy, no certificate on the wire.
+  TLS 1.3 with client certificates was rejected on air time: a first session moves kilobytes of
+  handshake, and only resumption makes it cheap. One response per challenge, as the handshake's
+  single flight allows; both responses present is a refusal even when one is right. (R4.4.3)
+* **63** `b2f: allow | refuse` is a property of a mailbox and it limits **collection only**.
+  Delivery is not collection: mail for that mailbox still arrives over B2F, because the caller
+  authenticates as the *sender* and the recipient is not the caller — a mailbox the network
+  cannot deliver to is not a mailbox. On the wire a refused mailbox is refused exactly like a
+  callsign that does not exist, so the door cannot be asked which mailboxes exist; the call log
+  records the real reason. (R4.4.3)
+* **64** The post office's B2F door verifies the post-office password only. Decision 27's
+  "either credential authenticates" was settled when the station was a single-account client
+  that was also its own post office and the operator's Winlink secret was the only one that
+  might exist; with an administrator-issued mailbox that rationale is gone, and the CMS password
+  stays the CMS's business. The trade is stated: a visiting registered user needs the password
+  this post office gave them. (R4.4.3, R9.1)
+* **65** The first step of the application is the seam, not the protocol: the answering half
+  splits into the mail policy (accept, defer, duplicate, offer, collected, unknown recipient)
+  and the B2F framing that drives it, with the listener as the door multiplexer. The native
+  protocol, the key store and the enrolment flow are postponed; they are not first-release work.
+  (R4.4.3)
+* **66** The console is the only door: four screens — station, mailboxes, calls, administrators
+  — and no user-facing mail reader, because the users are radio-only. The station screen is one
+  lamp and one word (armed / call / disarmed / fault), the modem picker, and the panels for
+  modems and recent calls; the call log is written from the session's own ending and is the
+  first thing to read when a user says a message never arrived, because it names the caller and
+  what the exchange did without any message content. Envelope inspection is a per-administrator
+  grant, off by default, metadata only, audited — and is the next screen, not this one. (R4.4.3,
+  R8.7, R7.7)
+* **67** The station is installed as a service, written by `deploy/install-postoffice.sh`: a
+  service account, a copy of the tree, one configuration written once with both keys generated
+  (never overwritten — replacing either key signs everybody out or makes every stored password
+  unreadable), and a systemd unit that restarts on failure, holds a 30-second stop timeout so
+  the station can disarm, and can write only its data directory. The console is built before
+  installation; the installer refuses without it rather than shipping a placeholder screen. The
+  default listener is loopback, and the two edits for a LAN console are printed at the end. The
+  Windows service wrapper is the next platform task and does not exist yet. (R7.9, R9.1)

@@ -19,11 +19,19 @@ import {
   MIGRATION_009,
   MIGRATION_010,
   MIGRATION_011,
+  MIGRATION_012,
+  MIGRATION_013,
+  MIGRATION_014,
   SCHEMA_VERSION,
+  POSTOFFICE_SCHEMA_VERSION,
 } from './schema.ts';
 import type {
   AttachmentRecord,
+  AdministratorRecord,
+  CreateAdministratorInput,
   CreateTransceiverInput,
+  PostOfficeCallRecord,
+  RecordCallInput,
   TransceiverRecord,
   CreateModemInput,
   ModemRecord,
@@ -93,6 +101,8 @@ interface SessionTargetRow {
   id: number;
   callsign: string;
   frequency_hz: number;
+  kind: string;
+  session_mode: string;
   uses: number;
   last_used_at: number;
   created_at: number;
@@ -135,20 +145,49 @@ interface AttachmentRow {
   size: number;
 }
 
+interface AdministratorRow {
+  id: number;
+  name: string;
+  pw_hash: string;
+  can_inspect: number;
+  enabled: number;
+  created_at: number;
+  updated_at: number;
+}
+
+interface CallRow {
+  id: number;
+  peer: string;
+  started_at: number;
+  elapsed_ms: number;
+  result: string;
+  sent: number;
+  received: number;
+  reason: string | null;
+}
+
 export interface SqliteStoreOptions {
   /** Path to the database file, or ':memory:' for tests. */
   path: string;
   /** Echo statements to a logger (development aid). */
   trace?: (sql: string) => void;
+  /**
+   * This database belongs to the post office application, so it also carries the
+   * station's administrators and its call log (decision 57). A client station
+   * leaves it false and never creates those tables.
+   */
+  postOffice?: boolean;
 }
 
 export class SqliteStore implements Store {
   private db: DatabaseSync;
   private trace: ((sql: string) => void) | undefined;
+  private readonly postOffice: boolean;
 
   constructor(options: SqliteStoreOptions) {
     this.db = new DatabaseSync(options.path);
     this.trace = options.trace;
+    this.postOffice = options.postOffice === true;
     this.db.exec('PRAGMA journal_mode = WAL');
     this.db.exec('PRAGMA foreign_keys = ON');
     this.db.exec('PRAGMA busy_timeout = 5000');
@@ -226,7 +265,10 @@ export class SqliteStore implements Store {
       [9, MIGRATION_009],
       [10, MIGRATION_010],
       [11, MIGRATION_011],
+      [12, MIGRATION_012],
+      [13, MIGRATION_013],
     ];
+    if (this.postOffice) migrations.push([14, MIGRATION_014]);
     for (const [version, sql] of migrations) {
       if (seen.has(version)) continue;
       this.transaction(() => {
@@ -234,10 +276,11 @@ export class SqliteStore implements Store {
         this.run('INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)', version, Date.now());
       });
     }
+    const supported = this.postOffice ? POSTOFFICE_SCHEMA_VERSION : SCHEMA_VERSION;
     const max = this.get<{ version: number }>('SELECT MAX(version) AS version FROM schema_migrations');
-    if ((max?.version ?? 0) > SCHEMA_VERSION) {
+    if ((max?.version ?? 0) > supported) {
       throw new Error(
-        `database schema is newer (${max?.version}) than this build supports (${SCHEMA_VERSION})`,
+        `database schema is newer (${max?.version}) than this build supports (${supported})`,
       );
     }
   }
@@ -625,6 +668,8 @@ export class SqliteStore implements Store {
       id: row.id,
       callsign: row.callsign,
       frequencyHz: row.frequency_hz,
+      kind: row.kind === '' ? null : row.kind,
+      sessionMode: row.session_mode === '' ? null : row.session_mode,
       uses: row.uses,
       lastUsedAt: row.last_used_at,
       createdAt: row.created_at,
@@ -642,22 +687,31 @@ export class SqliteStore implements Store {
 
   async recordSessionTarget(input: CreateSessionTargetInput): Promise<SessionTargetRecord> {
     const now = Date.now();
-    // The pair is unique case-insensitively; a second call to the same gateway on the same
-    // dial counts a use rather than making a second entry.
+    // One call, one entry, and the entry says what that call was: this callsign, on this dial,
+    // with this digital mode, in this kind of session. Recording never rewrites an entry's mode
+    // or type — a row left half-known by an older version stays half-known, and shows only what
+    // it knows, because inventing the missing half is how a peer call comes to be listed as a
+    // gateway call (decision 55).
     this.run(
-      `INSERT INTO session_targets (callsign, frequency_hz, uses, last_used_at, created_at)
-       VALUES (?, ?, 1, ?, ?)
-       ON CONFLICT DO UPDATE SET uses = uses + 1, last_used_at = excluded.last_used_at,
-                                 callsign = excluded.callsign`,
+      `INSERT INTO session_targets (callsign, frequency_hz, kind, session_mode, uses, last_used_at, created_at)
+       VALUES (?, ?, ?, ?, 1, ?, ?)
+       ON CONFLICT (callsign COLLATE NOCASE, frequency_hz, kind, session_mode)
+       DO UPDATE SET uses = uses + 1, last_used_at = excluded.last_used_at,
+                     callsign = excluded.callsign`,
       input.callsign,
       input.frequencyHz,
+      input.kind,
+      input.sessionMode,
       now,
       now,
     );
     const row = this.get<SessionTargetRow>(
-      'SELECT * FROM session_targets WHERE callsign = ? COLLATE NOCASE AND frequency_hz = ?',
+      `SELECT * FROM session_targets
+        WHERE callsign = ? COLLATE NOCASE AND frequency_hz = ? AND kind = ? AND session_mode = ?`,
       input.callsign,
       input.frequencyHz,
+      input.kind,
+      input.sessionMode,
     );
     if (!row) throw new Error('the session target vanished after it was recorded');
     return this.sessionTargetFrom(row);
@@ -1047,6 +1101,130 @@ export class SqliteStore implements Store {
       userId,
     );
     return row?.total ?? 0;
+  }
+
+  // -- the post office's own records (decision 57) -------------------------
+
+  private administratorFrom(row: AdministratorRow): AdministratorRecord {
+    return {
+      id: row.id,
+      name: row.name,
+      pwHash: row.pw_hash,
+      canInspect: row.can_inspect === 1,
+      enabled: row.enabled === 1,
+      createdAt: row.created_at,
+    };
+  }
+
+  async listAdministrators(): Promise<AdministratorRecord[]> {
+    return this.all<AdministratorRow>('SELECT * FROM administrators ORDER BY name COLLATE NOCASE').map(
+      (row) => this.administratorFrom(row),
+    );
+  }
+
+  async countAdministrators(): Promise<number> {
+    const row = this.get<{ n: number }>('SELECT COUNT(*) AS n FROM administrators');
+    return row?.n ?? 0;
+  }
+
+  async createAdministrator(input: CreateAdministratorInput): Promise<AdministratorRecord> {
+    const name = input.name.trim();
+    if (name === '') throw new Error('an administrator needs a name');
+    const now = Date.now();
+    const result = this.run(
+      `INSERT INTO administrators (name, pw_hash, can_inspect, enabled, created_at, updated_at)
+       VALUES (?, ?, ?, 1, ?, ?)`,
+      name,
+      input.pwHash,
+      input.canInspect === true ? 1 : 0,
+      now,
+      now,
+    );
+    const record = await this.getAdministrator(result.lastInsertRowid);
+    if (!record) throw new Error('administrator creation failed');
+    return record;
+  }
+
+  async findAdministrator(name: string): Promise<AdministratorRecord | null> {
+    const row = this.get<AdministratorRow>(
+      'SELECT * FROM administrators WHERE name = ? COLLATE NOCASE',
+      name.trim(),
+    );
+    return row ? this.administratorFrom(row) : null;
+  }
+
+  async getAdministrator(id: number): Promise<AdministratorRecord | null> {
+    const row = this.get<AdministratorRow>('SELECT * FROM administrators WHERE id = ?', id);
+    return row ? this.administratorFrom(row) : null;
+  }
+
+  async updateAdministrator(
+    id: number,
+    patch: { pwHash?: string; enabled?: boolean; canInspect?: boolean },
+  ): Promise<AdministratorRecord | null> {
+    const sets: string[] = [];
+    const args: Array<string | number | null> = [];
+    if (patch.pwHash !== undefined) {
+      sets.push('pw_hash = ?');
+      args.push(patch.pwHash);
+    }
+    if (patch.enabled !== undefined) {
+      sets.push('enabled = ?');
+      args.push(patch.enabled ? 1 : 0);
+    }
+    if (patch.canInspect !== undefined) {
+      sets.push('can_inspect = ?');
+      args.push(patch.canInspect ? 1 : 0);
+    }
+    if (sets.length > 0) {
+      sets.push('updated_at = ?');
+      args.push(Date.now(), id);
+      this.run(`UPDATE administrators SET ${sets.join(', ')} WHERE id = ?`, ...args);
+    }
+    return this.getAdministrator(id);
+  }
+
+  async deleteAdministrator(id: number): Promise<boolean> {
+    const result = this.run('DELETE FROM administrators WHERE id = ?', id);
+    return result.changes > 0;
+  }
+
+  private callFrom(row: CallRow): PostOfficeCallRecord {
+    return {
+      id: row.id,
+      peer: row.peer,
+      startedAt: row.started_at,
+      elapsedMs: row.elapsed_ms,
+      result: row.result === 'complete' || row.result === 'aborted' ? row.result : 'failed',
+      sent: row.sent,
+      received: row.received,
+      reason: row.reason,
+    };
+  }
+
+  async recordCall(input: RecordCallInput): Promise<PostOfficeCallRecord> {
+    const result = this.run(
+      `INSERT INTO po_calls (peer, started_at, elapsed_ms, result, sent, received, reason)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      input.peer.trim().toUpperCase(),
+      input.startedAt,
+      Math.max(0, Math.round(input.elapsedMs)),
+      input.result,
+      input.sent,
+      input.received,
+      input.reason ?? null,
+    );
+    const row = this.get<CallRow>('SELECT * FROM po_calls WHERE id = ?', result.lastInsertRowid);
+    if (!row) throw new Error('call record failed');
+    return this.callFrom(row);
+  }
+
+  async listCalls(limit = 100): Promise<PostOfficeCallRecord[]> {
+    const bounded = Math.max(1, Math.min(1000, Math.trunc(limit)));
+    return this.all<CallRow>(
+      'SELECT * FROM po_calls ORDER BY started_at DESC, id DESC LIMIT ?',
+      bounded,
+    ).map((row) => this.callFrom(row));
   }
 }
 
