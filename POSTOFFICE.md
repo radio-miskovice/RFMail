@@ -31,11 +31,17 @@ The console is the only door, and it is for administrators.
 `deploy/install-postoffice.sh`, run as root on the station:
 
 ```sh
-sudo deploy/install-postoffice.sh                 # /opt, /etc, /var/lib, systemd
+sudo deploy/install-postoffice.sh                 # /opt, /etc, /var/lib, a system unit
+deploy/install-postoffice.sh --user-service       # no root: $HOME and a systemd --user unit
 deploy/install-postoffice.sh --no-service ...     # files and config only, run it yourself
 deploy/install-postoffice.sh --dry-run            # say what it would do
 deploy/install-postoffice.sh --uninstall          # stop and remove the unit, keep the data
 ```
+
+`--user-service` is the same station run by the operator instead of by root: prefix, data and
+configuration default under `$HOME` (`~/.local/opt`, `~/.local/share`, `~/.config`), and the
+unit goes in `~/.config/systemd/user`. It comes back after a reboot only with lingering on, so
+the installer checks `loginctl show-user` and prints the one command that turns it on.
 
 What it does, and why each part is what it is:
 
@@ -97,6 +103,60 @@ Exercise of this script so far: PowerShell 7 on the development host with `-NoSe
 copy, generated configuration, the shim text, and the installed tree started and serving its
 console. The Task Scheduler, `icacls` and firewall branches need a Windows machine and have
 not been run.
+
+### The single-file Windows installer
+
+`deploy/pack-postoffice.sh` produces one file for the station:
+
+```sh
+npm run pack:postoffice                     # dist/rfmail-postoffice-<version>-setup.exe
+deploy/pack-postoffice.sh --sfx /path/7z.sfx --out /tmp/dist
+```
+
+It is a 7-Zip self-extracting executable: a Windows SFX module, then `config.txt`, then the
+payload archive. Double-clicking it unpacks to `%TEMP%`, asks for administrator rights, runs
+`Install.cmd`, and the installer copies the tree to `%ProgramFiles%`, writes the configuration
+and registers the boot task; the temporary directory is removed afterwards. Arguments are
+passed through — `rfmail-postoffice-setup.exe -Listen 0.0.0.0:8090 -OpenFirewall`.
+
+The payload is a **runtime** tree, not the checkout: the post office application, the console
+as built, `packages/`, and only the third-party packages those depend on (the build toolchain —
+typescript, vite, svelte — is left behind, which is most of the 83 MB in a checkout). Node.js 22
+is the only prerequisite on the target machine. The workspace links are deliberately absent from
+the archive and re-created by the installer, see below.
+
+The SFX module is a Windows PE file that no Linux package carries: take `7z.sfx` from a 7-Zip
+for Windows installation (it is installed into `C:\Program Files\7-Zip`) and put it at
+`deploy/7z.sfx`, which is git-ignored. Without it the script still writes the payload and says
+how to finish the file on Windows:
+
+    copy /b 7z.sfx + config.txt + payload.7z setup.exe
+
+### Loading a list of mailboxes
+
+A postmaster starts with a list, so the list is the input:
+
+```sh
+node apps/postoffice/src/cli.ts mailboxes --file mailboxes.yaml [--replace] [--dry-run]
+```
+
+```
+# club list
+OK1RAA: another good password
+OK2XYZ: " padded and preserved "
+OK3ABC: pass:with:colons
+```
+
+One mailbox per line, split at the **first** colon (a callsign cannot contain one, a password
+can); surrounding quotes keep leading or trailing spaces; blank lines and `#` comments are
+ignored. A bad line is reported with its number and the file is refused whole — nothing is
+half-loaded. A mailbox that already has a password is left alone unless `--replace`, because
+re-running the loader after a mistyped line should not silently change what everybody collects
+with. Passwords are sealed with the installation's key, never printed, and the file holds them
+in plain text: delete it once the mailboxes are loaded.
+
+The loader writes to the same database as a running station (SQLite handles the second writer),
+so mailboxes can be added while the post office is answering calls.
 
 ### The links both installers restore
 

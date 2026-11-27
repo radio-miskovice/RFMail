@@ -773,3 +773,29 @@ control were exercised against a stand-in modem only; what has *not* been seen o
   Verified here with PowerShell 7 and `-NoService`: the copy, the generated configuration, the
   shim, and the installed tree serving its console; the Task Scheduler, `icacls` and firewall
   branches need a Windows machine and have not been run. (R7.9, R9.1)
+
+* **70** The Linux installer also installs as a user unit (settled 27 Nov 2026): a station may
+  be somebody's own machine rather than a service box, and needing root to run it is a reason
+  not to. `--user-service` puts the prefix, the data and the configuration under `$HOME`,
+  writes `~/.config/systemd/user/rfmail-postoffice.service` with no `User=` and no hardening
+  that needs privilege, enables it with `systemctl --user`, and prints the
+  `loginctl enable-linger` command when lingering is off — because a unit without it starts at
+  boot only after somebody logs in, which for a post office is never. (R7.9)
+
+* **71** The Windows installer ships as one self-extracting file (settled 27 Nov 2026):
+  `deploy/pack-postoffice.sh` stages a *runtime* tree — the application, the console as built,
+  `packages/`, and only the third-party packages the code declares — and wraps it with a 7-Zip
+  SFX module, `config.txt` and `Install.cmd`. The build toolchain is left behind: most of a
+  checkout's 83 MB is typescript, vite and svelte, and the target machine has Node and needs
+  nothing else. The module is a Windows PE that no Linux package carries, so it is taken from a
+  7-Zip for Windows installation and ignored by git; without one the script still writes the
+  payload and prints the `copy /b` line that finishes the file. Double-clicking unpacks to
+  `%TEMP%`, elevates, and runs the same `install-postoffice.ps1` — so the installer has one
+  implementation, not a second one inside the wrapper. (R7.9)
+* **72** A list of callsigns and passwords can be loaded in one command (settled 27 Nov 2026):
+  `node apps/postoffice/src/cli.ts mailboxes --file LIST`. One mailbox per line, split at the
+  first colon, quotes preserving surrounding spaces, `#` comments; a bad line is named with its
+  number and the whole file is refused rather than half-loaded. A password a mailbox already
+  has is kept unless `--replace`, so re-running after one mistyped line does not quietly change
+  what everybody collects with. The passwords are sealed with the installation's key, never
+  printed, and the file is plaintext — the command says so and means it. (R7.2, R9.1)

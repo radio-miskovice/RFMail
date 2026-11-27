@@ -56,11 +56,17 @@ npm run build:postoffice                       # build the console
 sudo deploy/install-postoffice.sh             # Linux: /opt, /etc, /var/lib, systemd unit
 deploy\install-postoffice.ps1                 # Windows: Program Files, ProgramData, a boot task
 #   or, without a service, on either:
+deploy/install-postoffice.sh --user-service   # no root: $HOME, systemd --user
 deploy/install-postoffice.sh --no-service --prefix /opt/rfmail-po --data ~/.local/share/rfmail-postoffice
 ```
 
 The console opens on `http://127.0.0.1:8090`; its first screen names the station (a
-callsign) and its first administrator.
+callsign) and its first administrator. Mailboxes are seeded from a list:
+
+```sh
+node apps/postoffice/src/cli.ts mailboxes --file mailboxes.yaml   # CALLSIGN: password
+npm run pack:postoffice                                          # one-file Windows installer
+```
 
 ## Quick start
 

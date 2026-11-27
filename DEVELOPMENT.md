@@ -132,6 +132,8 @@ rfmail/
                               checked-in .service file would be a second source
     install-postoffice.ps1    the Windows installer: a task at boot, a logging shim, and
                               the workspace links re-created after the copy
+    pack-postoffice.sh        builds the one-file Windows installer: runtime payload,
+                              7z SFX module, config.txt, Install.cmd
 ```
 
 Why workspaces rather than `src/`: `core-b2f` must be usable from a test with no

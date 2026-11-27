@@ -20,6 +20,8 @@
 #   --listen ADDR   the console's listener           (default 127.0.0.1:8090)
 #   --source DIR    the checkout to install          (default: the one this script is in)
 #   --no-service    install files and configuration, print how to run it, touch no service
+#   --user-service  install as a *user* unit (systemctl --user), no root: prefix, data and
+#                   config default under $HOME, and it starts at boot when lingering is on
 #   --uninstall     stop, disable and remove the unit; data and configuration are kept
 #   --print-unit    print the unit file and exit (for review)
 #   --dry-run       say what would happen, change nothing
@@ -37,6 +39,7 @@ LISTEN=127.0.0.1:8090
 UNIT_PATH=/etc/systemd/system/rfmail-postoffice.service
 SOURCE=$(cd "$(dirname "$0")/.." && pwd)
 NO_SERVICE=0
+USER_SERVICE=0
 UNINSTALL=0
 DRY_RUN=0
 PRINT_UNIT=0
@@ -60,6 +63,7 @@ while [ $# -gt 0 ]; do
 	--listen) LISTEN=${2:?--listen needs host:port}; shift 2 ;;
 	--source) SOURCE=${2:?--source needs a directory}; shift 2 ;;
 	--no-service) NO_SERVICE=1; shift ;;
+	--user-service) USER_SERVICE=1; shift ;;
 	--uninstall) UNINSTALL=1; shift ;;
 	--print-unit) PRINT_UNIT=1; shift ;;
 	--dry-run) DRY_RUN=1; shift ;;
@@ -69,6 +73,29 @@ while [ $# -gt 0 ]; do
 done
 
 unit_file() {
+	if [ "$USER_SERVICE" -eq 1 ]; then
+		cat <<UNIT
+[Unit]
+Description=rfmail post office ($LISTEN, user unit)
+Documentation=file://$PREFIX/POSTOFFICE.md
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$PREFIX
+ExecStart=$NODE_BIN $PREFIX/apps/postoffice/src/main.ts --config $CONFIG
+Restart=always
+RestartSec=5
+# Disarming takes a few seconds: the modem is told to stop listening and the link is
+# waited out. Never leave a transmitter keyed.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
+UNIT
+		return
+	fi
 	cat <<UNIT
 [Unit]
 Description=rfmail post office ($LISTEN)
@@ -106,6 +133,18 @@ NODE_BIN=$(command -v node || true)
 [ -n "$NODE_BIN" ] || fail "node is not on this PATH; install Node 22 or newer"
 command -v rsync >/dev/null 2>&1 || fail "rsync is required to install the tree"
 
+# A user unit is the same station run by the operator instead of by root: the files go
+# under $HOME and systemd is asked as that user. Lingering decides whether it comes back
+# after a reboot without a login; the installer says so at the end.
+if [ "$USER_SERVICE" -eq 1 ]; then
+	NO_SERVICE=0
+	[ "$PREFIX" = /opt/rfmail-postoffice ] && PREFIX="${HOME}/.local/opt/rfmail-postoffice"
+	[ "$DATA" = /var/lib/rfmail-postoffice ] && DATA="${HOME}/.local/share/rfmail-postoffice"
+	[ "$CONFIG" = /etc/rfmail-postoffice/postoffice.toml ] &&
+		CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/rfmail-postoffice/postoffice.toml"
+	UNIT_PATH="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/rfmail-postoffice.service"
+fi
+
 if [ "$PRINT_UNIT" -eq 1 ]; then
 	unit_file
 	exit 0
@@ -113,7 +152,11 @@ fi
 
 if [ "$UNINSTALL" -eq 1 ]; then
 	say "Removing the $SERVICE service (data and configuration are kept)."
-	run systemctl disable --now "$SERVICE" || true
+	if [ "$USER_SERVICE" -eq 1 ]; then
+		run systemctl --user disable --now "$SERVICE" || true
+	else
+		run systemctl disable --now "$SERVICE" || true
+	fi
 	run rm -f "$UNIT_PATH"
 	run systemctl daemon-reload
 	say "  data   $DATA"
@@ -124,10 +167,21 @@ fi
 
 [ -d "$SOURCE" ] || fail "source directory does not exist: $SOURCE"
 [ -f "$SOURCE/apps/postoffice/src/main.ts" ] || fail "$SOURCE is not the rfmail tree"
+# A prefix inside the tree being copied (or the other way round) would copy the tree into
+# itself, which rsync then walks forever.
+SOURCE_REAL=$(cd "$SOURCE" && pwd -P)
+PREFIX_REAL=$(cd "$(dirname "$PREFIX")" 2>/dev/null && pwd -P || printf '%s' "$PREFIX")/$(basename "$PREFIX")
+case "$PREFIX_REAL" in
+	"$SOURCE_REAL"/*) fail "the prefix ($PREFIX) is inside the source tree ($SOURCE)" ;;
+esac
+case "$SOURCE_REAL" in
+	"$PREFIX_REAL"/*) fail "the source tree ($SOURCE) is inside the prefix ($PREFIX)" ;;
+esac
+
 [ -f "$SOURCE/apps/postoffice-web/build/index.html" ] || fail \
 	"the console is not built: run 'npm run build:postoffice' in $SOURCE first"
 
-if [ "$NO_SERVICE" -eq 0 ] && [ "$DRY_RUN" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
+if [ "$NO_SERVICE" -eq 0 ] && [ "$USER_SERVICE" -eq 0 ] && [ "$DRY_RUN" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
 	fail "installing a service needs root; run with sudo, or use --no-service for a user-run install"
 fi
 
@@ -146,7 +200,7 @@ say ""
 # write its database, and nothing else. In --no-service mode the operator runs the
 # station themselves, so there is no account to make.
 
-if [ "$NO_SERVICE" -eq 0 ]; then
+if [ "$NO_SERVICE" -eq 0 ] && [ "$USER_SERVICE" -eq 0 ]; then
 	if ! id -u "$RUN_USER" >/dev/null 2>&1; then
 		run useradd --system --no-create-home --home-dir "$DATA" --shell /usr/sbin/nologin "$RUN_USER"
 	else
@@ -236,7 +290,7 @@ EOF
 	fi
 fi
 
-if [ "$NO_SERVICE" -eq 0 ]; then
+if [ "$NO_SERVICE" -eq 0 ] && [ "$USER_SERVICE" -eq 0 ]; then
 	run chown -R "$RUN_USER:$RUN_USER" "$DATA"
 	run chown root:"$RUN_USER" "$CONFIG"
 	run chmod 0640 "$CONFIG"
@@ -256,16 +310,30 @@ fi
 if [ "$DRY_RUN" -eq 1 ]; then
 	say "  would write $UNIT_PATH"
 else
+	mkdir -p "$(dirname "$UNIT_PATH")"
 	unit_file >"$UNIT_PATH"
 	chmod 0644 "$UNIT_PATH"
 	say "  wrote $UNIT_PATH"
-	run systemctl daemon-reload
-	run systemctl enable --now "$SERVICE"
+	if [ "$USER_SERVICE" -eq 1 ]; then
+		run systemctl --user daemon-reload
+		run systemctl --user enable --now "$SERVICE"
+	else
+		run systemctl daemon-reload
+		run systemctl enable --now "$SERVICE"
+	fi
 fi
 
 say ""
 say "The console is at http://$LISTEN — the first page names the station and its administrator."
-say "Logs:      journalctl -u $SERVICE -f"
+if [ "$USER_SERVICE" -eq 1 ]; then
+	say "Logs:      journalctl --user -u $SERVICE -f"
+	if [ "$(loginctl show-user "$(id -un)" 2>/dev/null | sed -n 's/^Linger=//p')" != "yes" ]; then
+		say "Reboot:    it comes back after a reboot only with lingering on:"
+		say "             loginctl enable-linger $(id -un)"
+	fi
+else
+	say "Logs:      journalctl -u $SERVICE -f"
+fi
 say "Reaching it from the LAN needs two changes in $CONFIG:"
 say "             listen = \"0.0.0.0:8090\"   and   [access] mode = \"strict\" with a CIDR."
 say "Removing:  $0 --uninstall"

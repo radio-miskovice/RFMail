@@ -5,7 +5,8 @@
   "type": "module",
   "description": "The post office application: answers B2F calls and holds mail for its mailboxes",
   "bin": {
-    "rfmail-postoffice": "./src/main.ts"
+    "rfmail-postoffice": "./src/main.ts",
+    "rfmail-postoffice-mailboxes": "./src/cli.ts"
   },
   "scripts": {
     "start": "node src/main.ts"

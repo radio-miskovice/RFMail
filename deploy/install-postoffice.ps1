@@ -180,6 +180,16 @@ $NodeExe = Get-NodeExe
 $SourceMain = Join-Path $Source 'apps\postoffice\src\main.ts'
 $SourceConsole = Join-Path $Source 'apps\postoffice-web\build\index.html'
 
+# A prefix inside the tree being copied (or the other way round) would copy the tree into
+# itself. On a normal install this cannot happen — the source is the unpacked installer in
+# %TEMP% and the prefix is Program Files — but the script is also run by hand.
+$fullSource = [System.IO.Path]::GetFullPath($Source)
+$fullPrefix = [System.IO.Path]::GetFullPath($Prefix)
+$separator = [System.IO.Path]::DirectorySeparatorChar
+if ($fullPrefix.StartsWith($fullSource + $separator) -or $fullSource.StartsWith($fullPrefix + $separator)) {
+    Fail "the prefix ($Prefix) and the source ($Source) cannot contain one another"
+}
+
 if (-not (Test-Path -LiteralPath $SourceMain)) { Fail "$Source is not the rfmail tree" }
 if (-not (Test-Path -LiteralPath $SourceConsole)) {
     Fail "the console is not built: run 'npm run build:postoffice' in $Source first"

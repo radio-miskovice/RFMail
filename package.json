@@ -16,7 +16,9 @@
     "check": "tsc -p tsconfig.json && npm --workspace apps/web run check && npm --workspace apps/postoffice-web run check",
     "test": "node --test \"test/*.test.ts\"",
     "build:postoffice": "npm --workspace apps/postoffice-web run build",
-    "start:postoffice": "node apps/postoffice/src/main.ts"
+    "start:postoffice": "node apps/postoffice/src/main.ts",
+    "pack:postoffice": "deploy/pack-postoffice.sh",
+    "postoffice:cli": "node apps/postoffice/src/cli.ts"
   },
   "dependencies": {
     "smol-toml": "^1.4.2"

@@ -8,3 +8,6 @@ apps/postoffice-web/.svelte-kit/
 *.db-wal
 rfmail.toml
 b2f-live-test.ts
+
+dist/
+deploy/7z.sfx
